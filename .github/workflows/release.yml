@@ -70,16 +70,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # The version pinned in rust-toolchain.toml. `@stable` would install a
+      # different toolchain from the one rustup then selects in the repo, and
+      # the target would be added to the wrong one.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.100.0"
           targets: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.build_tool == 'cross'
         uses: taiki-e/install-action@v2
         with:
-          tool: cross
+          tool: cross@0.2.5
 
       - name: Build ${{ matrix.target }}${{ matrix.suffix }}
         run: ${{ matrix.build_tool }} build --release --target ${{ matrix.target }} ${{ matrix.feature_flags }}
@@ -136,7 +140,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release edit "${{ needs.create-release.outputs.version }}" --prerelease --draft=false --repo HalFrgrd/flyline
+          gh release edit "${{ needs.create-release.outputs.version }}" --prerelease --draft=false
 
   test-installation:
     name: test-installation (${{ matrix.target }})
