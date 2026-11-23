@@ -1156,9 +1156,9 @@ impl From<KeyEvent> for KeyEventMatch {
     }
 }
 
-/// Add a set of [`KeyModifiers`] to a [`KeyEventMatch`], OR-ing them into the
+/// Add a set of [`KeyModifiers`] to a `KeyEventMatch`, OR-ing them into the
 /// match's existing modifier set.  Combined with [`From<KeyCode>`] for
-/// [`KeyEventMatch`], this lets binding definitions read like keyboard
+/// `KeyEventMatch`, this lets binding definitions read like keyboard
 /// chords:
 ///
 /// ```ignore
@@ -1168,7 +1168,7 @@ impl From<KeyEvent> for KeyEventMatch {
 ///
 /// Direct `KeyModifiers + KeyCode` is not supported because both types are
 /// foreign to this crate (orphan rule); convert one side to
-/// [`KeyEventMatch`] first.  For "any char" matches with modifiers, write
+/// `KeyEventMatch` first.  For "any char" matches with modifiers, write
 /// `KeyEventMatch::AnyCharAndMods(KeyModifiers::SHIFT)` directly.
 impl Add<KeyEventMatch> for KeyModifiers {
     type Output = KeyEventMatch;
@@ -1917,7 +1917,7 @@ pub fn expand_variations_one(kem: KeyEventMatch) -> Vec<KeyEventMatch> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// // expand_variations![KeyCode::Enter.into()]   →  [Enter, Ctrl+j]
 /// // expand_variations![KeyModifiers::ALT + KeyCode::Enter.into()]
 /// //                                              →  [Alt+Enter, Meta+Enter]
@@ -2212,7 +2212,7 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
-/// MacOs: https://stackoverflow.com/questions/12827888/what-is-the-representation-of-the-mac-command-key-in-the-terminal
+/// MacOs: <https://stackoverflow.com/questions/12827888/what-is-the-representation-of-the-mac-command-key-in-the-terminal>
 /// MacOs command keyboard shortcuts are not sent to terminal apps by default.
 /// They are often captured by the terminal emulator itself for various commands
 /// Try `ghostty +list-keybinds --default` on ghostty. Most
@@ -2221,7 +2221,7 @@ fn capitalize_first(s: &str) -> String {
 /// SUPER: Windows key or Mac Command key
 /// HYPER: Often as as result of pressing Ctrl + Shift + Alt + Windows/Command key. rarely used.
 ///
-/// https://en.wikipedia.org/wiki/Table_of_keyboard_shortcuts#Command_line_shortcuts
+/// <https://en.wikipedia.org/wiki/Table_of_keyboard_shortcuts#Command_line_shortcuts>
 ///
 /// Meta vs Alt:
 /// On iterm2, there is a setting in Profiles->Keys->Left option key.

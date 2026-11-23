@@ -909,7 +909,7 @@ impl MouseEventAction {
                 if let Err(e) = crate::flush_stdout!(
                     "{}{}",
                     Csi::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseDisplay)),
-                    Csi::Cursor(Cursor::goto(0, 0))
+                    Csi::Cursor(Cursor::default_position())
                 ) {
                     log::warn!("Failed to clear terminal: {}", e);
                 }

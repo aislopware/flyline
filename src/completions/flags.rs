@@ -163,7 +163,7 @@ fn should_infer_filename_completion(completions: &[String], flags: &CompletionFl
 
 /// Some completion scripts like gh or docker put descriptions inline with
 /// the suggestion when there are multiple suggestions.
-/// So here I convert those to the format "suggestion<TAB>description" so that
+/// So here I convert those to the format `"suggestion<TAB>description"` so that
 /// flyline can show the description in a separate column.
 pub fn detect_and_convert_inline_descriptions(completions: &mut [String], flags: &CompletionFlags) {
     if flags.filename_completion_desired || completions.iter().any(|s| s.contains('\t')) {

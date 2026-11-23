@@ -985,7 +985,7 @@ fn tab_complete_tilde_expansion(pattern: &str) -> Vec<ProcessedSuggestion> {
     suggestions
 }
 
-/// Outcome of applying tab-completion results directly to a [`TextBuffer`].
+/// Outcome of applying tab-completion results directly to a [`TextBuffer`](flybuffer::TextBuffer).
 ///
 /// This is the buffer-mutation half of `finish_tab_complete` factored out so
 /// it can be exercised from unit tests without constructing a full `App`.

@@ -201,6 +201,15 @@ impl<B: Backend> Terminal<B> {
     /// Current behavior: for [`Viewport::Inline`], clearing runs from the viewport origin through
     /// the bottom of the viewport area.
     ///
+    /// For fixed viewports, this uses [`Backend::save_cursor_position`] and
+    /// [`Backend::restore_cursor_position`], falling back to [`Backend::get_cursor_position`] and
+    /// [`Backend::set_cursor_position`] when saving is unsupported. Saving avoids a terminal cursor
+    /// position query that could compete with application input readers for the response; see
+    /// [issue #2691](https://github.com/ratatui/ratatui/issues/2691). Because terminals generally
+    /// have a single saved-cursor slot, this may overwrite the position stored by any other call to
+    /// [`Backend::save_cursor_position`]; save and restore operations that overlap this call are
+    /// not nestable.
+    ///
     /// This also resets the "previous" buffer so the next [`Terminal::flush`] redraws the full
     /// viewport.
     ///
@@ -208,14 +217,22 @@ impl<B: Backend> Terminal<B> {
     ///
     /// Implementation note: this uses [`ClearType::AfterCursor`] starting at the viewport origin.
     pub fn clear(&mut self) -> Result<(), B::Error> {
-        if matches!(self.viewport, Viewport::Inline(_)) {
-            self.clear_viewport()?;
-        } else {
-            let original_cursor = self.backend.get_cursor_position()?;
-            self.clear_viewport()?;
-            self.backend.set_cursor_position(original_cursor)?;
+        match self.viewport {
+            // Clearing the full display preserves the cursor position by the Backend contract, so
+            // avoid saving it unnecessarily. The inline viewport tracks the cursor relative to its
+            // top row and never queries the terminal for it.
+            Viewport::Fullscreen | Viewport::Inline(_) => self.clear_viewport(),
+            Viewport::Fixed(_) => {
+                if self.backend.save_cursor_position()? {
+                    self.clear_viewport()?;
+                    self.backend.restore_cursor_position()
+                } else {
+                    let original_cursor = self.backend.get_cursor_position()?;
+                    self.clear_viewport()?;
+                    self.backend.set_cursor_position(original_cursor)
+                }
+            }
         }
-        Ok(())
     }
 
     /// Clears the entire terminal screen (including all rows above an inline viewport),
@@ -449,6 +466,23 @@ mod tests {
     }
 
     #[test]
+    fn clear_fixed_uses_saved_cursor_without_querying() {
+        let backend = TestBackend::new(10, 3);
+        let options = TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 1, 10, 2)),
+        };
+        let mut terminal = Terminal::with_options(backend, options).unwrap();
+        let query_count = terminal.backend().cursor_position_query_count();
+
+        terminal.clear().unwrap();
+
+        assert_eq!(
+            terminal.backend().cursor_position_query_count(),
+            query_count
+        );
+    }
+
+    #[test]
     fn clear_fixed_full_width_not_at_bottom() {
         let mut backend =
             TestBackend::with_lines(["before 1  ", "viewport 1", "viewport 2", "after 1   "]);
@@ -567,7 +601,8 @@ mod tests {
 
         terminal.clear().unwrap();
 
-        assert_eq!(terminal.backend().cursor_position(), Position::ORIGIN);
+        // The cursor ends at the viewport's top-left cell, which is row 2 on screen.
+        assert_eq!(terminal.backend().cursor_position(), Position { x: 0, y: 2 });
         assert_eq!(terminal.inline_cursor_x, 0);
         assert_eq!(terminal.inline_cursor_y, 0);
     }

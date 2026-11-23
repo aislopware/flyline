@@ -10,6 +10,18 @@ GitHub with a [breaking change] label.
 
 This is a quick summary of the sections below:
 
+- [v0.31.0](#v0310)
+  - `Flex::SpaceBetween` with a single item now preserves fixed-size constraints
+  - `Scrollbar` thumb now reaches the end of the track when the content is fully scrolled
+  - `Backend` adds cursor save and restore methods
+  - The calendar widget moved from `ratatui-widgets` to the new `ratatui-calendar` crate
+  - The calendar widget uses `jiff` dates instead of `time` dates
+  - `Widget` is implemented for `&Box<W>` and `WidgetRef` for `Box<W>`, which conflicts with manual
+    impls for boxed widgets
+  - Removed APIs deprecated in v0.26.x
+  - The `scrolling-regions` feature is removed. `Terminal::insert_before` now requires a backend
+    that implements the new `ScrollByRegion` trait
+  - `HighlightSpacing` is split into `ListHighlightSpacing` and `TableHighlightSpacing`
 - [v0.30.1](#v0301)
   - Adding `AsRef` impls for widgets may affect type inference in rare cases
   - MSRV is now 1.88.0
@@ -96,6 +108,224 @@ This is a quick summary of the sections below:
 - [v0.20.0](#v0200)
   - MSRV is now 1.63.0
   - `List` no longer ignores empty strings
+
+## v0.31.0
+
+### `Flex::SpaceBetween` with a single item now preserves fixed-size constraints
+
+Previously, `Flex::SpaceBetween` stretched a single layout item to fill the full area, even when the
+item used a fixed-size constraint such as `Length`, `Max`, `Percentage`, or `Ratio`. A single item
+now falls back to start alignment because there is no space to distribute between items.
+
+`Min` and `Fill` constraints still grow to fill the available area. If you relied on the previous
+single-item stretching behavior with a fixed-size constraint, use `Flex::Legacy` or switch the item
+to a growing constraint such as `Fill` or `Min`.
+
+### `Scrollbar` thumb now reaches the end of the track when the content is fully scrolled
+
+The scrollbar handle (thumb) now reaches the end when the last page is fully visible. With 100 items,
+22 visible, and scroll position 78:
+
+```text
+Before: <--------------####---->
+After:  <------------------####>
+```
+
+Set `viewport_content_length` to the number of visible items so the built-in scrolling controls
+also stop at the last full page. Leaving it at zero preserves their previous behavior.
+
+### `Backend` adds cursor save and restore methods
+
+`Backend` now provides default `save_cursor_position` and `restore_cursor_position` methods.
+Existing backend implementations continue to compile because both methods have default
+implementations. However, this may cause method-call ambiguity in the unlikely case that another
+trait in scope defines a method with the same name for a backend type. Use fully qualified syntax to
+disambiguate such calls.
+
+Backends that can save the cursor without querying terminal input should override both methods and
+return `Ok(true)` from `save_cursor_position`. Other backends can use the default implementations,
+which select the cursor get-and-set fallback.
+
+### The calendar widget uses `jiff` dates instead of `time` dates
+
+`ratatui-calendar` (and so `ratatui::widgets::calendar`) now uses [`jiff::civil::Date`] instead of
+`time::Date`. This affects `Monthly::new`, `DateStyler::get_style`, `CalendarEventStore::add` and
+the `HashMap` inside `CalendarEventStore`. `ratatui` no longer depends on `time`.
+
+Build dates with [`jiff::civil::date`][jiff-date-fn] and get today's date with `jiff::ZonedDateTime::now()`:
+
+```diff
+- use time::{Date, Month, OffsetDateTime};
++ use jiff::ZonedDateTime;
++ use jiff::civil::date;
+
+- let new_year = Date::from_calendar_date(2026, Month::January, 1)?;
++ let new_year = date(2026, 1, 1);
+- let today = OffsetDateTime::now_local()?.date();
++ let today = ZonedDateTime::now().date();
+```
+
+If the rest of your app keeps using `time`, convert at the boundary:
+
+```rust
+fn to_jiff(date: time::Date) -> jiff::civil::Date {
+    let year = i16::try_from(date.year()).expect("year in jiff's range");
+    jiff::civil::date(year, u8::from(date.month()) as i8, date.day() as i8)
+}
+```
+
+`CalendarEventStore::today` now uses the system time zone through jiff. Previously it used `time`'s
+local offset, which fails in multithreaded programs on Unix, so `today` could silently fall back to
+UTC and mark the wrong day.
+
+[`jiff::civil::Date`]: https://docs.rs/jiff/latest/jiff/civil/struct.Date.html
+[jiff-date-fn]: https://docs.rs/jiff/latest/jiff/civil/fn.date.html
+
+### The calendar widget moved from `ratatui-widgets` to the new `ratatui-calendar` crate
+
+The `calendar` module of `ratatui-widgets` (`Monthly`, `DateStyler` and `CalendarEventStore`) has
+moved to the new `ratatui-calendar` crate. `ratatui-widgets` no longer has the `calendar` and
+`all-widgets` features, its default features are now empty, and it no longer depends on `time`.
+
+If you use the calendar through `ratatui::widgets::calendar`, nothing changes: the
+`widget-calendar` feature (enabled by default through `all-widgets`) now pulls in
+`ratatui-calendar` and re-exports it at the same path.
+
+If you depend on `ratatui-widgets` directly and use its calendar, add `ratatui-calendar` and update
+the imports:
+
+```diff
+- use ratatui_widgets::calendar::{CalendarEventStore, Monthly};
++ use ratatui_calendar::{CalendarEventStore, Monthly};
+```
+
+Remove `calendar` and `all-widgets` from any `features` list for `ratatui-widgets`.
+
+### `Widget` is implemented for `&Box<W>` and `WidgetRef` for `Box<W>` ([#2883])
+
+[#2883]: https://github.com/ratatui/ratatui/pull/2883
+
+`Widget` is now implemented for `&Box<W>` whenever `&W` implements `Widget`, so boxed widgets can be
+rendered directly. If your crate has its own impl for a boxed widget, it now conflicts with this
+one:
+
+```rust
+impl Widget for &MyWidget { ... }
+
+// error[E0119]: conflicting implementations of trait `Widget` for type `&Box<MyWidget>`
+impl Widget for &Box<MyWidget> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        (**self).render(area, buf);
+    }
+}
+```
+
+Remove the `&Box<MyWidget>` impl. The new impl renders the boxed widget the same way. Impls for
+boxed trait objects such as `&Box<dyn MyTrait>` are not affected unless `&dyn MyTrait` also
+implements `Widget`.
+
+With the `unstable-widget-ref` feature, `WidgetRef` is likewise implemented for `Box<W>`, `Rc<W>`,
+and `Arc<W>` whenever `&W` implements `Widget`. Remove any `impl WidgetRef for Box<MyWidget>` in
+the same way.
+
+### Removed APIs deprecated in v0.26.x
+
+The following APIs, deprecated since February to May 2024, have been removed:
+
+- `Constraint::apply`. It has no replacement; layout computes sizes from constraints internally.
+- `Span::to_left_aligned_line`, `Span::to_centered_line` and `Span::to_right_aligned_line`. Use
+  `Span::into_left_aligned_line`, `Span::into_centered_line` and `Span::into_right_aligned_line`
+  instead.
+- `assert_buffer_eq!`. Use `assert_eq!(&actual, &expected)` instead.
+
+`TestBackend::assert_buffer` now uses `assert_eq!` internally, so its panic message is the standard
+``assertion `left == right` failed`` output instead of the `assert_buffer_eq!` message.
+
+### The `scrolling-regions` feature is removed and `insert_before` requires `ScrollByRegion` ([#2121])
+
+[#2121]: https://github.com/ratatui/ratatui/pull/2121
+
+The `scrolling-regions` feature added `scroll_region_up` and `scroll_region_down` to `Backend` only
+when it was enabled. Cargo features should only add things, so a crate that enabled the feature
+could break another crate in the same build that implemented `Backend`. The feature is removed, and
+the two methods move from `Backend` to a new `ScrollByRegion` trait, which has `Backend` as a
+supertrait.
+
+`Terminal::insert_before` now always uses scrolling regions, so it no longer clears the viewport
+when inserting lines. The implementation that moved the cursor and cleared the viewport is removed,
+and `insert_before` is only available when the backend implements `ScrollByRegion`. The built-in
+Crossterm, Termina, Termion, Termwiz, and `TestBackend` backends implement it.
+
+Remove `scrolling-regions` from any `features` list for `ratatui`, `ratatui-core`,
+`ratatui-crossterm`, `ratatui-termina`, `ratatui-termion`, or `ratatui-termwiz`:
+
+```diff
+- ratatui = { version = "0.30", features = ["scrolling-regions"] }
++ ratatui = "0.31"
+```
+
+Code that calls `insert_before` through a generic backend needs a `ScrollByRegion` bound instead of
+`Backend`. `Backend` is a supertrait, so all other `Terminal` methods remain available:
+
+```diff
+- fn run<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
++ fn run<B: ScrollByRegion>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+      terminal.insert_before(1, |buf| { /* ... */ })
+  }
+```
+
+Backends that implemented `scroll_region_up` and `scroll_region_down` behind the feature should move
+those methods into an `impl ScrollByRegion` block:
+
+```diff
+  impl Backend for MyBackend {
+      // ...
+-     #[cfg(feature = "scrolling-regions")]
+-     fn scroll_region_up(&mut self, region: Range<u16>, amount: u16) -> Result<(), Self::Error> {
+-         // ...
+-     }
+-
+-     #[cfg(feature = "scrolling-regions")]
+-     fn scroll_region_down(&mut self, region: Range<u16>, amount: u16) -> Result<(), Self::Error> {
+-         // ...
+-     }
+  }
++
++ impl ScrollByRegion for MyBackend {
++     fn scroll_region_up(&mut self, region: Range<u16>, amount: u16) -> Result<(), Self::Error> {
++         // ...
++     }
++
++     fn scroll_region_down(&mut self, region: Range<u16>, amount: u16) -> Result<(), Self::Error> {
++         // ...
++     }
++ }
+```
+
+Backends without scrolling regions no longer support `insert_before`. To keep supporting it, they
+can implement `ScrollByRegion` by emulating the region scroll, as `TestBackend` does.
+
+### `HighlightSpacing` is split into `ListHighlightSpacing` and `TableHighlightSpacing` ([#2265])
+
+[#2265]: https://github.com/ratatui/ratatui/pull/2265
+
+`List` and `Table` used to share one `HighlightSpacing` enum, defined in the table module. Each
+widget now has its own type so the two can evolve independently. `List::highlight_spacing` takes a
+`ListHighlightSpacing` and `Table::highlight_spacing` takes a `TableHighlightSpacing`. The variants
+are unchanged.
+
+```diff
+- use ratatui::widgets::{HighlightSpacing, List, Table};
++ use ratatui::widgets::{List, ListHighlightSpacing, Table, TableHighlightSpacing};
+
+- let list = List::new(items).highlight_spacing(HighlightSpacing::Always);
++ let list = List::new(items).highlight_spacing(ListHighlightSpacing::Always);
+- let table = Table::new(rows, widths).highlight_spacing(HighlightSpacing::Always);
++ let table = Table::new(rows, widths).highlight_spacing(TableHighlightSpacing::Always);
+```
+
+`HighlightSpacing` has been removed. Replace it with `ListHighlightSpacing` where it is passed to a
+`List` and with `TableHighlightSpacing` where it is passed to a `Table`.
 
 ## [v0.30.1](https://github.com/ratatui/ratatui/releases/tag/ratatui-v0.30.1)
 
@@ -283,7 +513,7 @@ The minimum supported Rust version (MSRV) is now 1.86.0.
 
 ### `layout::Alignment` is renamed to `layout::HorizontalAlignment` ([#1735])
 
-[#1735]: https://github.com/ratatui/ratatui/pull/1691
+[#1735]: https://github.com/ratatui/ratatui/pull/1735
 
 The `Alignment` enum has been renamed to `HorizontalAlignment` to better reflect its purpose. A type
 alias has been added to maintain backwards compatibility, however there are some cases where type
@@ -609,7 +839,7 @@ This change simplifies the trait and makes it easier to implement.
 
 ### List no clamps the selected index to list ([#1159])
 
-[#1149]: https://github.com/ratatui/ratatui/pull/1149
+[#1159]: https://github.com/ratatui/ratatui/pull/1159
 
 The `List` widget now clamps the selected index to the bounds of the list when navigating with
 `first`, `last`, `previous`, and `next`, as well as when setting the index directly with `select`.
@@ -729,7 +959,7 @@ flexible types from calling scopes, though it can break some type inference in t
 
 ### `LineGauge::gauge_style` is deprecated ([#565])
 
-[#565]: https://github.com/ratatui/ratatui/pull/1148
+[#565]: https://github.com/ratatui/ratatui/pull/565
 
 `LineGauge::gauge_style` is deprecated and replaced with `LineGauge::filled_style` and `LineGauge::unfilled_style`:
 

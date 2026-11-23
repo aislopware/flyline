@@ -1,3 +1,11 @@
+// The doc comments in this module are clap's `--help` text, which README.md mirrors, so they
+// use placeholders like <KEY> and bare URLs rather than rustdoc markup.
+#![allow(
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags
+)]
+
 #[cfg(not(test))]
 macro_rules! return_usage_error {
     ($($arg:tt)*) => {{
@@ -1535,7 +1543,7 @@ pub(crate) fn call(words: *const bash_symbols::WordList) -> c_int {
                         if let Err(e) = crate::flush_stdout!(
                             "{}{}",
                             Csi::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseDisplay)),
-                            Csi::Cursor(Cursor::goto(0, 0))
+                            Csi::Cursor(Cursor::default_position())
                         ) {
                             log::warn!("Failed to clear terminal: {}", e);
                         }

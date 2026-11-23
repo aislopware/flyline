@@ -250,7 +250,10 @@ impl<B: Backend> Terminal<B> {
     ///
     /// This method will:
     ///
-    /// - show/hide the cursor based on `cursor_position` ([`None`] will hide the cursor)
+    /// - show/hide the cursor based on `cursor_position` ([`None`] will hide the cursor). When a
+    ///   position is given, a `Show` is only emitted if the cursor is not already known to be
+    ///   visible; the `MoveTo` is always emitted. If something outside Ratatui hides the cursor,
+    ///   call [`Terminal::show_cursor`] to show it again.
     /// - call [`Terminal::swap_buffers`] to prepare for the next render pass
     /// - call [`Backend::flush`] to flush any buffered backend output
     /// - return a [`CompletedFrame`] with the current buffer and the area used for rendering
@@ -335,7 +338,7 @@ mod tests {
     use crate::backend::{Backend, ClearType, TestBackend, WindowSize};
     use crate::buffer::{Buffer, Cell};
     use crate::layout::{Position, Rect};
-    use crate::terminal::{Terminal, TerminalOptions, Viewport};
+    use crate::terminal::{CursorVisibility, Terminal, TerminalOptions, Viewport};
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     struct TestError(&'static str);
@@ -422,28 +425,6 @@ mod tests {
         fn flush(&mut self) -> Result<(), Self::Error> {
             self.inner.flush().map_err(|err| match err {})
         }
-
-        #[cfg(feature = "scrolling-regions")]
-        fn scroll_region_up(
-            &mut self,
-            region: core::ops::Range<u16>,
-            line_count: u16,
-        ) -> Result<(), Self::Error> {
-            self.inner
-                .scroll_region_up(region, line_count)
-                .map_err(|err| match err {})
-        }
-
-        #[cfg(feature = "scrolling-regions")]
-        fn scroll_region_down(
-            &mut self,
-            region: core::ops::Range<u16>,
-            line_count: u16,
-        ) -> Result<(), Self::Error> {
-            self.inner
-                .scroll_region_down(region, line_count)
-                .map_err(|err| match err {})
-        }
     }
 
     /// `draw` hides the cursor when the frame does not request a cursor position.
@@ -476,7 +457,7 @@ mod tests {
             "completed buffer contains the rendered content"
         );
 
-        assert_eq!(terminal.hidden_cursor, Some(true));
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Hidden);
         assert!(!terminal.backend().cursor_visible());
         assert_eq!(
             terminal.frame_count, 1,
@@ -503,7 +484,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(terminal.hidden_cursor, Some(false));
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Visible);
         assert!(terminal.backend().cursor_visible());
         assert_eq!(
             terminal.backend().cursor_position(),
@@ -517,6 +498,42 @@ mod tests {
         );
     }
 
+    /// A second draw with the cursor already visible doesn't emit another `Show`.
+    #[test]
+    fn cursor_visibility_skips_redundant_show() {
+        let mut terminal = Terminal::new(TestBackend::new(3, 2)).unwrap();
+
+        // The cursor starts Unknown, so the first draw shows it.
+        terminal
+            .draw(|frame| frame.set_cursor_position((1, 1)))
+            .unwrap();
+        assert_eq!(terminal.backend().show_cursor_count(), 1);
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Visible);
+
+        terminal
+            .draw(|frame| frame.set_cursor_position((1, 1)))
+            .unwrap();
+        assert_eq!(terminal.backend().show_cursor_count(), 1);
+        assert!(terminal.backend().cursor_visible());
+    }
+
+    /// A frame without a cursor hides it, and a later frame with a cursor shows it again.
+    #[test]
+    fn cursor_visibility_hides_and_reshows() {
+        let mut terminal = Terminal::new(TestBackend::new(3, 2)).unwrap();
+
+        terminal.draw(|_frame| {}).unwrap();
+        assert_eq!(terminal.backend().hide_cursor_count(), 1);
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Hidden);
+
+        terminal
+            .draw(|frame| frame.set_cursor_position((1, 0)))
+            .unwrap();
+        assert_eq!(terminal.backend().show_cursor_count(), 1);
+        assert_eq!(terminal.backend().hide_cursor_count(), 1);
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Visible);
+    }
+
     /// When the render callback returns an error, `try_draw` does not update the terminal.
     ///
     /// This is a characterization of the "no partial updates" behavior: backend contents and
@@ -528,7 +545,7 @@ mod tests {
 
         terminal.show_cursor().unwrap();
 
-        let was_hidden = terminal.hidden_cursor;
+        let was_hidden = terminal.cursor_visibility;
         let cursor_visible = terminal.backend().inner.cursor_visible();
         let cursor_position = terminal.backend().inner.cursor_position();
 
@@ -547,7 +564,7 @@ mod tests {
             "backend buffer is unchanged on error"
         );
         assert_eq!(
-            terminal.hidden_cursor, was_hidden,
+            terminal.cursor_visibility, was_hidden,
             "terminal cursor state is unchanged on error"
         );
         assert_eq!(
@@ -858,7 +875,7 @@ mod tests {
             "completed buffer contains the rendered content"
         );
 
-        assert_eq!(terminal.hidden_cursor, Some(true));
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Hidden);
         assert!(!terminal.backend().cursor_visible());
         assert_eq!(
             terminal.frame_count, 1,

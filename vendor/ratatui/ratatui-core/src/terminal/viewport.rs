@@ -90,9 +90,8 @@ pub enum Viewport {
     ///
     /// Inline viewports always span the full terminal width.
     ///
-    /// For the full inline rendering model, including output inserted above the UI, see the
-    /// "Inline Viewport" section on [`Terminal`](crate::terminal::Terminal) and
-    /// [`Terminal::insert_before`](crate::terminal::Terminal::insert_before).
+    /// For the full inline rendering model, see the "Inline Viewport" section on
+    /// [`Terminal`](crate::terminal::Terminal).
     ///
     /// [`Terminal::draw`]: crate::terminal::Terminal::draw
     /// [`Terminal::try_draw`]: crate::terminal::Terminal::try_draw

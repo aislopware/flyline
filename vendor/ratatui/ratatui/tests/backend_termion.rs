@@ -39,6 +39,7 @@ fn backend_termion_should_only_write_diffs() -> Result<(), Box<dyn std::error::E
         write!(s, "{}", color::Fg(color::Reset))?;
         write!(s, "{}", color::Bg(color::Reset))?;
         write!(s, "{}", style::Reset)?;
+        // The cursor is hidden once; later frames do not repeat it.
         write!(s, "{}", cursor::Hide)?;
         // Second draw
         write!(s, "{}", cursor::Goto(2, 1))?;
@@ -46,14 +47,12 @@ fn backend_termion_should_only_write_diffs() -> Result<(), Box<dyn std::error::E
         write!(s, "{}", color::Fg(color::Reset))?;
         write!(s, "{}", color::Bg(color::Reset))?;
         write!(s, "{}", style::Reset)?;
-        write!(s, "{}", cursor::Hide)?;
         // Third draw
         write!(s, "{}", cursor::Goto(3, 1))?;
         s.push('c');
         write!(s, "{}", color::Fg(color::Reset))?;
         write!(s, "{}", color::Bg(color::Reset))?;
         write!(s, "{}", style::Reset)?;
-        write!(s, "{}", cursor::Hide)?;
         // Terminal drop
         write!(s, "{}", cursor::Show)?;
         s

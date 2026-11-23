@@ -2,9 +2,9 @@ use crate::content::RelativePosition;
 use crate::shell;
 use crate::term_info;
 
-/// https://code.visualstudio.com/docs/terminal/shell-integration#_supported-escape-sequences
-/// https://sw.kovidgoyal.net/kitty/shell-integration/
-/// https://ghostty.org/docs/features/shell-integration#troubleshooting
+/// <https://code.visualstudio.com/docs/terminal/shell-integration#_supported-escape-sequences>
+/// <https://sw.kovidgoyal.net/kitty/shell-integration/>
+/// <https://ghostty.org/docs/features/shell-integration#troubleshooting>
 /// Ghostty right click -> Terminal inspector -> Terminal IO -> Filter for osc
 /// And you click on the event to see more details.
 

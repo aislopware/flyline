@@ -51,6 +51,7 @@ jobs:
           # No --all: that would also format the vendored path dependencies.
           cargo fmt                                                       -- --check
           cargo clippy --workspace --locked --quiet --all-features --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" \
           cargo doc    --workspace --locked --quiet --no-deps --document-private-items
 
   msrv:

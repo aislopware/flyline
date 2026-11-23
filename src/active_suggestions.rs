@@ -1426,7 +1426,7 @@ impl Ord for ProcessedSuggestion {
 }
 
 /// Raw completion from bash plus the metadata needed to post-process it into
-/// a [`ProcessedSuggestion`] via [`into_processed`].
+/// a [`ProcessedSuggestion`] via [`UnprocessedSuggestion::into_processed`].
 ///
 /// The expensive filesystem calls (`is_dir`, `style_for_path`,
 /// `fully_expand_path`) only happen when this is converted to a
@@ -1680,7 +1680,7 @@ const CHUNK_PROCESSING_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// (env vars, tilde expansion, flyline's own clap completions, ...) are never
 /// re-wrapped, while raw bash completions stay queued in `unprocessed` and
 /// are converted lazily.  `auto_accept_if_solo` controls whether
-/// [`ActiveSuggestions::try_accept`] will silently accept the candidate when
+/// `apply_tab_complete_to_buffer` will silently accept the candidate when
 /// there is only one of them (set to `false` for fuzzy filename matching, where
 /// the user generally wants to see and confirm the match).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1713,7 +1713,7 @@ impl ActiveSuggestionsBuilder {
         }
     }
 
-    /// Override [`auto_accept_if_solo`].  Set to `false` for fuzzy filename
+    /// Override [`Self::auto_accept_if_solo`].  Set to `false` for fuzzy filename
     /// matching, where the user should confirm the match even when only a
     /// single candidate survives the fuzzy scoring.
     pub fn with_auto_accept_if_solo(mut self, auto_accept_if_solo: bool) -> Self {
@@ -1860,7 +1860,7 @@ pub struct ColumnInfo {
 #[derive(Debug)]
 pub struct ActiveSuggestions {
     /// Raw completions waiting to be post-processed.  Drained from the front
-    /// in chunks each time [`into_grid`] is called or fuzzy matching runs.
+    /// in chunks each time [`Self::into_grid`] is called or fuzzy matching runs.
     unprocessed_suggestions: VecDeque<UnprocessedSuggestion>,
     /// Fully post-processed suggestions.  This is the only collection used by
     /// fuzzy matching, rendering, and acceptance logic.
@@ -1873,7 +1873,7 @@ pub struct ActiveSuggestions {
     pub original_word_under_cursor: SubString,
     pub word_under_cursor: SubString,
     /// Number of suggestion rows per column as used in the last rendered
-    /// grid.  Kept in sync by [`update_grid_size`].
+    /// grid.  Kept in sync by [`Self::into_grid`].
     last_num_rows_per_col: usize,
     /// Number of columns that were actually visible in the last rendered
     /// grid.  Used to compute the scroll offset.

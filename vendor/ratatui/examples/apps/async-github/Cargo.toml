@@ -1,7 +1,6 @@
 [package]
 name = "async-github"
 publish = false
-authors.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -20,3 +19,6 @@ octocrab.workspace = true
 ratatui.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream.workspace = true
+
+[lints]
+workspace = true

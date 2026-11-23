@@ -393,7 +393,7 @@ pub fn highlight_matching_indices(
     normal_lines
 }
 
-/// Format a [`Duration`] as a compact, exactly-5-character string.
+/// Format a [`Duration`](std::time::Duration) as a compact, exactly-5-character string.
 ///
 /// The output always occupies exactly 5 terminal columns so it can be used
 /// as a fixed-width column in the history list UI.

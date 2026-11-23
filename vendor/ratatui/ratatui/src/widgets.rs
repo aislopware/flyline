@@ -664,20 +664,22 @@
 //! [`ratatui-core`]: https://crates.io/crates/ratatui-core
 //! [no-std concept guide]: https://ratatui.rs/concepts/no-std/
 
+#[cfg(feature = "widget-calendar")]
+pub use ratatui_calendar as calendar;
 pub use ratatui_core::widgets::{StatefulWidget, Widget};
 pub use ratatui_widgets::barchart::{Bar, BarChart, BarGroup};
 pub use ratatui_widgets::block::{
     Block, BlockExt, CellEffect, Dimmed, Padding, Shadow, TitlePosition, dimmed,
 };
 pub use ratatui_widgets::borders::{BorderType, Borders};
-#[cfg(feature = "widget-calendar")]
-pub use ratatui_widgets::calendar;
 pub use ratatui_widgets::canvas;
 pub use ratatui_widgets::chart::{Axis, Chart, Dataset, GraphType, LegendPosition};
 pub use ratatui_widgets::clear::Clear;
 pub use ratatui_widgets::fill::Fill;
 pub use ratatui_widgets::gauge::{Gauge, LineGauge};
-pub use ratatui_widgets::list::{List, ListDirection, ListItem, ListState};
+pub use ratatui_widgets::list::{
+    List, ListDirection, ListHighlightSpacing, ListItem, ListState, SelectionMode,
+};
 pub use ratatui_widgets::logo::{RatatuiLogo, Size as RatatuiLogoSize};
 pub use ratatui_widgets::mascot::{MascotEyeColor, RatatuiMascot};
 pub use ratatui_widgets::paragraph::{Paragraph, Wrap};
@@ -685,13 +687,15 @@ pub use ratatui_widgets::scrollbar::{
     ScrollDirection, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 pub use ratatui_widgets::sparkline::{RenderDirection, Sparkline, SparklineBar};
-pub use ratatui_widgets::table::{Cell, HighlightSpacing, Row, Table, TableState};
+pub use ratatui_widgets::table::{Cell, Row, Table, TableHighlightSpacing, TableState};
 pub use ratatui_widgets::tabs::Tabs;
 #[instability::unstable(feature = "widget-ref")]
 pub use {stateful_widget_ref::StatefulWidgetRef, widget_ref::WidgetRef};
 
 mod stateful_widget_ref;
 mod widget_ref;
+mod widget_ref_string;
+mod widget_ref_wrapper;
 
 use ratatui_core::layout::Rect;
 

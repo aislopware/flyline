@@ -452,12 +452,12 @@ unsafe extern "C" {
 
 pub(crate) static BASH_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
 
-/// Reset [`BASH_LOCK`] in a forked child so it is not left held.
+/// Reset `BASH_LOCK` in a forked child so it is not left held.
 ///
 /// # Safety
 ///
 /// Call only in the child, immediately after `fork`, before any other code in
-/// this process observes [`BASH_LOCK`]. The parent may have held the lock at
+/// this process observes `BASH_LOCK`. The parent may have held the lock at
 /// fork time; this force-unlocks it so the child does not deadlock.
 pub unsafe fn reset_bash_lock_after_fork() {
     while BASH_LOCK.is_locked() {
@@ -467,7 +467,7 @@ pub unsafe fn reset_bash_lock_after_fork() {
     }
 }
 
-/// Allocate via Bash `xmalloc` while holding [`BASH_LOCK`].
+/// Allocate via Bash `xmalloc` while holding `BASH_LOCK`.
 ///
 /// # Safety
 ///
@@ -479,7 +479,7 @@ pub unsafe fn locked_xmalloc(size: libc::size_t) -> *mut libc::c_void {
     unsafe { xmalloc(size) }
 }
 
-/// Free via Bash `xfree` while holding [`BASH_LOCK`].
+/// Free via Bash `xfree` while holding `BASH_LOCK`.
 ///
 /// # Safety
 ///

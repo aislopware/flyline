@@ -37,6 +37,14 @@ use crate::reflow::{LineComposer, LineTruncator, WordWrapper, WrappedLine};
 /// Note: If neither wrapping or a block is needed, consider rendering the [`Text`], [`Line`], or
 /// [`Span`] widgets directly.
 ///
+/// To keep styled text in your application state without a lifetime parameter, see [Storing
+/// styled text]. To render stored text without cloning it, pass a reference to [`Paragraph::new`].
+///
+/// Text that contains ANSI escape sequences, such as colored output from another command, must be
+/// converted into a [`Text`] before it is passed in. See [ANSI escape sequences].
+///
+/// [Storing styled text]: ratatui_core::text#storing-styled-text
+/// [ANSI escape sequences]: ratatui_core::text#ansi-escape-sequences
 /// [Textwrap crate]: https://crates.io/crates/textwrap
 /// [`wrap`]: Self::wrap
 /// [`alignment`]: Self::alignment
@@ -146,6 +154,17 @@ impl<'a> Paragraph<'a> {
     /// let paragraph = Paragraph::new(Text::styled("Hello, world!", Style::default()));
     /// let paragraph = Paragraph::new(Line::from(vec!["Hello, ".into(), "world!".red()]));
     /// ```
+    ///
+    /// If you store a [`Text`] and render it every frame, pass a reference to it instead of
+    /// cloning it. The paragraph borrows the stored strings rather than copying them:
+    ///
+    /// ```rust
+    /// use ratatui::text::Text;
+    /// use ratatui::widgets::Paragraph;
+    ///
+    /// let stored_text = Text::from(String::from("Hello, world!"));
+    /// let paragraph = Paragraph::new(&stored_text);
+    /// ```
     pub fn new<T>(text: T) -> Self
     where
         T: Into<Text<'a>>,
@@ -182,8 +201,9 @@ impl<'a> Paragraph<'a> {
     /// `style` accepts any type that is convertible to [`Style`] (e.g. [`Style`], [`Color`], or
     /// your own type that implements [`Into<Style>`]).
     ///
-    /// This applies to the entire widget, including the block if one is present. Any style set on
-    /// the block or text will be added to this style.
+    /// This applies to the entire widget, including the block if one is present. On the rendered
+    /// text, the [`Text`], [`Line`], and [`Span`] styles are patched on top of this style in that
+    /// order, so fields they set take precedence.
     ///
     /// # Example
     ///
@@ -195,6 +215,7 @@ impl<'a> Paragraph<'a> {
     /// ```
     ///
     /// [`Color`]: ratatui_core::style::Color
+    /// [`Span`]: ratatui_core::text::Span
     #[must_use = "method moves the value of self and returns the modified value"]
     pub fn style<S: Into<Style>>(mut self, style: S) -> Self {
         self.style = style.into();
@@ -305,40 +326,83 @@ impl<'a> Paragraph<'a> {
         self.alignment(Alignment::Right)
     }
 
-    /// Calculates the number of lines needed to fully render.
+    /// Calculates the height needed to render this paragraph at the given width.
     ///
-    /// Given a max line width, this method calculates the number of lines that a paragraph will
-    /// need in order to be fully rendered. For paragraphs that do not use wrapping, this count is
-    /// simply the number of lines present in the paragraph.
+    /// The `width` includes the [`Block`]'s borders and padding, if set through [`Self::block`].
     ///
-    /// This method will also account for the [`Block`] if one is set through [`Self::block`].
+    /// Returns `0` if `width` is zero. If the block's borders and padding consume all available
+    /// width, no text rows are rendered, but the returned height still includes the block's
+    /// vertical borders and padding.
+    ///
+    /// Text is wrapped according to [`Wrap`] if set through [`Self::wrap`]. Without wrapping, text
+    /// exceeding the available width is horizontally clipped, and the returned height is the number
+    /// of text lines plus the block's vertical borders and padding.
     ///
     /// Note: The design for text wrapping is not stable and might affect this API.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```ignore
-    /// use ratatui::{widgets::{Paragraph, Wrap}};
+    /// ```
+    /// # #[cfg(feature = "unstable-rendered-line-info")] {
+    /// use ratatui::widgets::{Paragraph, Wrap};
     ///
-    /// let paragraph = Paragraph::new("Hello World")
-    ///     .wrap(Wrap { trim: false });
+    /// let paragraph = Paragraph::new("Hello World").wrap(Wrap { trim: false });
     /// assert_eq!(paragraph.line_count(20), 1);
     /// assert_eq!(paragraph.line_count(10), 2);
+    /// # }
+    /// ```
+    ///
+    /// ## Determining Rendered Height
+    ///
+    /// The returned height can be used to size the render area for the given width.
+    ///
+    /// ```
+    /// # #[cfg(feature = "unstable-rendered-line-info")] {
+    /// use ratatui::buffer::Buffer;
+    /// use ratatui::layout::Rect;
+    /// use ratatui::widgets::{Block, Paragraph, Widget, Wrap};
+    ///
+    /// let paragraph = Paragraph::new("Hello World")
+    ///     .block(Block::bordered())
+    ///     .wrap(Wrap { trim: false });
+    ///
+    /// let width = 10;
+    /// let height = paragraph.line_count(width) as u16;
+    /// assert_eq!(height, 4);
+    ///
+    /// let area = Rect::new(0, 0, width, height);
+    /// let mut buffer = Buffer::empty(area);
+    /// paragraph.render(area, &mut buffer);
+    /// assert_eq!(
+    ///     buffer,
+    ///     Buffer::with_lines([
+    ///         "┌────────┐",
+    ///         "│Hello   │",
+    ///         "│World   │",
+    ///         "└────────┘",
+    ///     ]),
+    /// );
+    /// # }
     /// ```
     #[instability::unstable(
         feature = "rendered-line-info",
         issue = "https://github.com/ratatui/ratatui/issues/293"
     )]
     pub fn line_count(&self, width: u16) -> usize {
-        if width < 1 {
+        if width == 0 {
             return 0;
         }
 
-        let (top, bottom) = self
+        let ((left, right), (top, bottom)) = self
             .block
             .as_ref()
-            .map(Block::vertical_space)
+            .map(|block| (block.horizontal_space(), block.vertical_space()))
             .unwrap_or_default();
+
+        let text_width = width.saturating_sub(left).saturating_sub(right);
+        if text_width == 0 {
+            return (top as usize).saturating_add(bottom as usize);
+        }
 
         let count = if let Some(Wrap { trim }) = self.wrap {
             let styled = self.text.iter().map(|line| {
@@ -349,7 +413,7 @@ impl<'a> Paragraph<'a> {
                 let alignment = line.alignment.unwrap_or(self.alignment);
                 (graphemes, alignment)
             });
-            let mut line_composer = WordWrapper::new(styled, width, trim);
+            let mut line_composer = WordWrapper::new(styled, text_width, trim);
             let mut count = 0;
             while line_composer.next_line().is_some() {
                 count += 1;
@@ -496,6 +560,7 @@ impl Styled for Paragraph<'_> {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use ratatui_core::buffer::{Buffer, CellWidth};
     use ratatui_core::layout::{Alignment, Rect};
@@ -505,7 +570,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::block::TitlePosition;
+    use crate::block::{Padding, TitlePosition};
     use crate::borders::Borders;
 
     /// Tests the [`Paragraph`] widget against the expected [`Buffer`] by rendering it onto an equal
@@ -666,40 +731,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_line_styled() {
-        let l0 = Line::raw("unformatted");
-        let l1 = Line::styled("bold text", Style::new().bold());
-        let l2 = Line::styled("cyan text", Style::new().cyan());
-        let l3 = Line::styled("dim text", Style::new().dim());
-        let paragraph = Paragraph::new(vec![l0, l1, l2, l3]);
-
-        let mut expected =
-            Buffer::with_lines(["unformatted", "bold text", "cyan text", "dim text"]);
-        expected.set_style(Rect::new(0, 1, 9, 1), Style::new().bold());
-        expected.set_style(Rect::new(0, 2, 9, 1), Style::new().cyan());
-        expected.set_style(Rect::new(0, 3, 8, 1), Style::new().dim());
-
-        test_case(&paragraph, &expected);
-    }
-
-    #[test]
-    fn test_render_line_spans_styled() {
-        let l0 = Line::default().spans([
-            Span::styled("bold", Style::new().bold()),
-            Span::raw(" and "),
-            Span::styled("cyan", Style::new().cyan()),
-        ]);
-        let l1 = Line::default().spans([Span::raw("unformatted")]);
-        let paragraph = Paragraph::new(vec![l0, l1]);
-
-        let mut expected = Buffer::with_lines(["bold and cyan", "unformatted"]);
-        expected.set_style(Rect::new(0, 0, 4, 1), Style::new().bold());
-        expected.set_style(Rect::new(9, 0, 4, 1), Style::new().cyan());
-
-        test_case(&paragraph, &expected);
-    }
-
-    #[test]
     fn test_render_paragraph_with_block_with_bottom_title_and_border() {
         let block = Block::new()
             .borders(Borders::BOTTOM)
@@ -769,6 +800,54 @@ mod tests {
                 "word.       ",
             ]),
         );
+    }
+
+    #[test]
+    fn wrapped_cjk_glyphs_do_not_leave_stale_cells_outside_the_area() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let text = concat!(
+            "\u{2502} \u{6784}\u{5efa} \u{2502} \u{7f16}\u{8bd1}\u{6574}\u{4e2a}\u{5de5}",
+            "\u{4f5c}\u{533a}\u{5e76}\u{8fd0}\u{884c}\u{5168}\u{90e8}\u{6d4b}\u{8bd5}",
+            "\u{7528}\u{4f8b} \u{2502} \u{30d3}\u{30eb}\u{30c9} \u{2502} ",
+            "\u{30ef}\u{30fc}\u{30af}\u{30b9}\u{30da}\u{30fc}\u{30b9}\u{5168}",
+            "\u{4f53}\u{3092}\u{30c6}\u{30b9}\u{30c8}\u{3059}\u{308b} \u{2502} ",
+            "\u{be4c}\u{b4dc} \u{2502} \u{c791}\u{c5c5} \u{acf5}\u{ac04} ",
+            "\u{c804}\u{ccb4}\u{b97c} \u{d14c}\u{c2a4}\u{d2b8}\u{d569}\u{b2c8}\u{b2e4}"
+        );
+        let height = 40;
+
+        for width in 8..=56 {
+            let mut terminal = Terminal::new(TestBackend::new(width + 4, height)).unwrap();
+
+            // Seed the cells just outside the paragraph so a wide glyph that spills out
+            // can cause the buffer diff to skip clearing them on the next frame.
+            terminal
+                .draw(|frame| {
+                    for y in 0..height {
+                        frame.render_widget(Paragraph::new("X"), Rect::new(width, y, 1, 1));
+                    }
+                })
+                .unwrap();
+
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        Paragraph::new(text).wrap(Wrap { trim: false }),
+                        Rect::new(0, 0, width, height),
+                    );
+                })
+                .unwrap();
+
+            for y in 0..height {
+                assert_eq!(
+                    terminal.backend().buffer()[(width, y)].symbol(),
+                    " ",
+                    "stale cell outside paragraph at ({width}, {y})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -940,35 +1019,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_paragraph_with_styled_text() {
-        let text = Line::from(vec![
-            Span::styled("Hello, ", Style::default().fg(Color::Red)),
-            Span::styled("world!", Style::default().fg(Color::Blue)),
-        ]);
-
-        let mut expected_buffer = Buffer::with_lines(["Hello, world!"]);
-        expected_buffer.set_style(
-            Rect::new(0, 0, 7, 1),
-            Style::default().fg(Color::Red).bg(Color::Green),
-        );
-        expected_buffer.set_style(
-            Rect::new(7, 0, 6, 1),
-            Style::default().fg(Color::Blue).bg(Color::Green),
-        );
-
-        for paragraph in [
-            Paragraph::new(text.clone()),
-            Paragraph::new(text.clone()).wrap(Wrap { trim: false }),
-            Paragraph::new(text.clone()).wrap(Wrap { trim: true }),
-        ] {
-            test_case(
-                &paragraph.style(Style::default().bg(Color::Green)),
-                &expected_buffer,
-            );
-        }
-    }
-
-    #[test]
     fn test_render_paragraph_with_special_characters() {
         let text = "Hello, <world>!";
         for paragraph in [
@@ -1096,6 +1146,19 @@ mod tests {
     }
 
     #[test]
+    fn repaints_cell_after_wide_grapheme() {
+        let next = Buffer::with_lines(["────"]);
+        let mut prev = next.clone();
+        Paragraph::new("1️⃣").render(Rect::new(1, 0, 2, 1), &mut prev);
+
+        assert_eq!(prev[(1, 0)].symbol(), "1️⃣");
+
+        let diff = prev.diff(&next);
+        let cols: Vec<_> = diff.iter().map(|(x, _, _)| *x).collect();
+        assert_eq!(cols, [1, 2]);
+    }
+
+    #[test]
     fn can_be_stylized() {
         assert_eq!(
             Paragraph::new("").black().on_white().bold().not_dim().style,
@@ -1195,6 +1258,235 @@ mod tests {
     }
 
     #[test]
+    fn line_count_bordered() {
+        let paragraph = Paragraph::new("The quick brown fox jumps over the lazy dog")
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 24, paragraph.line_count(24) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "┌──────────────────────┐",
+            "│The quick brown fox   │",
+            "│jumps over the lazy   │",
+            "│dog                   │",
+            "└──────────────────────┘",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn line_count_left_border() {
+        let paragraph = Paragraph::new("The quick brown fox jumps over the lazy dog")
+            .wrap(Wrap { trim: false })
+            .block(Block::new().borders(Borders::LEFT));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 23, paragraph.line_count(23) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "│The quick brown fox   ",
+            "│jumps over the lazy   ",
+            "│dog                   ",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn line_count_right_border() {
+        let paragraph = Paragraph::new("The quick brown fox jumps over the lazy dog")
+            .wrap(Wrap { trim: false })
+            .block(Block::new().borders(Borders::RIGHT));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 23, paragraph.line_count(23) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "The quick brown fox   │",
+            "jumps over the lazy   │",
+            "dog                   │",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn line_count_top_border() {
+        let paragraph = Paragraph::new("The quick brown fox jumps over the lazy dog")
+            .wrap(Wrap { trim: false })
+            .block(Block::new().borders(Borders::TOP));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 22, paragraph.line_count(22) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "──────────────────────",
+            "The quick brown fox   ",
+            "jumps over the lazy   ",
+            "dog                   ",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn line_count_bottom_border() {
+        let paragraph = Paragraph::new("The quick brown fox jumps over the lazy dog")
+            .wrap(Wrap { trim: false })
+            .block(Block::new().borders(Borders::BOTTOM));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 22, paragraph.line_count(22) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "The quick brown fox   ",
+            "jumps over the lazy   ",
+            "dog                   ",
+            "──────────────────────",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn line_count_padding() {
+        let paragraph = Paragraph::new("The quick brown fox jumps over the lazy dog")
+            .wrap(Wrap { trim: false })
+            .block(Block::new().padding(Padding::uniform(1)));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 24, paragraph.line_count(24) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "                        ",
+            " The quick brown fox    ",
+            " jumps over the lazy    ",
+            " dog                    ",
+            "                        ",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    /// The example from <https://github.com/ratatui/ratatui/issues/2823>.
+    #[test]
+    fn line_count_issue_2823() {
+        let paragraph = Paragraph::new("This is an example")
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 18, paragraph.line_count(18) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "┌────────────────┐",
+            "│This is an      │",
+            "│example         │",
+            "└────────────────┘",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn line_count_borders_and_padding() {
+        let paragraph = Paragraph::new("The quick brown fox jumps over the lazy dog")
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().padding(Padding::horizontal(1)));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 26, paragraph.line_count(26) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "┌────────────────────────┐",
+            "│ The quick brown fox    │",
+            "│ jumps over the lazy    │",
+            "│ dog                    │",
+            "└────────────────────────┘",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn line_count_title() {
+        let paragraph = Paragraph::new("The quick brown fox jumps over the lazy dog")
+            .wrap(Wrap { trim: false })
+            .block(Block::new().title("Title"));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 22, paragraph.line_count(22) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "Title                 ",
+            "The quick brown fox   ",
+            "jumps over the lazy   ",
+            "dog                   ",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    /// Unwrapped text is clipped, so the height is the number of lines plus the borders.
+    #[test]
+    fn line_count_unwrapped_bordered() {
+        let paragraph =
+            Paragraph::new("The quick brown fox jumps over the lazy dog").block(Block::bordered());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 24, paragraph.line_count(24) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        let expected = Buffer::with_lines([
+            "┌──────────────────────┐",
+            "│The quick brown fox ju│",
+            "└──────────────────────┘",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    /// With no inner width there are no text rows, but the borders still count.
+    #[test]
+    fn line_count_bordered_without_inner_width() {
+        let paragraph = Paragraph::new("Hello world").block(Block::bordered());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, paragraph.line_count(2) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        #[rustfmt::skip]
+        let expected = Buffer::with_lines([
+            "┌┐",
+            "└┘",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    /// With no inner width there are no text rows, but the vertical padding still counts.
+    #[test]
+    fn line_count_padding_without_inner_width() {
+        let paragraph =
+            Paragraph::new("Hello world").block(Block::new().padding(Padding::new(1, 1, 1, 2)));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, paragraph.line_count(2) as u16));
+
+        Widget::render(&paragraph, buf.area, &mut buf);
+
+        #[rustfmt::skip]
+        let expected = Buffer::with_lines([
+            "  ",
+            "  ",
+            "  ",
+        ]);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn line_count_zero_width() {
+        let paragraph = Paragraph::new("Hello world").block(Block::bordered());
+        assert_eq!(paragraph.line_count(0), 0);
+    }
+
+    /// With no inner width and no vertical borders or padding, nothing is rendered.
+    #[test]
+    fn line_count_left_right_borders_without_inner_width() {
+        let paragraph = Paragraph::new("Hello world")
+            .block(Block::new().borders(Borders::LEFT | Borders::RIGHT));
+        assert_eq!(paragraph.line_count(2), 0);
+    }
+
+    #[test]
     fn widgets_paragraph_line_width() {
         let paragraph = Paragraph::new("Hello World");
         assert_eq!(paragraph.line_width(), 11);
@@ -1274,27 +1566,6 @@ mod tests {
         assert_eq!(p.alignment, Alignment::Right);
     }
 
-    /// Regression test for <https://github.com/ratatui/ratatui/issues/990>
-    ///
-    /// This test ensures that paragraphs with a block and styled text are rendered correctly.
-    /// It has been simplified from the original issue but tests the same functionality.
-    #[test]
-    fn paragraph_block_text_style() {
-        let text = Text::styled("Styled text", Color::Green);
-        let paragraph = Paragraph::new(text).block(Block::bordered());
-
-        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 3));
-        paragraph.render(Rect::new(0, 0, 20, 3), &mut buf);
-
-        let mut expected = Buffer::with_lines([
-            "┌──────────────────┐",
-            "│Styled text       │",
-            "└──────────────────┘",
-        ]);
-        expected.set_style(Rect::new(1, 1, 11, 1), Style::default().fg(Color::Green));
-        assert_eq!(buf, expected);
-    }
-
     #[rstest]
     #[case::bottom(Rect::new(0, 5, 15, 1))]
     #[case::right(Rect::new(20, 0, 15, 1))]
@@ -1334,5 +1605,145 @@ mod tests {
         let paragraph = Paragraph::new("Lorem ipsum");
         // This should not panic, even if the buffer has zero size.
         paragraph.render(buffer.area, &mut buffer);
+    }
+
+    mod style {
+        use super::*;
+
+        #[test]
+        fn style() {
+            let paragraph = Paragraph::new("").style(Style::new().red());
+            assert_eq!(paragraph.style, Style::new().red());
+        }
+
+        #[test]
+        fn render_overrides_prerendered_style() {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+            buf.set_style(buf.area, Style::new().red().on_green().italic());
+            Paragraph::new("hi").blue().render(buf.area, &mut buf);
+            let mut expected = Buffer::with_lines(["hi  "]);
+            expected.set_style(expected.area, Style::new().blue().on_green().italic());
+            assert_eq!(buf, expected);
+        }
+
+        #[test]
+        fn render_text_style_overrides_paragraph_style() {
+            let paragraph = Paragraph::new(Text::from("hi").blue()).red().on_green();
+            let mut expected = Buffer::with_lines(["hi  "]);
+            expected.set_style(expected.area, Style::new().red().on_green());
+            expected.set_style(Rect::new(0, 0, 2, 1), Style::new().blue());
+            test_case(&paragraph, &expected);
+        }
+
+        #[test]
+        fn render_line_style_overrides_text_style() {
+            let paragraph = Paragraph::new(Text::from(Line::from("hi").blue()).red().on_green());
+            let mut expected = Buffer::with_lines(["hi  "]);
+            expected.set_style(Rect::new(0, 0, 2, 1), Style::new().blue().on_green());
+            test_case(&paragraph, &expected);
+        }
+
+        #[test]
+        fn render_span_style_overrides_line_style() {
+            let paragraph = Paragraph::new(Line::from(Span::from("hi").blue()).red().on_green());
+            let mut expected = Buffer::with_lines(["hi  "]);
+            expected.set_style(Rect::new(0, 0, 2, 1), Style::new().blue().on_green());
+            test_case(&paragraph, &expected);
+        }
+
+        #[test]
+        fn render_paragraph_style_overrides_block_style_inside_the_block() {
+            let paragraph = Paragraph::new("hi")
+                .block(Block::bordered().on_green())
+                .on_blue();
+            let mut expected = Buffer::with_lines(["┌────┐", "│hi  │", "└────┘"]);
+            expected.set_style(expected.area, Style::new().on_green());
+            expected.set_style(Rect::new(1, 1, 4, 1), Style::new().on_blue());
+            test_case(&paragraph, &expected);
+        }
+
+        #[test]
+        fn render_line_styled() {
+            let l0 = Line::raw("unformatted");
+            let l1 = Line::styled("bold text", Style::new().bold());
+            let l2 = Line::styled("cyan text", Style::new().cyan());
+            let l3 = Line::styled("dim text", Style::new().dim());
+            let paragraph = Paragraph::new(vec![l0, l1, l2, l3]);
+
+            let mut expected =
+                Buffer::with_lines(["unformatted", "bold text", "cyan text", "dim text"]);
+            expected.set_style(Rect::new(0, 1, 9, 1), Style::new().bold());
+            expected.set_style(Rect::new(0, 2, 9, 1), Style::new().cyan());
+            expected.set_style(Rect::new(0, 3, 8, 1), Style::new().dim());
+
+            test_case(&paragraph, &expected);
+        }
+
+        #[test]
+        fn render_line_spans_styled() {
+            let l0 = Line::default().spans([
+                Span::styled("bold", Style::new().bold()),
+                Span::raw(" and "),
+                Span::styled("cyan", Style::new().cyan()),
+            ]);
+            let l1 = Line::default().spans([Span::raw("unformatted")]);
+            let paragraph = Paragraph::new(vec![l0, l1]);
+
+            let mut expected = Buffer::with_lines(["bold and cyan", "unformatted"]);
+            expected.set_style(Rect::new(0, 0, 4, 1), Style::new().bold());
+            expected.set_style(Rect::new(9, 0, 4, 1), Style::new().cyan());
+
+            test_case(&paragraph, &expected);
+        }
+
+        #[test]
+        fn render_with_styled_text() {
+            let text = Line::from(vec![
+                Span::styled("Hello, ", Style::default().fg(Color::Red)),
+                Span::styled("world!", Style::default().fg(Color::Blue)),
+            ]);
+
+            let mut expected_buffer = Buffer::with_lines(["Hello, world!"]);
+            expected_buffer.set_style(
+                Rect::new(0, 0, 7, 1),
+                Style::default().fg(Color::Red).bg(Color::Green),
+            );
+            expected_buffer.set_style(
+                Rect::new(7, 0, 6, 1),
+                Style::default().fg(Color::Blue).bg(Color::Green),
+            );
+
+            for paragraph in [
+                Paragraph::new(text.clone()),
+                Paragraph::new(text.clone()).wrap(Wrap { trim: false }),
+                Paragraph::new(text.clone()).wrap(Wrap { trim: true }),
+            ] {
+                test_case(
+                    &paragraph.style(Style::default().bg(Color::Green)),
+                    &expected_buffer,
+                );
+            }
+        }
+
+        /// Regression test for <https://github.com/ratatui/ratatui/issues/990>
+        ///
+        /// This test ensures that paragraphs with a block and styled text are rendered correctly.
+        /// It has been simplified from the original issue but tests the same functionality.
+        #[test]
+        fn block_text_style() {
+            let text = Text::styled("Styled text", Color::Green);
+            let paragraph = Paragraph::new(text).block(Block::bordered());
+
+            let mut buf = Buffer::empty(Rect::new(0, 0, 20, 3));
+            paragraph.render(Rect::new(0, 0, 20, 3), &mut buf);
+
+            let mut expected = Buffer::with_lines([
+                "┌──────────────────┐",
+                "│Styled text       │",
+                "└──────────────────┘",
+            ]);
+            expected.set_style(Rect::new(1, 1, 11, 1), Style::default().fg(Color::Green));
+            assert_eq!(buf, expected);
+        }
     }
 }

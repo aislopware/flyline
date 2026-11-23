@@ -3,7 +3,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState};
+use ratatui::widgets::{
+    Block, Borders, List, ListHighlightSpacing, ListItem, ListState, SelectionMode,
+};
 use ratatui::{Terminal, symbols};
 use rstest::rstest;
 
@@ -281,7 +283,7 @@ fn widget_list_should_not_ignore_empty_string_items() {
 }
 
 #[rstest]
-#[case::none_when_selected(None, HighlightSpacing::WhenSelected, [
+#[case::none_when_selected(None, ListHighlightSpacing::WhenSelected, [
     "┌─────────────┐",
     "│Item 1       │",
     "│Item 1a      │",
@@ -291,7 +293,7 @@ fn widget_list_should_not_ignore_empty_string_items() {
     "│Item 3c      │",
     "└─────────────┘",
 ])]
-#[case::none_always(None, HighlightSpacing::Always, [
+#[case::none_always(None, ListHighlightSpacing::Always, [
     "┌─────────────┐",
     "│   Item 1    │",
     "│   Item 1a   │",
@@ -301,7 +303,7 @@ fn widget_list_should_not_ignore_empty_string_items() {
     "│   Item 3c   │",
     "└─────────────┘",
 ])]
-#[case::none_never(None, HighlightSpacing::Never, [
+#[case::none_never(None, ListHighlightSpacing::Never, [
     "┌─────────────┐",
     "│Item 1       │",
     "│Item 1a      │",
@@ -311,7 +313,7 @@ fn widget_list_should_not_ignore_empty_string_items() {
     "│Item 3c      │",
     "└─────────────┘",
 ])]
-#[case::first_when_selected(Some(0), HighlightSpacing::WhenSelected, [
+#[case::first_when_selected(Some(0), ListHighlightSpacing::WhenSelected, [
     "┌─────────────┐",
     "│>> Item 1    │",
     "│   Item 1a   │",
@@ -321,7 +323,7 @@ fn widget_list_should_not_ignore_empty_string_items() {
     "│   Item 3c   │",
     "└─────────────┘",
 ])]
-#[case::first_always(Some(0), HighlightSpacing::Always, [
+#[case::first_always(Some(0), ListHighlightSpacing::Always, [
     "┌─────────────┐",
     "│>> Item 1    │",
     "│   Item 1a   │",
@@ -331,7 +333,7 @@ fn widget_list_should_not_ignore_empty_string_items() {
     "│   Item 3c   │",
     "└─────────────┘",
 ])]
-#[case::first_never(Some(0), HighlightSpacing::Never, [
+#[case::first_never(Some(0), ListHighlightSpacing::Never, [
     "┌─────────────┐",
     "│Item 1       │",
     "│Item 1a      │",
@@ -343,7 +345,7 @@ fn widget_list_should_not_ignore_empty_string_items() {
 ])]
 fn widgets_list_enable_always_highlight_spacing<'line, Lines>(
     #[case] selected: Option<usize>,
-    #[case] space: HighlightSpacing,
+    #[case] space: ListHighlightSpacing,
     #[case] expected: Lines,
 ) where
     Lines: IntoIterator,
@@ -368,4 +370,43 @@ fn widgets_list_enable_always_highlight_spacing<'line, Lines>(
     terminal
         .backend()
         .assert_buffer(&Buffer::with_lines(expected));
+}
+
+#[rstest]
+fn widgets_list_updates_bounds_when_items_change(
+    #[values(SelectionMode::Clamp, SelectionMode::Wrap)] mode: SelectionMode,
+) {
+    let backend = TestBackend::new(10, 3);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = ListState::default().with_selection_mode(mode);
+    state.select_last();
+
+    let mut render = |items: &[&str], state: &mut ListState| {
+        terminal
+            .draw(|f| {
+                f.render_stateful_widget(List::new(items.iter().copied()), f.area(), state);
+            })
+            .unwrap();
+    };
+    render(&["Item 0", "Item 1", "Item 2"], &mut state);
+    assert_eq!(state.item_count(), Some(3));
+    assert_eq!(state.selected(), Some(2));
+
+    // An explicit selection can target an item added since the previous render.
+    state.select(Some(3));
+    render(&["Item 0", "Item 1", "Item 2", "Item 3"], &mut state);
+    assert_eq!(state.item_count(), Some(4));
+    assert_eq!(state.selected(), Some(3));
+
+    render(&["Item 0"], &mut state);
+    assert_eq!(state.item_count(), Some(1));
+    assert_eq!(state.selected(), Some(0));
+    render(&[], &mut state);
+    assert_eq!(state.item_count(), Some(0));
+    assert_eq!(state.selected(), None);
+    assert_eq!(state.offset(), 0);
+
+    state.select(Some(0));
+    render(&["New item"], &mut state);
+    assert_eq!(state.selected(), Some(0));
 }
