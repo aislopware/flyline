@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Flyline installer
-# Usage: source <(curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh)
-#   or:  curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh | sh
+# Usage: source <(curl -sSfL https://github.com/aislopware/flyline/releases/latest/download/install.sh)
+#   or:  curl -sSfL https://github.com/aislopware/flyline/releases/latest/download/install.sh | sh
 #
 # NOTE FOR MAINTAINERS:
 # Both `source <(curl ...)` and traditional `curl ... | sh` (or `curl ... | bash`) MUST work
@@ -28,7 +28,7 @@ expand_path() {
     esac
 }
 
-REPO="HalFrgrd/flyline"
+REPO="aislopware/flyline"
 if [ -n "${FLYLINE_INSTALL_DIR:-}" ]; then
     INSTALL_DIR="$(expand_path "$FLYLINE_INSTALL_DIR")"
 elif [ -n "${FLYLINE_LOAD_DIR:-}" ]; then

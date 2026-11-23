@@ -2,14 +2,14 @@
 
 <div align="center">
 
-[![CI](https://github.com/HalFrgrd/flyline/actions/workflows/ci.yml/badge.svg)](https://github.com/HalFrgrd/flyline/actions/workflows/ci.yml)
-[![Latest Release](https://img.shields.io/github/v/release/HalFrgrd/flyline)](https://github.com/HalFrgrd/flyline/releases)
+[![CI](https://github.com/aislopware/flyline/actions/workflows/ci.yml/badge.svg)](https://github.com/aislopware/flyline/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/aislopware/flyline)](https://github.com/aislopware/flyline/releases)
 [![Built With Ratatui](https://ratatui.rs/built-with-ratatui/badge.svg)](https://ratatui.rs/)
 
 **A Bash plugin for modern command line editing.**
 
 
-[![Demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_overview.gif)](https://github.com/HalFrgrd/evp)
+[![Demo](https://github.com/aislopware/flyline/releases/download/assets/demo_overview.gif)](https://github.com/HalFrgrd/evp)
 
 </div>
 
@@ -33,7 +33,7 @@ Flyline is similar to [ble.sh](https://github.com/akinomyoga/ble.sh) but is writ
 
 ### Who is it for?
 1. You want an out-of-the-box great shell experience without the hassle of setting up half a dozen plugins, plugin managers, keyboard shortcuts, and startup scripts (any one of which might phone home).
-2. You're a terminal power user who wants to fine-tune their shell experience by writing in a modern language like Rust. Flyline can be the starting platform for you; [contributions welcome](https://github.com/HalFrgrd/flyline/discussions)!
+2. You're a terminal power user who wants to fine-tune their shell experience by writing in a modern language like Rust. Flyline can be the starting platform for you; [contributions welcome](https://github.com/aislopware/flyline/discussions)!
 
 # Installation
 
@@ -59,7 +59,7 @@ Other platforms (Intel Macs, 32-bit, FreeBSD, …) can still [build from source]
 > Run this command in bash to download flyline and update your `.bashrc` to load the latest version. No need for `sudo`!
 
 ```bash
-source <(curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh)
+source <(curl -sSfL https://github.com/aislopware/flyline/releases/latest/download/install.sh)
 ```
 On macOS you must first install a version of Bash that supports custom builtins: `brew install bash`
 
@@ -89,7 +89,7 @@ path into interactive Bash; it does not modify `.bashrc` or run an installer.
 Add the input to your system flake:
 
 ```nixn
-inputs.flyline.url = "github:HalFrgrd/flyline";
+inputs.flyline.url = "github:aislopware/flyline";
 ```
 
 Import the module and enable it in the NixOS configuration:
@@ -107,7 +107,7 @@ For local development, use `nix develop`. Build the package with
 
 ### Download from releases
 
-Download the latest `libflyline.so` for your system from [the releases page](https://github.com/HalFrgrd/flyline/releases). If you are on Linux, you probably want the `gnu` variant unless you know you are on a `musl` based Linux distro (e.g. Alpine, Chimera).
+Download the latest `libflyline.so` for your system from [the releases page](https://github.com/aislopware/flyline/releases). If you are on Linux, you probably want the `gnu` variant unless you know you are on a `musl` based Linux distro (e.g. Alpine, Chimera).
 Then, in your `.bashrc` (or in your current Bash session):
 ```bash
 enable flyline 2>/dev/null || enable -f /path/to/libflyline.so flyline
@@ -164,7 +164,7 @@ Flyline supports dynamic content in `PS1`, `RPS1` / `RPROMPT`, `PS1_FILL`, `PROM
 
 ## PS1
 The `PS1` environment variable sets the left prompt just like normal. See [Bash prompt documentation](https://www.gnu.org/software/bash/manual/html_node/Controlling-the-Prompt.html), [Arch Linux wiki](https://wiki.archlinux.org/title/Bash/Prompt_customization), or [Starship](https://starship.rs/) for more information.
-[![PS1 demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_prompts_ps1.gif)](https://github.com/HalFrgrd/evp)
+[![PS1 demo](https://github.com/aislopware/flyline/releases/download/assets/demo_prompts_ps1.gif)](https://github.com/HalFrgrd/evp)
 ```bash
 PS1='\u@\h:\w$ '
 PS1='\u@\h:\w\n$ '
@@ -176,7 +176,7 @@ PS1='\e[01;32m\u@\h\e[00m:\e[01;34m\w\e[00m\n$ '
 
 ## RPS1 / RPROMPT
 The `RPS1` / `RPROMPT` variable sets the right prompt similarly to Zsh.
-[![RPS1 demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_prompts_rps1.gif)](https://github.com/HalFrgrd/evp)
+[![RPS1 demo](https://github.com/aislopware/flyline/releases/download/assets/demo_prompts_rps1.gif)](https://github.com/HalFrgrd/evp)
 ```bash
 RPS1='\t'
 RPS1='\t\n<'
@@ -185,7 +185,7 @@ RPS1='\e[01;33m\t\n<\e[00m'
 
 ## PS1_FILL
 `PS1_FILL` fills the gap between the `PS1` and `RPS1` lines.
-[![PS1_FILL demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_prompts_ps1_fill.gif)](https://github.com/HalFrgrd/evp)
+[![PS1_FILL demo](https://github.com/aislopware/flyline/releases/download/assets/demo_prompts_ps1_fill.gif)](https://github.com/HalFrgrd/evp)
 ```bash
 PS1_FILL='-'
 PS1_FILL='🯁🯂🯃🮲🮳' # finger pointing to running man
@@ -194,7 +194,7 @@ PS1_FILL='🯁🯂🯃🮲🮳 \D{%.3f}'
 
 ## PROMPT_RULER
 `PROMPT_RULER` (or `PS1_RULER`) draws a horizontal separator above the prompt to cleanly separate previous command output from the new prompt.
-[![PROMPT_RULER demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_prompts_prompt_ruler.gif)](https://github.com/HalFrgrd/evp)
+[![PROMPT_RULER demo](https://github.com/aislopware/flyline/releases/download/assets/demo_prompts_prompt_ruler.gif)](https://github.com/HalFrgrd/evp)
 ```bash
 # Draw a full-width line with a box-drawing character
 PROMPT_RULER='─'
@@ -209,7 +209,7 @@ PROMPT_RULER='empty-line'
 ## PS2
 The `PS2` environment variable configures the multi-line continuation prompt.
 `FLYLINE_PROMPT_LINE_NUMBER` will be replaced by the line number:
-[![PS2 demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_prompts_ps2.gif)](https://github.com/HalFrgrd/evp)
+[![PS2 demo](https://github.com/aislopware/flyline/releases/download/assets/demo_prompts_ps2.gif)](https://github.com/HalFrgrd/evp)
 ```bash
 # Styled line numbers with ANSI color
 PS2='\e[2mFLYLINE_PROMPT_LINE_NUMBER>\e[0m '
@@ -225,7 +225,7 @@ PS2='\e[0m> '
 ## Final (transient) prompts
 `PS1_FINAL`, `RPS1_FINAL`, `PS1_FILL_FINAL`, and `PROMPT_RULER_FINAL` let you configure transient prompts. When a command is submitted, Flyline performs a final redraw using these environment variables instead of their standard counterparts. This keeps your terminal scrollback history clean by replacing complex, multi-line prompts with a minimal version.
 
-[![Final prompts demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_prompts_final.gif)](https://github.com/HalFrgrd/evp)
+[![Final prompts demo](https://github.com/aislopware/flyline/releases/download/assets/demo_prompts_final.gif)](https://github.com/HalFrgrd/evp)
 ```bash
 PS1_FINAL='Ran at \D{%Y-%m-%d %H:%M:%S}> '
 RPS1_FINAL=''
@@ -280,7 +280,7 @@ The available widget types are `animation`, `mouse-mode`, `copy-buffer`, `custom
 Create your own animations with `flyline create-prompt-widget animation --name [your animation name here] [FRAMES]...`.
 Flyline will replace strings in the prompt matching the animation name with the animation:
 
-[![Custom animation demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_custom_animation.gif)](https://github.com/HalFrgrd/evp)
+[![Custom animation demo](https://github.com/aislopware/flyline/releases/download/assets/demo_custom_animation.gif)](https://github.com/HalFrgrd/evp)
 
 More examples can be found in [examples/animations.sh](examples/animations.sh).
 
@@ -298,7 +298,7 @@ Examples:
   flyline create-prompt-widget animation --name "MY_ANIMATION" --fps 10  ⣾ ⣷ ⣯ ⣟ ⡿ ⢿ ⣻ ⣽
   flyline create-prompt-widget animation --name "john" --ping-pong --fps 5  '\e[33m\u' '\e[31m\u' '\e[35m\u' '\e[36m\u'
 
-See https://github.com/HalFrgrd/flyline/blob/master/examples/animations.sh for more details and example usage.
+See https://github.com/aislopware/flyline/blob/master/examples/animations.sh for more details and example usage.
 
 Usage: flyline create-prompt-widget animation [OPTIONS] --name <NAME> [FRAMES]...
 
@@ -433,7 +433,7 @@ RPS1=' FLYLINE_LAST_COMMAND_DURATION'
 Flyline can interact with your AI agent to suggest commands.
 This allows you to write a command in plain English and your agent will convert it into a Bash command:
 
-[![Agent mode demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_agent_mode.gif)](https://github.com/HalFrgrd/evp)
+[![Agent mode demo](https://github.com/aislopware/flyline/releases/download/assets/demo_agent_mode.gif)](https://github.com/HalFrgrd/evp)
 
 After setting up your agent with flyline, you can pass the buffer to your agent with Alt+Enter or simply Enter when your command starts with your trigger prefix (e.g. `ai: list files older than three days`).
 
@@ -470,7 +470,7 @@ Note that you will need to have [set up completions in normal Bash first](https:
 ### Intellisense style auto suggestions
 Flyline can automatically start tab completion suggestions as you type. This demo shows auto-started suggestions, confirming a suggestion, dismissing with Escape, and submitting the command.
 
-[![Auto tab completion demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_auto_tab_completion.gif)](https://github.com/HalFrgrd/evp)
+[![Auto tab completion demo](https://github.com/aislopware/flyline/releases/download/assets/demo_auto_tab_completion.gif)](https://github.com/HalFrgrd/evp)
 
 This is similar to [inshellisense](https://github.com/microsoft/inshellisense) but uses Bash's completion system and runs in the same process as Bash.
 
@@ -484,7 +484,7 @@ flyline suggestions --auto-suggest false --auto-suggest-inline true
 ### Fuzzy tab completion search
 When you're presented with suggestions, you can type to fuzzily search through the list:
 
-[![Fuzzy path suggestions demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_fuzzy_suggestions.gif)](https://github.com/HalFrgrd/evp)
+[![Fuzzy path suggestions demo](https://github.com/aislopware/flyline/releases/download/assets/demo_fuzzy_suggestions.gif)](https://github.com/HalFrgrd/evp)
 
 You can customize the fuzzy matching behavior using the `flyline suggestions set-fuzzy-mode` command. It accepts three options:
 - `all` (default): Fuzzy matching is enabled for all completion suggestions.
@@ -494,7 +494,7 @@ You can customize the fuzzy matching behavior using the `flyline suggestions set
 ### Fuzzy path completion
 The last path segments from the cursor to the end will be fuzzily matched on the directory contents:
 
-[![Fuzzy path suggestions demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_fuzzy_path_suggestions.gif)](https://github.com/HalFrgrd/evp)
+[![Fuzzy path suggestions demo](https://github.com/aislopware/flyline/releases/download/assets/demo_fuzzy_path_suggestions.gif)](https://github.com/HalFrgrd/evp)
 
 ### Glob & extended glob (extglob) expansion
 Flyline automatically previews and expands standard globs (`*`, `?`, `[...]`, `[[:digit:]]`, `{a,b}`) and Bash [`extglob`s](https://www.gnu.org/savannah-checkouts/gnu/bash/manual/bash.html#Pattern-Matching-1):
@@ -506,7 +506,7 @@ Flyline automatically previews and expands standard globs (`*`, `?`, `[...]`, `[
 - `+(pat1|pat2)`: Matches one or more occurrences of the patterns (e.g. `ls +([0-9]).txt`)
 - Multi-segment directory extglobs: `ls src/@(app|grammar)/*.rs`
 
-[![Glob & extglob auto completion demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_glob_expansion.gif)](https://github.com/HalFrgrd/evp)
+[![Glob & extglob auto completion demo](https://github.com/aislopware/flyline/releases/download/assets/demo_glob_expansion.gif)](https://github.com/HalFrgrd/evp)
 
 > [!TIP]
 > **Required Bash Settings**:
@@ -531,7 +531,7 @@ For instance, `ls $(grep --<Tab>)` calls `grep`'s tab completion logic if it's s
 ### Dynamic descriptions
 If a suggestion contains a tab character, flyline displays the contents after the tab as a description. If there are multiple tab characters, flyline will animate each tab-delimited frame at 24fps. Try `flyline set-cursor --interpolate-easing <Tab>` for an example:
 
-[![Tab completion easing demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_tab_completion_easing.gif)](https://github.com/HalFrgrd/evp)
+[![Tab completion easing demo](https://github.com/aislopware/flyline/releases/download/assets/demo_tab_completion_easing.gif)](https://github.com/HalFrgrd/evp)
 
 
 ANSI styling is supported in descriptions: any ANSI colour/style escape codes embedded in the tab-separated description text will be rendered as ratatui styled spans.
@@ -549,21 +549,21 @@ flyline suggestions --git-ref-mtime [true|false]
 ### Automatic completion synthesis (flycomp)
 If a command lacks a completion script, flyline can invoke [flycomp](https://github.com/HalFrgrd/flycomp) to dynamically synthesize one by parsing its `--help` outputs and man pages. You type the command name, press Tab, then flyline will prompt you to run flycomp to generate the completion spec:
 
-[![Automatic completion synthesis demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_flycomp.gif)](https://github.com/HalFrgrd/evp)
+[![Automatic completion synthesis demo](https://github.com/aislopware/flyline/releases/download/assets/demo_flycomp.gif)](https://github.com/HalFrgrd/evp)
 
 Flycomp settings are configurable with `flyline suggestions flycomp ...`.
 
 ### `LS_COLORS` styling
 Flyline styles your filename tab completion results according to `$LS_COLORS`:
 
-[![LS_COLORS demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_ls_colors.gif)](https://github.com/HalFrgrd/evp)
+[![LS_COLORS demo](https://github.com/aislopware/flyline/releases/download/assets/demo_ls_colors.gif)](https://github.com/HalFrgrd/evp)
 
 # Command history
 
 **Fuzzy history search:**
 Flyline offers a fuzzy history search similar to fzf or skim accessed with `Ctrl+R`:
 
-[![Fuzzy history demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_fuzzy_history.gif)](https://github.com/HalFrgrd/evp)
+[![Fuzzy history demo](https://github.com/aislopware/flyline/releases/download/assets/demo_fuzzy_history.gif)](https://github.com/HalFrgrd/evp)
 
 You can access a list of commands in the current Bash session that you Ctrl+C'd while editing using `Alt+R`.
 This is useful if you start writing a command, realise you want to run another command first, but you don't want to lose your first command.
@@ -574,7 +574,7 @@ Inline suggestions show the most recent matching history entry as you type.
 - Accept one word at a time with `Ctrl+Right` (whitespace words) or `Alt+Right` (word parts, stopping at punctuation and path segments).
 - With the [JSONL history backend](#flyline-jsonl-history-backend), entries run in the current directory are preferred (`flyline editor --inline-history-prefer global|cwd`).
 
-[![Inline history demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_inline_history.gif)](https://github.com/HalFrgrd/evp)
+[![Inline history demo](https://github.com/aislopware/flyline/releases/download/assets/demo_inline_history.gif)](https://github.com/HalFrgrd/evp)
 
 **Scroll through prefix matches:**
 Pressing `Up` will scroll through history entries that are a prefix match with the current command.
@@ -610,7 +610,7 @@ Flyline can configure the cursor styling, color, and interpolation/easing animat
 
 You can configure the style and animation effects using the `flyline set-cursor` command:
 
-[![Cursor style demo](https://github.com/HalFrgrd/flyline/releases/download/assets/demo_cursor_style.gif)](https://github.com/HalFrgrd/evp)
+[![Cursor style demo](https://github.com/aislopware/flyline/releases/download/assets/demo_cursor_style.gif)](https://github.com/HalFrgrd/evp)
 
 For example, to configure a custom color with elastic interpolation and fade effects:
 ```bash
@@ -763,7 +763,7 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 
-Read more at https://github.com/HalFrgrd/flyline
+Read more at https://github.com/aislopware/flyline
 ```
 <!-- FLYLINE_HELP_END -->
 
