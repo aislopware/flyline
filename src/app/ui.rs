@@ -2004,13 +2004,16 @@ impl App<'_> {
 
                     // Retroactive style/fill pass for the single row
                     let suggestion_width = main_text_width;
-                    for col_idx in (x as usize + 1)..(x as usize + 1 + inner_width) {
-                        let cell = &mut content.buf[current_y as usize][col_idx];
+                    let first_col = x as usize + 1;
+                    let row = &mut content.buf[current_y as usize];
+                    for (relative_col, cell) in row[first_col..first_col + inner_width]
+                        .iter_mut()
+                        .enumerate()
+                    {
                         if cell.cell.symbol().is_empty() {
                             cell.cell.set_symbol(" ");
                         }
                         cell.tag = tag;
-                        let relative_col = col_idx - (x as usize + 1);
                         if relative_col < suggestion_width {
                             cell.cell
                                 .set_style(Palette::convert_to_highlighted(cell.cell.style()));
@@ -2053,8 +2056,9 @@ impl App<'_> {
                     // Retroactive style/fill pass for the selected item rows to make sure they are highlighted properly
                     let mut in_description = false;
                     for row_idx in item_start_row..=item_end_row {
-                        for col_idx in (x as usize + 1)..(x as usize + 1 + inner_width) {
-                            let cell = &mut content.buf[row_idx as usize][col_idx];
+                        let first_col = x as usize + 1;
+                        let row = &mut content.buf[row_idx as usize];
+                        for cell in &mut row[first_col..first_col + inner_width] {
                             if !cell.cell.symbol().is_empty()
                                 && !cell.cell.style().add_modifier.contains(Modifier::REVERSED)
                             {

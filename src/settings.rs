@@ -651,8 +651,10 @@ mod tests {
 
     #[test]
     fn test_settings_diff_detects_changed_history_jsonl_path() {
-        let mut settings = Settings::default();
-        settings.history_jsonl_path = std::path::PathBuf::from("/tmp/test.jsonl");
+        let settings = Settings {
+            history_jsonl_path: std::path::PathBuf::from("/tmp/test.jsonl"),
+            ..Settings::default()
+        };
         let diff = settings.diff();
         let changed: Vec<_> = diff.iter().filter(|e| !e.is_default).collect();
         assert_eq!(changed.len(), 1);
@@ -702,8 +704,10 @@ mod tests {
 
     #[test]
     fn test_settings_diff_detects_changed_delayed_startup_ms() {
-        let mut settings = Settings::default();
-        settings.delayed_startup_ms = 300;
+        let settings = Settings {
+            delayed_startup_ms: 300,
+            ..Settings::default()
+        };
         let diff = settings.diff();
         let changed: Vec<_> = diff.iter().filter(|e| !e.is_default).collect();
         assert_eq!(changed.len(), 1);

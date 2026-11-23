@@ -589,10 +589,10 @@ impl<T: Clone + Copy + PartialEq + Eq + std::hash::Hash + Default> Contents<T> {
         }
 
         // Clear all cells spanning this grapheme
-        for c in start_col..=end_col {
-            self.buf[row][c].cell.reset();
-            self.buf[row][c].tag = T::default();
-            self.buf[row][c].is_continuation = false;
+        for tagged in &mut self.buf[row][start_col..=end_col] {
+            tagged.cell.reset();
+            tagged.tag = T::default();
+            tagged.is_continuation = false;
         }
 
         // Set cursor to start_col and write the character using write_span_internal
