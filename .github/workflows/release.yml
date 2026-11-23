@@ -36,22 +36,23 @@ jobs:
       version: ${{ env.VERSION }}
 
   build-release:
-    name: Build ${{ matrix.target }}${{ matrix.suffix }}
+    name: Build ${{ matrix.target }}
     needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux (via cross)
-          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          # Linux glibc: docker/builder.Dockerfile (AlmaLinux 9, glibc 2.34 floor), built natively per arch
+          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest,    build_tool: bake,  lib: libflyline.so }
+          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-24.04-arm, build_tool: bake,  lib: libflyline.so }
+          # Linux musl (via cross)
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,    build_tool: cross, lib: libflyline.so }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest,    build_tool: cross, lib: libflyline.so }
           # Android (via cross)
-          - { target: aarch64-linux-android,      os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
+          - { target: aarch64-linux-android,      os: ubuntu-latest,    build_tool: cross, lib: libflyline.so }
           # macOS (native cargo)
-          - { target: aarch64-apple-darwin,       os: macos-latest,  build_tool: cargo, lib: libflyline.dylib, feature_flags: "",                        suffix: "" }
+          - { target: aarch64-apple-darwin,       os: macos-latest,     build_tool: cargo, lib: libflyline.dylib }
 
     steps:
       - name: Checkout
@@ -61,6 +62,7 @@ jobs:
       # different toolchain from the one rustup then selects in the repo, and
       # the target would be added to the wrong one.
       - name: Install Rust toolchain
+        if: matrix.build_tool != 'bake'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.100.0"
@@ -72,12 +74,26 @@ jobs:
         with:
           tool: cross@0.2.5
 
-      - name: Build ${{ matrix.target }}${{ matrix.suffix }}
-        run: ${{ matrix.build_tool }} build --release --target ${{ matrix.target }} ${{ matrix.feature_flags }}
+      - name: Set up Docker Buildx
+        if: matrix.build_tool == 'bake'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build ${{ matrix.target }}
+        if: matrix.build_tool == 'bake'
+        uses: docker/bake-action@v7
+        with:
+          files: docker-bake.hcl
+          targets: extract-release-artifact
+          set: |
+            extract-release-artifact.output=type=local,dest=target/${{ matrix.target }}/release
+
+      - name: Build ${{ matrix.target }}
+        if: matrix.build_tool != 'bake'
+        run: ${{ matrix.build_tool }} build --release --lib --target ${{ matrix.target }}
 
       - name: Prepare release artifact
         run: |
-          ARCHIVE="libflyline-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}"
+          ARCHIVE="libflyline-${{ github.ref_name }}-${{ matrix.target }}"
           echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
 
       - name: Build archive

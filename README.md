@@ -40,6 +40,19 @@ Flyline is similar to [ble.sh](https://github.com/akinomyoga/ble.sh) but is writ
 > [!IMPORTANT]
 > After installing, run `flyline run-tutorial` and if you don't like the mouse capturing: `flyline mouse --mode disabled`
 
+### Supported platforms
+
+Flyline needs Bash 4.4 or newer and is tested on Bash 5.1, 5.2 and 5.3. Prebuilt libraries are published for:
+
+| Platform | Minimum |
+|---|---|
+| Linux x86_64 / aarch64, glibc | glibc 2.34 (RHEL 9, Amazon Linux 2023, Ubuntu 22.04, Debian 13 and newer) |
+| Linux x86_64 / aarch64, musl | Alpine and other musl distros |
+| macOS, Apple silicon | macOS 11, with Homebrew Bash |
+| Android aarch64 | Termux |
+
+Other platforms (Intel Macs, 32-bit, FreeBSD, …) can still [build from source](#build-from-source).
+
 ### Quick install: `install.sh`
 
 > [!TIP]

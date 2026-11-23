@@ -1,4 +1,4 @@
-# An older supported LTS on purpose; newer distros are covered by arch/alpine.
+# The oldest supported Ubuntu LTS (glibc 2.35, bash 5.1), close to the glibc 2.34 floor.
 FROM ubuntu:22.04
 
 ARG FLYLINE_INSTALL_VERSION
