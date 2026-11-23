@@ -133,6 +133,7 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 
 ## v2.0.2 (2026-11-23)
 - **No terminal attached**: `flyline version` and other commands that detect the terminal now work when bash has no controlling terminal, such as when a script or a coding agent runs `bash -ic`.
+- **Atuin import**: `flyline history import` with no path now finds Atuin's database in `~/.atuin/data` (recent Atuin) or `~/.local/share/atuin`, on macOS too.
 "#;
 
 pub(crate) fn pretty_changelog() -> String {
