@@ -1,4 +1,5 @@
-FROM termux/termux-docker:latest
+# flyline publishes Android builds for aarch64 only, so test the aarch64 Termux image.
+FROM termux/termux-docker:aarch64
 
 ARG FLYLINE_INSTALL_VERSION
 
