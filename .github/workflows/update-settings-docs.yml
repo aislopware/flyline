@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   update-settings-docs:
-    name: Regenerate flyline --help text and update README
+    name: Regenerate flyline --help text and update the guide
     runs-on: ubuntu-latest
     env:
       NO_COLOR: "1"
@@ -37,7 +37,7 @@ jobs:
       # flyline_help.txt, flyline_create_prompt_widget_animation_help.txt,
       # flyline_create_prompt_widget_mouse_mode_help.txt, and
       # flyline_create_prompt_widget_custom_help.txt are now in the project root (output of extract-help-text)
-      - name: Update README between marker comments
+      - name: Update docs/guide.md between marker comments
         run: |
           python3 - <<'EOF'
           import pathlib
@@ -47,7 +47,7 @@ jobs:
               end = next(i for i, l in enumerate(lines) if l.strip() == end_marker)
               return lines[:start] + replacement_lines + lines[end + 1:]
 
-          lines = pathlib.Path("README.md").read_text().splitlines(keepends=True)
+          lines = pathlib.Path("docs/guide.md").read_text().splitlines(keepends=True)
 
           help_text = pathlib.Path("flyline_help.txt").read_text().rstrip("\n")
           lines = replace_between_markers(
@@ -81,8 +81,8 @@ jobs:
               ["<!-- FLYLINE_CREATE_PROMPT_WIDGET_CUSTOM_HELP_START -->\n", "```\n", *[l + "\n" for l in custom_help_text.splitlines()], "```\n", "<!-- FLYLINE_CREATE_PROMPT_WIDGET_CUSTOM_HELP_END -->\n"],
           )
 
-          pathlib.Path("README.md").write_text("".join(lines))
-          print("README.md updated")
+          pathlib.Path("docs/guide.md").write_text("".join(lines))
+          print("docs/guide.md updated")
           EOF
 
       - name: Create or update pull request
@@ -92,15 +92,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -B update-settings-docs
-          git add README.md
+          git add docs/guide.md
           git diff --cached --quiet && echo "No changes to settings docs" && exit 0
           git commit -m "chore: update settings documentation from flyline --help"
           git push --force origin update-settings-docs
           gh pr create \
             --title "chore: update settings documentation" \
-            --body "Automated PR to update the Settings section of the README from \`flyline --help\`." \
+            --body "Automated PR to update the Settings section of docs/guide.md from \`flyline --help\`." \
             --base master \
             --head update-settings-docs \
           || gh pr edit update-settings-docs \
             --title "chore: update settings documentation" \
-            --body "Automated PR to update the Settings section of the README from \`flyline --help\`."
+            --body "Automated PR to update the Settings section of docs/guide.md from \`flyline --help\`."

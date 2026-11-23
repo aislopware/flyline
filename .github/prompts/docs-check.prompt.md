@@ -1,7 +1,7 @@
 You are reviewing the documentation of a Rust project called Flyline.
 
 Check the following documentation sources for consistency with the actual source code:
-- README.md (and any other README files)
+- README.md and docs/guide.md (and any other README files)
 - Doc comments in src/lib.rs that clap uses to generate CLI help messages
   (look for #[arg(...)], #[command(...)], and /// comments on FlylineArgs fields and Commands variants)
 - Shell scripts in examples/

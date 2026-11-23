@@ -1,4 +1,4 @@
-// The doc comments in this module are clap's `--help` text, which README.md mirrors, so they
+// The doc comments in this module are clap's `--help` text, which docs/guide.md mirrors, so they
 // use placeholders like <KEY> and bare URLs rather than rustdoc markup.
 #![allow(
     rustdoc::bare_urls,
