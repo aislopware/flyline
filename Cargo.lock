@@ -546,11 +546,8 @@ version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "027cd1402a609c71a9ac333c7e3d90ee042e7a131da1a83da8c60df323f12f61"
 dependencies = [
- "chrono",
  "rust_decimal",
- "serde",
  "thiserror 2.0.21",
- "time",
  "winnow",
 ]
 
