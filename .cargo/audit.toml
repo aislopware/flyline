@@ -1,0 +1,6 @@
+# cargo audit (supply-chain.yml) reads this; keep it in step with the
+# [advisories] ignore list in deny.toml, which carries the reasons.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0543", # chrono unmaintained
+]

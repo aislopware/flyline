@@ -3,14 +3,22 @@ members = [
     "crates/flybuffer",
     "crates/flycontent",
 ]
+# Vendored forks keep their own workspaces, lints and formatting; see vendor/README.md.
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2024"
+# MSRV, set by the dependency tree (skim needs 1.91). CI checks it in the msrv
+# job of code-quality.yml; everything else builds with rust-toolchain.toml.
+rust-version = "1.91"
 
 [workspace.dependencies]
 flybuffer = { path = "crates/flybuffer" }
 flycontent = { path = "crates/flycontent" }
 
 anyhow = "1.0"
-clap = { version = "4.6.1", features = ["derive"] }
-clap_complete = { version = "4.6.3", features = ["unstable-dynamic"] }
+clap = { version = "4.6.9", features = ["derive"] }
+clap_complete = { version = "4.6.12", features = ["unstable-dynamic"] }
 easing-function = "0.1"
 itertools = "0.15"
 log = "0.4"
@@ -24,10 +32,12 @@ tui-scrollbar = "0.2"
 unicode-segmentation = "1.13"
 unicode-width = { version = "0.2", default-features = false }
 
-ansi-to-tui = { git = "https://github.com/HalFrgrd/ansi-to-tui.git", branch = "main" }
-ratatui = { git = "https://github.com/HalFrgrd/ratatui.git", branch = "inline_viewport_improvments", default-features = false, features = ["macros", "serde", "termina", "unstable-backend-writer", "unstable-rendered-line-info"] }
-skim = { git = "https://github.com/HalFrgrd/skim", rev = "7908ee85a5f6cd49575925fcc0bdef3999409d26", default-features = false, features = ["algos_only"] }
-termina = { git = "https://github.com/HalFrgrd/termina.git", rev = "dfa34e768a46d298e4b06fff6242c3d571f7061f" }
+# crates.io release; [patch.crates-io] points its ratatui-core at the fork below.
+ansi-to-tui = "8.0.1"
+# Vendored forks (vendor/README.md): changes flyline needs that upstream does not have.
+ratatui = { path = "vendor/ratatui/ratatui", default-features = false, features = ["macros", "serde", "termina", "unstable-backend-writer", "unstable-rendered-line-info"] }
+skim = { path = "vendor/skim", default-features = false, features = ["algos_only"] }
+termina = { path = "vendor/termina" }
 
 # ref: https://doc.rust-lang.org/stable/clippy/index.html
 [workspace.lints.clippy]
@@ -39,7 +49,9 @@ multiple_crate_versions = { level = "allow", priority = 1 }
 [package]
 name = "flyline"
 version = "1.11.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -53,19 +65,23 @@ anyhow.workspace = true
 chrono = "0.4"
 clap.workspace = true
 clap_complete.workspace = true
-ctor = "1.0"
-dirs = "6.0"
-duration-str = "0.21"
+dirs = "7.0"
+# Only `parse` is used; the default features pull in chrono, time and serde.
+duration-str = { version = "0.21", default-features = false }
 easing-function.workspace = true
 flybuffer.workspace = true
-flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "754be16d7a2130ad12b6d038d42a8933c92c103f" }
+flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "34e8e6e798fa35b4daa3d4c5586241e95d2dbacf" }
 flycontent.workspace = true
 itertools.workspace = true
 libc = "0.2"
 log.workspace = true
 lscolors.workspace = true
 mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
-nix = { version = "0.29", features = ["fs", "poll", "process", "signal", "user"] }
+nix = { version = "0.32", features = ["fs", "poll", "process", "signal", "user"] }
+# Held at 0.12: termina (^0.12, also in 0.4.0) would keep 0.12 in the graph, so
+# 0.13 compiles parking_lot, parking_lot_core and lock_api twice into the dylib
+# that every shell loads, and raises the MSRV to 1.95. Its gain is contended
+# lock throughput, which a line editor does not hit. Move when termina does.
 parking_lot = "0.12"
 parse-style.workspace = true
 pulldown-cmark.workspace = true
@@ -81,10 +97,7 @@ termina.workspace = true
 tui-scrollbar.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
-uuid = { version = "1.10", features = ["v7"] }
-
-[features]
-pre_bash_4_4 = []
+uuid = { version = "1.29", features = ["v7"] }
 
 [dev-dependencies]
 rusty-fork = "0.3.1"
@@ -101,18 +114,10 @@ chrono = "0.4"
 # cross-rs configurations
 [package.metadata.cross.target.aarch64-linux-android]
 dockerfile = "docker/cross/aarch64-linux-android.Dockerfile"
-[package.metadata.cross.target.aarch64-unknown-linux-gnu]
-dockerfile = "docker/cross/aarch64-unknown-linux-gnu.Dockerfile"
-[package.metadata.cross.target.armv7-linux-androideabi]
-dockerfile = "docker/cross/armv7-linux-androideabi.Dockerfile"
-[package.metadata.cross.target.i686-linux-android]
-dockerfile = "docker/cross/i686-linux-android.Dockerfile"
-[package.metadata.cross.target.x86_64-linux-android]
-dockerfile = "docker/cross/x86_64-linux-android.Dockerfile"
-[package.metadata.cross.target.x86_64-unknown-linux-gnu]
-dockerfile = "docker/cross/x86_64-unknown-linux-gnu.Dockerfile"
 
+# crates.io dependents (ansi-to-tui, tui-scrollbar, ratatui-termina's termina)
+# must link the vendored copies, not a second ratatui-core or termina.
 [patch.crates-io]
-ratatui-core = { git = "https://github.com/HalFrgrd/ratatui.git", branch = "inline_viewport_improvments" }
-termina = { git = "https://github.com/HalFrgrd/termina.git", rev = "dfa34e768a46d298e4b06fff6242c3d571f7061f" }
+ratatui-core = { path = "vendor/ratatui/ratatui-core" }
+termina = { path = "vendor/termina" }
 

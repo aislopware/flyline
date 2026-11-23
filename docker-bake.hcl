@@ -1,9 +1,7 @@
+# The oldest bash on a supported distro is 5.1 (RHEL 9, Ubuntu 22.04);
+# 5.2 is Debian 13 / Ubuntu 24.04, 5.3 is current upstream.
 variable "BASH_VERSION_MATRIX" {
-    default = ["4.4-rc1", "4.4.18", "5.0", "5.3"]
-}
-
-variable "PRE_BASH_4_4_VERSION_MATRIX" {
-    default = ["3.2.57"]
+    default = ["5.1", "5.2", "5.3"]
 }
 
 variable "FLYLINE_INSTALL_VERSION" {
@@ -38,16 +36,6 @@ target "extract-integration-test-build-artifact" {
     target = "flyline-built-artifact"
 }
 
-target "extract-pre-bash-4-4-integration-test-build-artifact" {
-    context = "."
-    output = ["type=local,dest=docker/build-pre-bash-4-4-integration-test"]
-    dockerfile = "docker/builder.Dockerfile"
-    target = "flyline-built-artifact"
-    args = {
-        CARGO_FEATURES = "pre_bash_4_4"
-    }
-}
-
 target "lib-tests" {
     context = "."
     dockerfile = "docker/builder.Dockerfile"
@@ -67,19 +55,6 @@ target "specific-bash-version" {
     tags = ["bash-${docker_bash_version}"]
 }
 
-target "specific-bash-version-pre-4-4" {
-    context = "."
-    dockerfile = "docker/specific_bash_version.Dockerfile"
-    name = "specific-bash-version-${replace(docker_bash_version, ".", "_")}"
-    matrix = {
-        docker_bash_version = PRE_BASH_4_4_VERSION_MATRIX
-    }
-    args = {
-        DOCKER_BASH_VERSION = docker_bash_version
-    }
-    tags = ["bash-${docker_bash_version}"]
-}
-
 target "bash-integration-tests" {
     context = "."
     contexts = {
@@ -89,23 +64,6 @@ target "bash-integration-tests" {
     name = "bash-integration-test-${replace(docker_bash_version, ".", "_")}"
     matrix = {
         docker_bash_version = BASH_VERSION_MATRIX
-    }
-    dockerfile = "docker/bash_integration_test.Dockerfile"
-    args = {
-        DOCKER_BASH_VERSION = docker_bash_version
-    }
-}
-
-target "bash-integration-tests-pre-4-4" {
-    context = "."
-    contexts = {
-        built-artifact = "target:extract-pre-bash-4-4-integration-test-build-artifact",
-        specific-bash-version = "target:specific-bash-version-${replace(docker_bash_version, ".", "_")}"
-    }
-    name = "bash-integration-test-${replace(docker_bash_version, ".", "_")}"
-    tags = ["bash-integration-test-pre-4-4-${docker_bash_version}"]
-    matrix = {
-        docker_bash_version = PRE_BASH_4_4_VERSION_MATRIX
     }
     dockerfile = "docker/bash_integration_test.Dockerfile"
     args = {
@@ -301,17 +259,6 @@ target "install-test-termux" {
     }
 }
 
-
-target "install-test-bash-3-2-57" {
-    context = "."
-    contexts = {
-        specific-bash-version = "target:specific-bash-version-3_2_57"
-    }
-    dockerfile = "docker/install_test_bash_3.2.57.Dockerfile"
-    args = {
-        FLYLINE_INSTALL_VERSION = FLYLINE_INSTALL_VERSION
-    }
-}
 
 target "test-mimalloc-symbols" {
     context = "."

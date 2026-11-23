@@ -39,10 +39,8 @@ rustPlatform.buildRustPackage {
 
   # The docker_integration_tests need Docker, which the sandbox lacks; skip them.
   checkFlags = [
-    "--skip=test_bash_3_2_57"
-    "--skip=test_bash_4_4_18"
-    "--skip=test_bash_4_4_rc1"
-    "--skip=test_bash_5_0"
+    "--skip=test_bash_5_1"
+    "--skip=test_bash_5_2"
     "--skip=test_bash_5_3"
   ];
 

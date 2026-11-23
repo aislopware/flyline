@@ -3,34 +3,19 @@ use std::path::Path;
 
 use crate::grammar::{QuoteType, find_quote_type};
 
-/* Values for COMPSPEC options field. */
-// In bash >= 4.4, COPT_NOQUOTE was inserted at (1<<4), shifting later values.
-// In bash < 4.4: NOSPACE=(1<<4), BASHDEFAULT=(1<<5), PLUSDIRS=(1<<6)
-// In bash >= 4.4: NOQUOTE=(1<<4), NOSPACE=(1<<5), BASHDEFAULT=(1<<6), PLUSDIRS=(1<<7), NOSORT=(1<<8), FULLQUOTE=(1<<9)
+/* Values for COMPSPEC options field (pcomplete.h, bash >= 4.4). */
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum CompspecOption {
     Reserved = 1 << 0,
     Default = 1 << 1,
     Filenames = 1 << 2,
     Dirnames = 1 << 3,
-    #[cfg(not(feature = "pre_bash_4_4"))]
     NoQuote = 1 << 4,
-    #[cfg(not(feature = "pre_bash_4_4"))]
     NoSpace = 1 << 5,
-    #[cfg(not(feature = "pre_bash_4_4"))]
     BashDefault = 1 << 6,
-    #[cfg(not(feature = "pre_bash_4_4"))]
     PlusDirs = 1 << 7,
-    #[cfg(not(feature = "pre_bash_4_4"))]
     NoSort = 1 << 8,
-    #[cfg(not(feature = "pre_bash_4_4"))]
     FullQuote = 1 << 9,
-    #[cfg(feature = "pre_bash_4_4")]
-    NoSpace = 1 << 4,
-    #[cfg(feature = "pre_bash_4_4")]
-    BashDefault = 1 << 5,
-    #[cfg(feature = "pre_bash_4_4")]
-    PlusDirs = 1 << 6,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,19 +46,13 @@ impl CompletionFlags {
             quote_type,
             readline_default_fallback_desired: foundcs & (CompspecOption::Default as libc::c_int)
                 != 0,
-            #[cfg(not(feature = "pre_bash_4_4"))]
             filename_quoting_desired: foundcs & (CompspecOption::NoQuote as libc::c_int) == 0,
-            #[cfg(feature = "pre_bash_4_4")]
-            filename_quoting_desired: true,
             filename_completion_desired: foundcs & (CompspecOption::Filenames as libc::c_int) != 0,
             no_suffix_desired: foundcs & (CompspecOption::NoSpace as libc::c_int) != 0,
             suffix_character: char::from_u32(append_char as u32).unwrap_or(' '),
             bash_default_fallback_desired: foundcs & (CompspecOption::BashDefault as libc::c_int)
                 != 0,
-            #[cfg(not(feature = "pre_bash_4_4"))]
             nosort_desired: foundcs & (CompspecOption::NoSort as libc::c_int) != 0,
-            #[cfg(feature = "pre_bash_4_4")]
-            nosort_desired: false,
             some_dont_end_in_equal_sign,
         }
     }

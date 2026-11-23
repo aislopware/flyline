@@ -2906,25 +2906,25 @@ mod test_keyword_bracket_color {
         let tokens = parser.tokens();
 
         // echo
-        assert_eq!(tokens[0].annotations.is_glob, false);
+        assert!(!tokens[0].annotations.is_glob);
         // *.txt
-        assert_eq!(tokens[2].annotations.is_glob, true);
+        assert!(tokens[2].annotations.is_glob);
         // ./foo/
-        assert_eq!(tokens[4].annotations.is_glob, false);
+        assert!(!tokens[4].annotations.is_glob);
         // {
-        assert_eq!(tokens[5].annotations.is_glob, true);
+        assert!(tokens[5].annotations.is_glob);
         // a,b
-        assert_eq!(tokens[6].annotations.is_glob, true);
+        assert!(tokens[6].annotations.is_glob);
         // }
-        assert_eq!(tokens[7].annotations.is_glob, true);
+        assert!(tokens[7].annotations.is_glob);
         // bar
-        assert_eq!(tokens[9].annotations.is_glob, false);
+        assert!(!tokens[9].annotations.is_glob);
         // [
-        assert_eq!(tokens[10].annotations.is_glob, true);
+        assert!(tokens[10].annotations.is_glob);
         // 0-9
-        assert_eq!(tokens[11].annotations.is_glob, true);
+        assert!(tokens[11].annotations.is_glob);
         // ]
-        assert_eq!(tokens[12].annotations.is_glob, true);
+        assert!(tokens[12].annotations.is_glob);
     }
 
     #[test]
@@ -2934,12 +2934,12 @@ mod test_keyword_bracket_color {
         let tokens = parser.tokens();
 
         // ls
-        assert_eq!(tokens[0].annotations.is_glob, false);
+        assert!(!tokens[0].annotations.is_glob);
         assert_eq!(tokens[0].annotations.command_word, Some("ls".to_string()));
 
         // All tokens inside @(...) should be marked is_glob = true
         for t in &tokens[2..] {
-            assert_eq!(t.annotations.is_glob, true);
+            assert!(t.annotations.is_glob);
             // '|' inside extglob should not create spurious command_word annotations
             assert_ne!(t.annotations.command_word, Some("bar".to_string()));
             assert_ne!(t.annotations.command_word, Some("baz2".to_string()));

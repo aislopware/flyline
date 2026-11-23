@@ -10,6 +10,7 @@ This document provides a simplified developer guide for [flyline](.), a Bash plu
 - **[src/shell/bash/symbols.rs](src/shell/bash/symbols.rs)**: C-compatible definitions of GNU Bash internal types, structures, and global variables.
 - **[src/prompt_manager.rs](src/prompt_manager.rs)**: Asynchronous shell prompt widgets, PS1 configurations, and terminal animations.
 - **[crates/flybuffer](crates/flybuffer)**: Text state management, cursor movements, and undo/redo stacks.
+- **[vendor/](vendor/README.md)**: Vendored forks of ratatui, termina and skim (git subtree). Edit them in place; update from upstream with `git subtree pull` as described in vendor/README.md.
 
 ## Useful Commands
 ```bash
@@ -32,13 +33,13 @@ cargo test -p flycomp
 cargo fmt
 
 # Run Code Quality CI checks locally
-cargo fmt --all -- --check
+cargo fmt -- --check
 cargo clippy --workspace --all-features -- -D warnings
 cargo doc --workspace --no-deps --document-private-items
 ```
 
 > [!TIP]
-> Avoid running the full `cargo test` suite locally. The integration tests (`tests/docker_integration_tests.rs`) spawn Docker containers testing multiple versions of Bash, which is extremely slow. Prefer running `cargo test --lib` or testing specific packages. Before pushing, verify code quality with `cargo fmt --all -- --check`, `cargo clippy --workspace --all-features -- -D warnings`, and `cargo doc --workspace --no-deps --document-private-items`.
+> Avoid running the full `cargo test` suite locally. The integration tests (`tests/docker_integration_tests.rs`) spawn Docker containers testing multiple versions of Bash, which is extremely slow. Prefer running `cargo test --lib` or testing specific packages. Before pushing, verify code quality with `cargo fmt -- --check`, `cargo clippy --workspace --all-features -- -D warnings`, and `cargo doc --workspace --no-deps --document-private-items`.
 
 ## Guidelines
 1. **Safety & Stability**: `flyline` runs inside the active shell process. Avoid unwinding panics across the C FFI boundary; wrap entry points in `catch_unwind_safe` to prevent shell crashes. Never create an `App` instance in library unit tests, as `App` depends on global FFI symbols (like `history_list` or `current_readline_prompt`) that are only resolved dynamically when loaded inside Bash, causing linker failures in library test targets.

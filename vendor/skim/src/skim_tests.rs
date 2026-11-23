@@ -1,0 +1,526 @@
+use super::*;
+use ratatui::backend::TestBackend;
+use std::time::{Duration, Instant};
+
+#[cfg(feature = "listen")]
+#[tokio::test]
+async fn listener_accepts_same_user() {
+    use interprocess::local_socket::traits::tokio::*;
+    use interprocess::local_socket::{GenericNamespaced, ToNsName as _};
+
+    let name = format!("skim-test-user-{}", std::process::id());
+    let mut options = SkimOptions::default();
+    options.listen = Some(name.clone());
+    let mut skim = Skim::<TestBackend>::init(options.build(), None).unwrap();
+    skim.init_listener().unwrap();
+    let _client = RemoteStream::connect(name.to_ns_name::<GenericNamespaced>().unwrap())
+        .await
+        .unwrap();
+    let peer = skim.listener.as_ref().unwrap().accept().await.unwrap();
+    #[cfg(unix)]
+    {
+        use nix::unistd::{Uid, geteuid};
+
+        let uid = geteuid();
+        check_remote_user(&peer, uid).unwrap();
+        let other_uid = Uid::from_raw(uid.as_raw() ^ 1);
+        let err = check_remote_user(&peer, other_uid).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+    drop(peer);
+}
+
+#[test]
+fn enqueue_items_batches_in_order_and_closes_when_sender_is_dropped() {
+    let (_, rx) = enqueue_items((0..1025).map(|index| index.to_string())).unwrap();
+    let first = rx.recv().unwrap();
+    let last = rx.recv().unwrap();
+    assert_eq!(first.len(), 1024);
+    assert_eq!(first[0].text(), "0");
+    assert_eq!(first[1023].text(), "1023");
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].text(), "1024");
+    assert!(rx.recv().is_err());
+}
+
+#[test]
+#[should_panic(expected = "Invalid margin: \"margin needs one to four non-negative row counts or percentages\"")]
+fn init_panics_for_invalid_margin() {
+    let options = crate::options::SkimOptionsBuilder::default()
+        .margin("invalid")
+        .build()
+        .unwrap();
+    let _ = Skim::<TestBackend>::init(options, None);
+}
+
+/// Spin until `cond` holds or a short timeout elapses.
+fn wait_until(mut cond: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !cond() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Build a `Skim<TestBackend>` pre-loaded with `items`, started, with its
+/// reader drained — mirroring the snapshot test harness setup.
+fn started_skim_with(options: SkimOptions, items: &[&str]) -> Skim<TestBackend> {
+    let (tx, rx) = crate::prelude::unbounded();
+    let batch: Vec<Arc<dyn SkimItem>> = items
+        .iter()
+        .map(|s| Arc::new(s.to_string()) as Arc<dyn SkimItem>)
+        .collect();
+    tx.send(batch).unwrap();
+    drop(tx); // close the channel so the reader finishes
+
+    let backend = TestBackend::new(40, 10);
+    let tui = Tui::new_with_height_and_backend(backend, Size::Percent(100)).unwrap();
+    let mut skim = Skim::<TestBackend>::init(options, Some(rx)).unwrap();
+    skim.init_tui_with(tui);
+    skim.start();
+    skim
+}
+
+fn started_skim(items: &[&str]) -> Skim<TestBackend> {
+    started_skim_with(SkimOptions::default().build(), items)
+}
+
+#[test]
+fn attaching_tui_sets_no_clear_before_event_handling() {
+    for no_clear in [false, true] {
+        let options = crate::options::SkimOptionsBuilder::default()
+            .no_clear(no_clear)
+            .build()
+            .unwrap();
+        let mut skim = Skim::<TestBackend>::init(options, None).unwrap();
+        let tui = Tui::new_with_height_and_backend(TestBackend::new(40, 10), Size::Percent(100)).unwrap();
+        skim.init_tui_with(tui);
+        assert_eq!(skim.tui_ref().no_clear, no_clear);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn no_clear_start_keeps_items_until_reload_results_or_completion() {
+    for (no_clear_start, no_clear_if_empty, replacement) in [
+        (true, false, "new"),
+        (true, false, ""),
+        (false, true, "new"),
+        (false, true, ""),
+        (true, true, "new"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("ready");
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; printf '{replacement}'",
+            gate.to_string_lossy()
+        );
+        let mut options = SkimOptions::default();
+        options.no_clear_start = no_clear_start;
+        options.no_clear_if_empty = no_clear_if_empty;
+        let mut skim = Skim::<TestBackend>::init(options.build(), None).unwrap();
+        skim.app.item_list.items.push(crate::item::MatchedItem::new(
+            Arc::new("old".to_string()),
+            crate::Rank::default(),
+            None,
+            &crate::item::RankBuilder::default(),
+        ));
+        skim.app.item_list.select_row(0);
+        let render = |skim: &mut Skim<TestBackend>| {
+            let area = ratatui::layout::Rect::new(0, 0, 40, 10);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut skim.app, area, &mut buffer);
+        };
+        skim.handle_reload(&command);
+        wait_until(|| skim.matcher_stopped());
+        render(&mut skim);
+        assert_eq!(skim.app.item_list.items[0].item.text(), "old");
+        std::fs::write(gate, "").unwrap();
+        wait_until(|| {
+            skim.check_reader();
+            skim.app.restart_matcher(false);
+            render(&mut skim);
+            skim.reader_done() && skim.matcher_stopped() && skim.app.item_pool.num_not_taken() == 0
+        });
+        render(&mut skim);
+        assert_eq!(
+            skim.app.item_list.selection.len(),
+            usize::from(replacement.is_empty() && no_clear_if_empty)
+        );
+        let items = &skim.app.item_list.items;
+        if replacement.is_empty() && !no_clear_if_empty {
+            assert_eq!(items.as_slice(), []);
+        } else {
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                items[0].item.text(),
+                if replacement.is_empty() { "old" } else { replacement }
+            );
+        }
+    }
+}
+
+#[test]
+fn accessors_expose_app_and_tui() {
+    let mut skim = started_skim(&["alpha", "beta"]);
+
+    // Immutable and mutable app/tui accessors.
+    assert!(!skim.app().should_quit);
+    skim.app_mut().input.value = "x".to_string();
+    assert_eq!(skim.app().input.value, "x");
+
+    // The TUI accessors and combined borrow do not panic once initialized.
+    let _ = skim.tui_ref();
+    let _ = skim.tui_mut();
+    let (_app, _tui) = skim.app_and_tui();
+
+    // The event sender is cloneable while the TUI is live.
+    let _sender = skim.event_sender();
+
+    // Final event defaults to Quit and skim has not been asked to quit yet.
+    assert!(matches!(skim.final_event(), Event::Quit));
+    assert!(!skim.should_quit());
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_min_query_length_gates_command_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("invocations");
+    let cmd = format!(
+        "printf 'run\\n' >> '{}'; printf 'result\\n'; exec sleep 30",
+        log.to_string_lossy().replace('\'', "'\\''")
+    );
+    let mut options = SkimOptions::default();
+    options.interactive = true;
+    options.cmd = Some(cmd.clone());
+    options.min_query_length = Some(3);
+    options.no_clear_if_empty = true;
+    options.sync = true;
+    let mut skim = Skim::<TestBackend>::init(options.build(), None).unwrap();
+    skim.start();
+    assert!(skim.reader_done());
+    assert!(skim.reader_control.is_none());
+    assert!(skim.should_enter());
+    assert!(!log.exists());
+
+    skim.app.input.value = "éé".to_string();
+    skim.handle_reload(&cmd);
+    assert!(skim.reader_done());
+    assert!(!log.exists());
+
+    skim.app.input.value.push('é');
+    skim.handle_reload(&cmd);
+    wait_until(|| !skim.app.item_pool.is_empty());
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "run\n");
+    assert!(!skim.reader_done());
+    skim.app.item_list.items.push(crate::item::MatchedItem::new(
+        Arc::new("old result".to_string()),
+        crate::Rank::default(),
+        None,
+        &crate::item::RankBuilder::default(),
+    ));
+
+    skim.app.input.value.pop();
+    skim.handle_reload(&cmd);
+    assert!(skim.reader_done());
+    assert!(skim.reader_control.is_none());
+    assert!(skim.app.item_pool.is_empty());
+    assert_eq!(skim.app.item_list.items, [] as [crate::item::MatchedItem; 0]);
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "run\n");
+
+    skim.app.input.value.push('é');
+    skim.handle_reload(&cmd);
+    wait_until(|| std::fs::read_to_string(&log).is_ok_and(|text| text == "run\nrun\n"));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "run\nrun\n");
+    assert!(!skim.reader_done());
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_runs_command_when_length_gate_does_not_apply() {
+    for (interactive, min, disabled, query) in [
+        (true, Some(3), false, "ééé"),
+        (true, None, false, ""),
+        (true, Some(3), true, ""),
+        (false, Some(3), false, ""),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("invocations");
+        let mut options = SkimOptions::default();
+        options.interactive = interactive;
+        options.min_query_length = min;
+        options.disabled = disabled;
+        options.cmd_query = Some(query.to_string());
+        options.cmd = Some(format!(
+            "printf 'run\\n' >> '{}'",
+            log.to_string_lossy().replace('\'', "'\\''")
+        ));
+        let mut skim = Skim::<TestBackend>::init(options.build(), None).unwrap();
+        skim.start();
+        wait_until(|| skim.check_reader());
+        assert!(skim.reader_done());
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "run\n");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn initial_command_receives_the_startup_state() {
+    // The very first `--cmd` must see the same variables as a later reload.
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("initial");
+    let mut options = SkimOptions::default();
+    options.query = Some("seeded".to_string());
+    options.cmd = Some(format!(
+        "printf '%s' \"$SKIM_QUERY\" > '{}'",
+        log.to_string_lossy().replace('\'', "'\\''")
+    ));
+    let mut skim = Skim::<TestBackend>::init(options.build(), None).unwrap();
+    skim.start();
+    wait_until(|| skim.check_reader());
+    assert_eq!(std::fs::read_to_string(log).unwrap(), "seeded");
+}
+
+#[cfg(unix)]
+#[test]
+fn reload_command_sees_the_state_before_the_list_is_cleared() {
+    // A reload must export the focused and selected items that triggered it,
+    // not the empty list left behind by clearing.
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("reload");
+    let cmd = format!(
+        "printf '%s|%s|%s|%s' \"$SKIM_CURRENT_ITEM\" \"$SKIM_SELECTED_ITEMS\" \"$SKIM_QUERY\" \"$SKIM_ACTION\" > '{}'",
+        log.to_string_lossy().replace('\'', "'\\''")
+    );
+    let mut skim = started_skim(&["alpha", "beta"]);
+    skim.app.item_list.items.push(crate::item::MatchedItem::new(
+        Arc::new("alpha".to_string()),
+        crate::Rank::default(),
+        None,
+        &crate::item::RankBuilder::default(),
+    ));
+    skim.app.item_list.current = 0;
+    skim.app.item_list.toggle();
+    let tui = skim.tui.as_mut().unwrap();
+    skim.app
+        .handle_event(tui, &Event::Action(Action::Reload(Some(cmd))))
+        .unwrap();
+    let cmd = loop {
+        if let Event::Reload(cmd) = tui.event_rx.try_recv().unwrap() {
+            break cmd;
+        }
+    };
+    skim.app.input.value = "later".to_string();
+    skim.handle_reload(&cmd);
+    wait_until(|| std::fs::read_to_string(&log).is_ok_and(|text| !text.is_empty()));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "alpha|alpha||reload");
+}
+
+#[test]
+fn should_enter_is_false_in_filter_mode() {
+    let mut options = SkimOptions::default();
+    options.filter = Some(String::new());
+    let options = options.build();
+    let mut skim = started_skim_with(options, &["a", "b", "c"]);
+    // Filter mode processes everything synchronously and never enters the TUI.
+    assert!(!skim.should_enter());
+    assert_eq!(skim.app().item_list.items.len(), 3);
+}
+
+#[test]
+fn filter_mode_terminates_when_query_is_below_min_query_length() {
+    // `--min-query-length` makes `restart_matcher` a no-op, so the filter loop must
+    // not wait for the item pool to drain — it used to spin forever here. Run it on a
+    // worker thread so the regression surfaces as a failed assertion, not a hung test.
+    let (done_tx, done_rx) = crate::prelude::unbounded::<(bool, usize)>();
+    let worker = std::thread::spawn(move || {
+        let mut options = SkimOptions::default();
+        options.filter = Some("a".to_string());
+        options.min_query_length = Some(3);
+        let options = options.build();
+        let mut skim = started_skim_with(options, &["a", "b", "c"]);
+        let entered = skim.should_enter();
+        let _ = done_tx.send((entered, skim.app().item_list.items.len()));
+    });
+
+    let (entered, matched) = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("filter mode did not terminate with a query below --min-query-length");
+    worker.join().unwrap();
+    assert!(!entered);
+    // The query is too short, so nothing is reported as matched.
+    assert_eq!(matched, 0);
+}
+
+#[test]
+fn filter_mode_matches_when_query_meets_min_query_length() {
+    let mut options = SkimOptions::default();
+    options.filter = Some("abc".to_string());
+    options.min_query_length = Some(3);
+    let options = options.build();
+    let mut skim = started_skim_with(options, &["abc", "xyz"]);
+    assert!(!skim.should_enter());
+    assert_eq!(skim.app().item_list.items.len(), 1);
+}
+
+#[test]
+fn should_enter_is_false_for_select_1_single_match() {
+    let mut options = SkimOptions::default();
+    options.select_1 = true;
+    let options = options.build();
+    // A single matching item satisfies select-1, so skim exits early.
+    let mut skim = started_skim_with(options, &["only"]);
+    assert!(!skim.should_enter());
+}
+
+#[test]
+fn should_enter_is_true_in_sync_mode_with_matches() {
+    let mut options = SkimOptions::default();
+    options.sync = true;
+    let options = options.build();
+    // Sync mode waits for all items, then enters the TUI to display them.
+    let mut skim = started_skim_with(options, &["a", "b"]);
+    assert!(skim.should_enter());
+}
+
+#[test]
+fn should_enter_is_true_for_exit_0_with_matches() {
+    let mut options = SkimOptions::default();
+    options.exit_0 = true;
+    let options = options.build();
+    // exit-0 only bails when nothing matches; here items match so we enter.
+    let mut skim = started_skim_with(options, &["a", "b"]);
+    assert!(skim.should_enter());
+}
+
+#[test]
+fn output_collects_results_and_marks_abort() {
+    let mut skim = started_skim(&["a", "b"]);
+    wait_until(|| skim.check_reader());
+    wait_until(|| skim.matcher_stopped());
+    let output = skim.output();
+    // The default final_event (Quit) is treated as an abort.
+    assert!(output.is_abort);
+    // Non-interactive, no cmd_query → the command is the initial command.
+    assert_eq!(output.cmd, "");
+}
+
+#[test]
+fn nested_accept_actions_are_reported_as_accepts() {
+    for binding in ["start:first,first:accept", "start:if-query-empty(accept)"] {
+        let mut options = SkimOptions::default();
+        options.bind = vec![binding.to_string()];
+        let mut skim = started_skim_with(options.build(), &["a"]);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(skim.run()).unwrap();
+
+        assert!(matches!(skim.final_event(), Event::Action(Action::Accept(None))));
+        assert!(!skim.output().is_abort, "binding `{binding}` was reported as an abort");
+    }
+}
+
+#[test]
+fn output_uses_input_as_cmd_in_interactive_mode() {
+    let mut options = SkimOptions::default();
+    options.interactive = true;
+    let options = options.build();
+    let mut skim = started_skim_with(options, &["a"]);
+    skim.app_mut().input.value = "typed".to_string();
+    wait_until(|| skim.check_reader());
+    let output = skim.output();
+    assert_eq!(output.cmd, "typed");
+    assert_eq!(output.query, "typed");
+}
+
+#[test]
+fn output_uses_cmd_query_when_set() {
+    let mut options = SkimOptions::default();
+    options.cmd_query = Some("preset".to_string());
+    let options = options.build();
+    let mut skim = started_skim_with(options, &["a"]);
+    wait_until(|| skim.check_reader());
+    let output = skim.output();
+    assert_eq!(output.cmd, "preset");
+}
+
+#[test]
+fn multi_selection_flows_into_output_and_serializes() {
+    // multi-select -> SkimOutput -> CLI serialization. The matcher only fills the
+    // visible list on render, so we populate it directly and exercise selection +
+    // output + serialization. (The reader -> matcher half is covered by
+    // `reader_and_matcher_complete`.)
+    use crate::Rank;
+    use crate::item::{MatchedItem, RankBuilder};
+
+    let mut options = SkimOptions::default();
+    options.multi = true;
+    let options = options.build();
+    let mut skim = started_skim_with(options, &["a", "b", "c"]);
+    wait_until(|| skim.check_reader());
+    wait_until(|| skim.matcher_stopped());
+
+    let rb = RankBuilder::default();
+    let mk = |t: &str| MatchedItem::new(Arc::new(t.to_string()) as Arc<dyn SkimItem>, Rank::default(), None, &rb);
+    skim.app_mut().item_list.append(&mut vec![mk("a"), mk("b"), mk("c")]);
+    // Toggle "a" and "c" into the selection, as BTab would.
+    skim.app_mut().item_list.toggle_at(0);
+    skim.app_mut().item_list.toggle_at(2);
+
+    let output = skim.output();
+    let texts: Vec<String> = output.selected_items.iter().map(|i| i.output().into_owned()).collect();
+    assert_eq!(texts, vec!["a", "c"]);
+
+    // --print0 serialization of the multi-selection.
+    let mut print0 = SkimOptions::default();
+    print0.print0 = true;
+    let bin = crate::BinOptions::from_opts(&print0);
+    let mut buf = Vec::new();
+    output.write_output(&mut buf, &bin).unwrap();
+    assert_eq!(String::from_utf8(buf).unwrap(), "a\0c\0");
+}
+
+#[test]
+fn reader_and_matcher_complete() {
+    let mut skim = started_skim(&["one", "two", "three"]);
+
+    // The reader drains and reports done via check_reader.
+    wait_until(|| skim.check_reader());
+    assert!(skim.reader_done());
+
+    // After the reader finishes, the matcher eventually stops.
+    wait_until(|| skim.matcher_stopped());
+    assert!(skim.matcher_stopped());
+}
+
+#[test]
+fn try_flush_render_emits_render_when_due() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let mut skim = started_skim(&["a"]);
+
+    // Mark a render as needed and age the frame-rate gate so it is due.
+    skim.app.needs_render.store(true, Ordering::Relaxed);
+    let now = Instant::now();
+    skim.app.last_render_timer = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+    skim.try_flush_render();
+
+    // The render flag is cleared and a Render event is queued on the TUI.
+    assert!(!skim.app.needs_render.load(Ordering::Relaxed));
+    let mut saw_render = false;
+    while let Ok(ev) = skim.tui.as_mut().unwrap().event_rx.try_recv() {
+        if matches!(ev, Event::Render) {
+            saw_render = true;
+        }
+    }
+    assert!(saw_render);
+}
+
+#[test]
+fn try_flush_render_noop_when_not_needed() {
+    use std::sync::atomic::Ordering;
+    let mut skim = started_skim(&["a"]);
+    // No render requested → nothing happens, no panic.
+    skim.app.needs_render.store(false, Ordering::Relaxed);
+    skim.try_flush_render();
+    assert!(!skim.app.needs_render.load(Ordering::Relaxed));
+}

@@ -67,7 +67,7 @@ cleanup_flyline_install() {
             trap - EXIT 2>/dev/null || true
         fi
         unset -f expand_path say warn err err_no_exit need_cmd download get_latest_version detect_os detect_arch detect_libc detect_bash_version_parts is_bash_version_4_4_or_later is_system_bash_pre_4_4 find_homebrew_bash verify_bash_environment verify_sha256 cleanup_flyline_install is_sourced is_interactive main 2>/dev/null || true
-        unset REPO INSTALL_DIR BASHRC OS ARCH TARGET LIB_NAME VERSION LIB_PATH ENABLE_CMD TMP_DIR _FLYLINE_IS_SOURCED _FLYLINE_SAVED_OPTS _FLYLINE_SAVED_TRAP 2>/dev/null || true
+        unset REPO INSTALL_DIR BASHRC OS ARCH BREW_BASH TARGET LIB_NAME VERSION LIB_PATH ENABLE_CMD TMP_DIR _FLYLINE_IS_SOURCED _FLYLINE_SAVED_OPTS _FLYLINE_SAVED_TRAP 2>/dev/null || true
     fi
 }
 
@@ -127,8 +127,7 @@ detect_os() {
     case "$os" in
         Linux) echo "linux" ;;
         Darwin) echo "darwin" ;;
-        FreeBSD) echo "freebsd" ;;
-        *) err "Unsupported OS: $os" ;;
+        *) err "Unsupported OS: $os. Prebuilt libraries exist for Linux, macOS and Android (Termux)." ;;
     esac
 }
 
@@ -137,11 +136,7 @@ detect_arch() {
     case "$arch" in
         x86_64 | amd64) echo "x86_64" ;;
         aarch64 | arm64) echo "aarch64" ;;
-        armv7* | armhf) echo "armv7" ;;
-        i386 | i486 | i586 | i686) echo "i686" ;;
-        riscv64) echo "riscv64gc" ;;
-        ppc64le | powerpc64le) echo "powerpc64le" ;;
-        *) err "Unsupported architecture: $arch" ;;
+        *) err "Unsupported architecture: $arch. Prebuilt libraries exist for x86_64 and aarch64; build from source for others." ;;
     esac
 }
 
@@ -254,70 +249,45 @@ main() {
     OS="$(detect_os)"
     ARCH="$(detect_arch)"
 
+    # flyline needs bash >= 4.4, which calls <name>_builtin_load on `enable -f`.
+    # Every supported Linux and Termux ships newer; macOS's /bin/bash is 3.2.
     if is_system_bash_pre_4_4; then
-        use_bash_pre_4_4=true
-    else
-        use_bash_pre_4_4=false
+        BREW_BASH=""
+        if [ "$OS" = "darwin" ]; then
+            BREW_BASH="$(find_homebrew_bash)"
+        fi
+        if [ -n "$BREW_BASH" ]; then
+            warn "Your system Bash is older than 4.4 and cannot load flyline."
+            warn "Ensure that you use $BREW_BASH for flyline."
+        elif [ "$OS" = "darwin" ]; then
+            err_no_exit "Your system Bash is older than 4.4 and cannot load flyline."
+            err_no_exit "To use flyline on macOS, please install a modern Bash using Homebrew:"
+            err_no_exit "    brew install bash"
+            err "Then re-run the installer using Homebrew Bash."
+        else
+            err "flyline needs Bash 4.4 or newer; this Bash is older."
+        fi
     fi
 
     if [ "$OS" = "darwin" ]; then
-        TARGET="${ARCH}-apple-darwin"
+        if [ "$ARCH" != "aarch64" ]; then
+            err "Intel Macs have no prebuilt library; build from source with: cargo build --release --lib"
+        fi
+        TARGET="aarch64-apple-darwin"
         LIB_NAME="libflyline.dylib"
-
-        # Flyline can run on the 3.2.57 version of Bash.
-        # However, the Bash binary on macOS is often compiled without linkable symbols required to load the Flyline plugin.
-        if $use_bash_pre_4_4; then
-            BREW_BASH="$(find_homebrew_bash)"
-            if [ -n "$BREW_BASH" ]; then
-                warn "Your system Bash is older than 4.4. This version won't have been compiled with custom plugin support."
-                warn "Ensure that you use $BREW_BASH for flyline."
-                use_bash_pre_4_4=false
-            else
-                err_no_exit "Your system Bash is older than 4.4 and lacks custom loadable plugin support."
-                err_no_exit "To use flyline on macOS, please install a modern Bash using Homebrew:"
-                err_no_exit "    brew install bash"
-                err "Then re-run the installer using Homebrew Bash."
-            fi
-        fi
-    elif [ "$OS" = "freebsd" ]; then
-        if [ "$ARCH" != "x86_64" ]; then
-            err "Unsupported FreeBSD architecture: $ARCH. Only x86_64 is supported."
-        fi
-        TARGET="x86_64-unknown-freebsd"
-        LIB_NAME="libflyline.so"
     elif [ "$OS" = "android" ]; then
         case "$ARCH" in
             aarch64)
                 TARGET="aarch64-linux-android"
                 ;;
-            x86_64)
-                TARGET="x86_64-linux-android"
-                ;;
-            armv7)
-                TARGET="armv7-linux-androideabi"
-                ;;
-            i686)
-                TARGET="i686-linux-android"
-                ;;
             *)
-                err "Unsupported Android architecture: $ARCH"
+                err "Unsupported Android architecture: $ARCH. Only aarch64 (arm64) is supported."
                 ;;
         esac
         LIB_NAME="libflyline.so"
     else
         LIBC="$(detect_libc)"
-        case "$ARCH" in
-            armv7)
-                if [ "$LIBC" = "gnu" ]; then
-                    TARGET="armv7-unknown-linux-gnueabihf"
-                else
-                    err "Unsupported libc ($LIBC) for armv7. Only gnu (gnueabihf) is supported."
-                fi
-                ;;
-            *)
-                TARGET="${ARCH}-unknown-linux-${LIBC}"
-                ;;
-        esac
+        TARGET="${ARCH}-unknown-linux-${LIBC}"
         LIB_NAME="libflyline.so"
     fi
 
@@ -334,14 +304,8 @@ main() {
 
     ARCHIVE_STEM="libflyline-${VERSION}-${TARGET}"
 
-    if $use_bash_pre_4_4; then
-        say "Detected Bash < 4.4, using pre-bash-4.4 build..."
-        ARCHIVE="${ARCHIVE_STEM}_pre_bash_4_4.tar.gz"
-        ARCHIVE_SHA256="${ARCHIVE}.sha256"
-    else
-        ARCHIVE="${ARCHIVE_STEM}.tar.gz"
-        ARCHIVE_SHA256="${ARCHIVE}.sha256"
-    fi
+    ARCHIVE="${ARCHIVE_STEM}.tar.gz"
+    ARCHIVE_SHA256="${ARCHIVE}.sha256"
 
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
     SHA256_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE_SHA256}"
