@@ -540,6 +540,9 @@ flyline history import ~/.local/share/atuin/history.db
 
 It is similar to Atuin but local only and uses a JSONL file instead of a SQLite database.
 
+The JSONL history follows `HISTCONTROL=ignorespace` (or `ignoreboth`): a command that starts with a space is not recorded.
+This still works after bash-preexec, which `atuin init bash` loads, removes `ignorespace` from `HISTCONTROL`: Flyline remembers the setting from your `.bashrc`.
+
 # Cursor animations and styles
 
 Flyline can configure the cursor styling, color, and interpolation/easing animations. When moving the cursor or deleting/inserting characters, the cursor dynamically slides and animates to its new position.

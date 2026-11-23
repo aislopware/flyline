@@ -70,7 +70,10 @@ extern "C" fn flyline_unget_char(c: c_int) -> c_int {
 }
 
 extern "C" fn flyline_call_command(words: *const bash_symbols::WordList) -> c_int {
-    let result = catch_unwind_safe(|| cli::call(words));
+    let result = catch_unwind_safe(|| {
+        crate::history::ignorespace::note_histcontrol();
+        cli::call(words)
+    });
     match result {
         Ok(code) => code,
         Err(_) => {
@@ -151,7 +154,10 @@ impl Flyline {
             self.content = match result {
                 app::ExitState::WithCommand(cmd) => {
                     if settings.history_backend == crate::settings::HistoryBackend::Flyline {
-                        let should_add_to_history = bash_funcs::check_add_history(&cmd);
+                        // Ask Bash first: check_add_history also adds the line to Bash's
+                        // own history, which bash-preexec reads back with `history 1`.
+                        let should_add_to_history = bash_funcs::check_add_history(&cmd)
+                            && !crate::history::ignorespace::should_ignore_command(&cmd);
                         if should_add_to_history {
                             let cmd_id = self
                                 .long_lived
@@ -252,6 +258,8 @@ fn flyline_load_common() -> c_int {
     logging::init().unwrap_or_else(|e| {
         eprintln!("Flyline failed to setup logging: {}", e);
     });
+
+    crate::history::ignorespace::note_histcontrol();
 
     // When do we want to set up flyline's input stream?
     // shell.c:main:792:set_bash_input: sets up readline if interactive && no_line_editing

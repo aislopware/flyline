@@ -371,7 +371,25 @@ impl TryFrom<HistoryJsonlEvent> for HistoryEntry {
     }
 }
 
+/// Bash history entries that may seed a new JSONL file: drops a trailing copy of
+/// `pending_command` (about to be recorded with its own metadata) and the entries
+/// `ignore` rejects.
+fn recordable_bash_entries(
+    mut entries: Vec<HistoryEntry>,
+    pending_command: Option<&str>,
+    ignore: impl Fn(&str) -> bool,
+) -> Vec<HistoryEntry> {
+    if let Some(pending) = pending_command
+        && entries.last().is_some_and(|e| e.command == pending)
+    {
+        entries.pop();
+    }
+    entries.retain(|e| !ignore(&e.command));
+    entries
+}
+
 pub mod backend;
+pub mod ignorespace;
 pub mod importing;
 
 pub use backend::{HistoryJsonlEvent, LastJsonlReadOffset, default_jsonl_path};
@@ -659,10 +677,21 @@ impl HistoryManager {
     }
 
     fn ensure_jsonl_repopulated_if_needed(&mut self) -> PathBuf {
+        self.ensure_jsonl_repopulated_skipping(None)
+    }
+
+    /// Like `ensure_jsonl_repopulated_if_needed`, for when `pending_command` is
+    /// about to be recorded: Bash has already added it to its own history, so a
+    /// trailing copy of it in Bash's history is dropped instead of being written twice.
+    fn ensure_jsonl_repopulated_skipping(&mut self, pending_command: Option<&str>) -> PathBuf {
         let path = self.jsonl_path();
         if is_file_empty_or_missing(&path) {
             if self.entries.is_empty() {
-                let bash_entries = shell::backend().parse_history_from_memory();
+                let bash_entries = recordable_bash_entries(
+                    shell::backend().parse_history_from_memory(),
+                    pending_command,
+                    ignorespace::should_ignore_command,
+                );
                 self.entries = Self::normalize_entries(bash_entries);
             }
             if !self.entries.is_empty() {
@@ -756,7 +785,7 @@ impl HistoryManager {
             return uuid::Uuid::now_v7().to_string();
         }
 
-        let path = self.ensure_jsonl_repopulated_if_needed();
+        let path = self.ensure_jsonl_repopulated_skipping(Some(&command));
         let command_id = self.push_entry(command.clone());
 
         if let Some(entry) = self.entries.last() {
@@ -1907,6 +1936,34 @@ git status
         let custom_path = std::path::PathBuf::from("/tmp/custom_flyline_history.jsonl");
         let hm = HistoryManager::new_empty_with_path(Some(custom_path.clone()));
         assert_eq!(hm.jsonl_path(), custom_path);
+    }
+
+    #[test]
+    fn test_recordable_bash_entries() {
+        let entries = |cmds: &[&str]| {
+            cmds.iter()
+                .enumerate()
+                .map(|(i, c)| HistoryEntry::new(None, i, c.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let commands =
+            |es: Vec<HistoryEntry>| es.into_iter().map(|e| e.command).collect::<Vec<_>>();
+        let space = |c: &str| c.starts_with(' ');
+
+        let kept = recordable_bash_entries(
+            entries(&["ls", " echo secret", "git status"]),
+            Some("git status"),
+            space,
+        );
+        assert_eq!(commands(kept), vec!["ls"]);
+
+        // Only a trailing copy of the pending command is dropped.
+        let kept =
+            recordable_bash_entries(entries(&["git status", "ls"]), Some("git status"), space);
+        assert_eq!(commands(kept), vec!["git status", "ls"]);
+
+        let kept = recordable_bash_entries(entries(&[" a", "b"]), None, |_| false);
+        assert_eq!(commands(kept), vec![" a", "b"]);
     }
 
     #[test]

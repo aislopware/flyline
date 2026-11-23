@@ -134,6 +134,10 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 ## v2.0.2 (2026-11-23)
 - **No terminal attached**: `flyline version` and other commands that detect the terminal now work when bash has no controlling terminal, such as when a script or a coding agent runs `bash -ic`.
 - **Atuin import**: `flyline history import` with no path now finds Atuin's database in `~/.atuin/data` (recent Atuin) or `~/.local/share/atuin`, on macOS too.
+
+## v2.0.3 (2026-11-23)
+- **Space-prefixed commands stay private**: With `HISTCONTROL=ignorespace` or `ignoreboth`, the JSONL history no longer records commands that start with a space when bash-preexec (loaded by `atuin init bash`) has removed `ignorespace` from `HISTCONTROL`.
+- **First command in a new history file**: When the JSONL file is created, the first command is no longer written twice, and space-prefixed commands from Bash's history are left out.
 "#;
 
 pub(crate) fn pretty_changelog() -> String {
