@@ -92,7 +92,7 @@ const MAX_PAYLOAD_SIZE: usize = 1024 * 1024 * 1024; // 1 GB limit
 
 fn read_exact_fd(fd: RawFd, mut buf: &mut [u8]) -> std::io::Result<()> {
     while !buf.is_empty() {
-        match nix::unistd::read(fd, buf) {
+        match nix::unistd::read(unsafe { BorrowedFd::borrow_raw(fd) }, buf) {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,

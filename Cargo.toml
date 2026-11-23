@@ -9,8 +9,8 @@ flybuffer = { path = "crates/flybuffer" }
 flycontent = { path = "crates/flycontent" }
 
 anyhow = "1.0"
-clap = { version = "4.6.1", features = ["derive"] }
-clap_complete = { version = "4.6.3", features = ["unstable-dynamic"] }
+clap = { version = "4.6.9", features = ["derive"] }
+clap_complete = { version = "4.6.12", features = ["unstable-dynamic"] }
 easing-function = "0.1"
 itertools = "0.15"
 log = "0.4"
@@ -54,18 +54,22 @@ chrono = "0.4"
 clap.workspace = true
 clap_complete.workspace = true
 ctor = "1.0"
-dirs = "6.0"
+dirs = "7.0"
 duration-str = "0.21"
 easing-function.workspace = true
 flybuffer.workspace = true
-flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "754be16d7a2130ad12b6d038d42a8933c92c103f" }
+flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "34e8e6e798fa35b4daa3d4c5586241e95d2dbacf" }
 flycontent.workspace = true
 itertools.workspace = true
 libc = "0.2"
 log.workspace = true
 lscolors.workspace = true
 mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
-nix = { version = "0.29", features = ["fs", "poll", "process", "signal", "user"] }
+nix = { version = "0.32", features = ["fs", "poll", "process", "signal", "user"] }
+# Held at 0.12: termina (^0.12, also in 0.4.0) would keep 0.12 in the graph, so
+# 0.13 compiles parking_lot, parking_lot_core and lock_api twice into the dylib
+# that every shell loads, and raises the MSRV to 1.95. Its gain is contended
+# lock throughput, which a line editor does not hit. Move when termina does.
 parking_lot = "0.12"
 parse-style.workspace = true
 pulldown-cmark.workspace = true
@@ -81,7 +85,7 @@ termina.workspace = true
 tui-scrollbar.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
-uuid = { version = "1.10", features = ["v7"] }
+uuid = { version = "1.29", features = ["v7"] }
 
 [features]
 pre_bash_4_4 = []
