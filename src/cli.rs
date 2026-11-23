@@ -97,7 +97,7 @@ fn parse_idle_frame_rate(s: &str) -> Result<f64, String> {
     name = "flyline",
     styles = get_styles(),
     color = clap::ColorChoice::Auto,
-    after_help = "Read more at https://github.com/HalFrgrd/flyline",
+    after_help = "Read more at https://github.com/aislopware/flyline",
 )]
 struct FlylineArgs {
     /// Show version information
@@ -377,7 +377,7 @@ enum Commands {
     ///     --command 'copilot --reasoning-effort low --prompt'
     ///   flyline set-agent-mode --trigger-prefix ": " --command 'copilot --reasoning-effort low --prompt'
     ///
-    /// See https://github.com/HalFrgrd/flyline/blob/master/examples/agent_mode.sh for more details and example usage.
+    /// See https://github.com/aislopware/flyline/blob/master/examples/agent_mode.sh for more details and example usage.
     #[command(
         name = "set-agent-mode",
         verbatim_doc_comment,
@@ -926,7 +926,7 @@ enum PromptWidgetSubcommands {
     ///   flyline create-prompt-widget animation --name "MY_ANIMATION" --fps 10  ⣾ ⣷ ⣯ ⣟ ⡿ ⢿ ⣻ ⣽
     ///   flyline create-prompt-widget animation --name "john" --ping-pong --fps 5  '\e[33m\u' '\e[31m\u' '\e[35m\u' '\e[36m\u'
     ///
-    /// See https://github.com/HalFrgrd/flyline/blob/master/examples/animations.sh for more details and example usage.
+    /// See https://github.com/aislopware/flyline/blob/master/examples/animations.sh for more details and example usage.
     #[command(
         name = "animation",
         verbatim_doc_comment,
@@ -1872,9 +1872,9 @@ pub(crate) fn call(words: *const bash_symbols::WordList) -> c_int {
                 Some(Commands::Upgrade) => {
                     println!("Flyline is a purely offline piece of software. Please run:");
                     println!(
-                        "source <(curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh)"
+                        "source <(curl -sSfL https://github.com/aislopware/flyline/releases/latest/download/install.sh)"
                     );
-                    settings.initial_buffer = Some("source <(curl -sSfL https://github.com/HalFrgrd/flyline/releases/latest/download/install.sh)".to_string());
+                    settings.initial_buffer = Some("source <(curl -sSfL https://github.com/aislopware/flyline/releases/latest/download/install.sh)".to_string());
                 }
                 Some(Commands::Settings { all }) => {
                     show_settings(&*settings, all);

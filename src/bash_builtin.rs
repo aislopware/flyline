@@ -35,7 +35,7 @@ extern "C" fn flyline_get_char() -> c_int {
             Err(_) => {
                 // writing to stderr can panic if master pty side has been closed.
                 report_stderr_no_panic(
-                    "flyline: app panicked; recovering with EOF. Please create an issue with the steps to reproduce at https://github.com/HalFrgrd/flyline/issues.",
+                    "flyline: app panicked; recovering with EOF. Please create an issue with the steps to reproduce at https://github.com/aislopware/flyline/issues.",
                 );
                 report_error_no_panic("app panicked; recovering with EOF");
 

@@ -66,7 +66,7 @@ rustPlatform.buildRustPackage {
       configurable keybindings and prompts. Enable it in an interactive shell
       with `enable -f ${placeholder "out"}/lib/libflyline.<ext> flyline`.
     '';
-    homepage = "https://github.com/HalFrgrd/flyline";
+    homepage = "https://github.com/aislopware/flyline";
     license = lib.licenses.gpl3Plus;
     platforms = lib.platforms.unix;
   };
