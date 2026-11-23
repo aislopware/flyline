@@ -485,16 +485,24 @@ static STATIC_TERM_INFO: Mutex<Option<TermInfo>> = Mutex::new(None);
 /// Access the static [`TermInfo`].
 ///
 /// If already initialized, returns the static struct.
-/// If not yet initialized, queries the terminal via `reader` (blocking),
-/// initializes `TermInfo::new(reader)`, stores it in the static instance, and returns it.
-pub fn get_term_info(reader: &termina::EventReader) -> TermInfo {
+/// If not yet initialized, queries the terminal through the global event reader (blocking),
+/// stores the result in the static instance, and returns it.
+///
+/// Without a controlling terminal (for example `bash -ic 'flyline version'` run by a script or
+/// an agent), there is nothing to query and opening the event reader would fail, so this
+/// returns [`TermInfo::from_env`] without caching it.
+pub fn get_term_info() -> TermInfo {
     if let Ok(guard) = STATIC_TERM_INFO.lock()
         && let Some(ref info) = *guard
     {
         return info.clone();
     }
 
-    let info = TermInfo::new(reader);
+    if !has_controlling_terminal() {
+        return TermInfo::from_env();
+    }
+
+    let info = TermInfo::new(&crate::app::GLOBAL_EVENT_READER);
     if let Ok(mut guard) = STATIC_TERM_INFO.lock() {
         if guard.is_none() {
             *guard = Some(info.clone());
@@ -506,19 +514,28 @@ pub fn get_term_info(reader: &termina::EventReader) -> TermInfo {
     info
 }
 
+/// Whether this process has a controlling terminal that the event reader can open.
+fn has_controlling_terminal() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
+}
+
 /// Returns the cached [`DeviceAttributes`] if device attribute querying has been performed.
 pub fn device_attributes() -> Option<DeviceAttributes> {
-    get_term_info(&crate::app::GLOBAL_EVENT_READER).device_attributes
+    get_term_info().device_attributes
 }
 
 /// Returns the detected active terminal emulator for the current process.
 pub fn current() -> TerminalEmulator {
-    get_term_info(&crate::app::GLOBAL_EVENT_READER).emulator
+    get_term_info().emulator
 }
 
 /// Returns the detected active terminal multiplexer for the current process, if any.
 pub fn multiplexer() -> Option<Multiplexer> {
-    get_term_info(&crate::app::GLOBAL_EVENT_READER).multiplexer
+    get_term_info().multiplexer
 }
 
 /// Helper function to perform DA query on an EventReader.

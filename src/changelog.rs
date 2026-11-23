@@ -130,6 +130,10 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 ## v2.0.1 (2026-11-23)
 - **Zero-size terminals**: A terminal that reports a 0x0 size (such as a freshly spawned pty) no longer makes flyline exit the shell; it assumes 80x24.
 - **History path on macOS**: The help and guide now give the JSONL history path on macOS, `~/Library/Application Support/flyline/history.jsonl`.
+
+## v2.0.2 (2026-11-23)
+- **No terminal attached**: `flyline version` and other commands that detect the terminal now work when bash has no controlling terminal, such as when a script or a coding agent runs `bash -ic`.
+- **Atuin import**: `flyline history import` with no path now finds Atuin's database in `~/.atuin/data` (recent Atuin) or `~/.local/share/atuin`, on macOS too.
 "#;
 
 pub(crate) fn pretty_changelog() -> String {

@@ -1959,7 +1959,7 @@ impl<'a> App<'a> {
         self.has_run_delayed_startup = Some(std::time::Instant::now());
         log::debug!("Running delayed startup initialization");
         time_it!("delayed startup", {
-            let _ = crate::term_info::get_term_info(&GLOBAL_EVENT_READER);
+            let _ = crate::term_info::get_term_info();
             self.sync_viewport_top_from_cpr();
 
             if self.terminal.viewport_top().is_none() {

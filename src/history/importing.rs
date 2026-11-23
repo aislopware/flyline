@@ -189,20 +189,47 @@ pub fn import_history_file(path: &Path, target_jsonl_path: &Path) -> anyhow::Res
     Ok(imported_count)
 }
 
-pub fn import_atuin_history(target_jsonl_path: &Path) -> anyhow::Result<usize> {
-    let db_path = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("atuin")
-        .join("history.db");
-
-    if !db_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Atuin database file not found at {}",
-            db_path.display()
-        ));
+/// Where Atuin may keep its history database, most specific first.
+///
+/// Recent Atuin releases use `$ATUIN_HOME/data` (default `~/.atuin/data`); older ones use
+/// `$XDG_DATA_HOME/atuin` (default `~/.local/share/atuin`) on every Unix, macOS included.
+fn atuin_db_candidates() -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let mut dirs_to_try = Vec::new();
+    if let Some(atuin_home) = std::env::var_os("ATUIN_HOME") {
+        dirs_to_try.push(PathBuf::from(atuin_home).join("data"));
     }
+    if let Some(home) = &home {
+        dirs_to_try.push(home.join(".atuin").join("data"));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        dirs_to_try.push(PathBuf::from(xdg).join("atuin"));
+    }
+    if let Some(home) = &home {
+        dirs_to_try.push(home.join(".local").join("share").join("atuin"));
+    }
+    if let Some(data) = dirs::data_local_dir() {
+        dirs_to_try.push(data.join("atuin"));
+    }
+    let mut candidates: Vec<PathBuf> = dirs_to_try
+        .into_iter()
+        .map(|d| d.join("history.db"))
+        .collect();
+    candidates.dedup();
+    candidates
+}
 
-    import_atuin_sqlite_file(&db_path, target_jsonl_path)
+pub fn import_atuin_history(target_jsonl_path: &Path) -> anyhow::Result<usize> {
+    let candidates = atuin_db_candidates();
+    let Some(db_path) = candidates.iter().find(|p| p.exists()) else {
+        let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+        return Err(anyhow::anyhow!(
+            "Atuin database not found (tried {}). Pass its path: flyline history import <PATH>",
+            tried.join(", ")
+        ));
+    };
+
+    import_atuin_sqlite_file(db_path, target_jsonl_path)
 }
 
 #[cfg(test)]
