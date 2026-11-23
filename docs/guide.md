@@ -571,6 +571,13 @@ You can check https://vtdn.dev/ to see what features your terminal emulator / mu
 I recommend setting `cursor-click-to-move = false`.
 When this is `true`, incorrect mouse events are sent to flyline.
 
+Ghostty's shell integration works with flyline: Ghostty injects it into bash 5 automatically.
+It reports command start and end (OSC 133), which `jump_to_prompt` (`Cmd+Up` / `Cmd+Down`) and `notify-on-command-finish` use, and the working directory (OSC 7), which new tabs and splits open in. flyline marks the prompt itself.
+flyline draws its own cursor, so Ghostty's `cursor` feature has no effect. A config that turns it off and adds the SSH and sudo helpers:
+```
+shell-integration-features = no-cursor,sudo,title,ssh-env,ssh-terminfo,path
+```
+
 ## Kitty:
 When running inside Kitty, it is highly recommended to use the terminal cursor backend:
 ```bash

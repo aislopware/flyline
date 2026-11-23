@@ -205,6 +205,9 @@ pub struct PromptManager {
     /// The current working directory at the time the prompt was constructed.
     /// Used by `PromptCwdEdit` mode to compute the path for a given CWD segment index.
     cwd: String,
+    /// The window title PS1 sets, written out by the app because the prompt
+    /// renderer drops OSC sequences. See [`osc_title`].
+    title: Option<String>,
 }
 
 /// Pass a raw bash prompt string (with any time-code placeholders already
@@ -222,13 +225,21 @@ fn expand_prompt_through_bash(raw: String) -> Option<Vec<Line<'static>>> {
     if raw.is_empty() {
         return Some(vec![]);
     }
+    decoded_prompt_to_lines(&decode_prompt_through_bash(&raw)?)
+}
 
+/// Runs a raw prompt string through bash's `decode_prompt_string`, after
+/// stripping the `\[` / `\]` non-printing-sequence markers.
+fn decode_prompt_through_bash(raw: &str) -> Option<String> {
     // Strip literal `\[` / `\]` non-printing-sequence markers before handing
     // the string to `decode_prompt`.
     let raw = raw.replace("\\[", "").replace("\\]", "");
+    shell::backend().decode_prompt(&raw, true)
+}
 
-    let decoded = shell::backend().decode_prompt(&raw, true)?;
-
+/// Parses a decoded prompt string into lines, dropping escape sequences that
+/// don't draw anything (such as OSC title sequences, see [`osc_title`]).
+fn decoded_prompt_to_lines(decoded: &str) -> Option<Vec<Line<'static>>> {
     let mut lines = decoded.into_text().ok()?.lines;
     for line in &mut lines {
         for span in &mut line.spans {
@@ -242,6 +253,36 @@ fn expand_prompt_through_bash(raw: String) -> Option<Vec<Line<'static>>> {
     }
 
     Some(lines)
+}
+
+/// The window title that an OSC 0 or OSC 2 sequence in a decoded prompt sets,
+/// if there is one. With several, the last one wins, as in a terminal.
+///
+/// Prompts often set the title this way: Debian's default `.bashrc` puts
+/// `\[\e]0;\u@\h: \w\a\]` in PS1, and Ghostty's and Kitty's shell integration
+/// add the working directory as the title. Readline would print these
+/// sequences with the prompt. flyline draws the prompt itself and its ANSI
+/// parser drops OSC sequences, so it writes the title out separately.
+pub(crate) fn osc_title(decoded: &str) -> Option<String> {
+    let mut title = None;
+    let mut rest = decoded;
+    while let Some(start) = rest.find("\x1b]") {
+        let body = &rest[start + 2..];
+        let bel = body.find('\x07').map(|i| (i, 1));
+        let st = body.find("\x1b\\").map(|i| (i, 2));
+        let Some((end, terminator_len)) = [bel, st].into_iter().flatten().min() else {
+            break;
+        };
+        let sequence = &body[..end];
+        if let Some(text) = sequence
+            .strip_prefix("0;")
+            .or_else(|| sequence.strip_prefix("2;"))
+        {
+            title = Some(text.to_string());
+        }
+        rest = &body[end + terminator_len..];
+    }
+    title
 }
 
 /// Builds expanded prompt segment lines from raw bash prompt strings while
@@ -276,6 +317,9 @@ struct PromptStringBuilder<'a> {
     /// Passed through to [`PromptSegment::WidgetLastCommandDuration`] so that
     /// the elapsed duration can be computed at render time.
     last_app_closed_at: Option<std::time::Instant>,
+    /// The window title set by the most recently expanded prompt string, if it
+    /// set one. See [`osc_title`].
+    title: Option<String>,
 }
 
 impl<'a> PromptStringBuilder<'a> {
@@ -288,6 +332,7 @@ impl<'a> PromptStringBuilder<'a> {
             cwd: None,
             home: None,
             last_app_closed_at: None,
+            title: None,
         }
     }
 
@@ -417,7 +462,13 @@ impl<'a> PromptStringBuilder<'a> {
     /// Returns `None` when the string cannot be processed.
     fn expand_prompt_string(&mut self, raw: String) -> Option<Vec<Vec<PromptSegment>>> {
         let modified = self.extract_time_codes(&raw);
-        let lines = expand_prompt_through_bash(modified)?;
+        if modified.is_empty() {
+            self.title = None;
+            return Some(vec![]);
+        }
+        let decoded = decode_prompt_through_bash(&modified)?;
+        self.title = osc_title(&decoded);
+        let lines = decoded_prompt_to_lines(&decoded)?;
         let result = lines
             .into_iter()
             .map(|line| {
@@ -1362,6 +1413,7 @@ impl PromptManager {
                 prompt_ruler_final: None,
                 construction_time: chrono::Local::now(),
                 cwd: String::new(),
+                title: None,
             }
         } else {
             const PS1_DEFAULT: &str = "bad ps1> ";
@@ -1427,6 +1479,7 @@ impl PromptManager {
                     log::warn!("Failed to parse PS1, defaulting to '{}'", PS1_DEFAULT);
                     vec![vec![PromptSegment::Static(Span::raw(PS1_DEFAULT))]]
                 });
+            let title = builder.title.take();
 
             let ps2 = shell::backend()
                 .env_var("PS2")
@@ -1530,8 +1583,14 @@ impl PromptManager {
                 prompt_ruler_final,
                 construction_time: chrono::Local::now(),
                 cwd,
+                title,
             }
         }
+    }
+
+    /// The window title PS1 sets with an OSC 0 or OSC 2 sequence, if any.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     pub fn get_ps1_lines(
@@ -1687,6 +1746,50 @@ impl PromptManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc_title_finds_title_sequences() {
+        // Debian's default PS1, after decoding.
+        assert_eq!(
+            osc_title("\x1b]0;me@host: ~/src\x07me@host:~/src$ "),
+            Some("me@host: ~/src".to_string())
+        );
+        // Ghostty's shell integration: OSC 133 marks around PS1, OSC 2 at the end.
+        assert_eq!(
+            osc_title("\x1b]133;P;k=i\x07~/src $ \x1b]133;B\x07\x1b]2;~/src\x07"),
+            Some("~/src".to_string())
+        );
+        // ST terminator, and the last title wins.
+        assert_eq!(
+            osc_title("\x1b]2;first\x1b\\\x1b]2;second\x1b\\$ "),
+            Some("second".to_string())
+        );
+        assert_eq!(osc_title("\x1b[32m~/src\x1b[0m $ "), None);
+        assert_eq!(osc_title("\x1b]7;file://host/tmp\x07$ "), None);
+        // An unterminated sequence is ignored.
+        assert_eq!(osc_title("\x1b]2;broken $ "), None);
+    }
+
+    #[test]
+    fn expand_prompt_string_records_title_and_hides_it() {
+        let mut builder = PromptStringBuilder::new(vec![], &[]);
+        let lines = builder
+            .expand_prompt_string("\x1b]2;~/src\x07~/src $ ".to_string())
+            .unwrap();
+        assert_eq!(builder.title.as_deref(), Some("~/src"));
+        let text: String = lines
+            .iter()
+            .flatten()
+            .map(|seg| match seg {
+                PromptSegment::Static(span) => span.content.to_string(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(text, "~/src $ ");
+
+        builder.expand_prompt_string("$ ".to_string()).unwrap();
+        assert_eq!(builder.title, None);
+    }
     use crate::settings::PromptWidgetCustom;
     use chrono::TimeZone;
 
@@ -2434,6 +2537,7 @@ mod tests {
             prompt_ruler_final: None,
             construction_time: chrono::Local::now(),
             cwd: cwd.to_string(),
+            title: None,
         }
     }
 
@@ -2451,6 +2555,7 @@ mod tests {
             prompt_ruler_final: None,
             construction_time: chrono::Local::now(),
             cwd: String::new(),
+            title: None,
         };
         assert_eq!(pm.cwd_display_segment_count(), 0);
     }
@@ -2978,6 +3083,7 @@ mod tests {
             prompt_ruler_final: None,
             construction_time: chrono::Local::now(),
             cwd: String::new(),
+            title: None,
         };
 
         let (_, _, _, ruler) = pm.get_ps1_lines(false, false, false, true);
@@ -2998,6 +3104,7 @@ mod tests {
             prompt_ruler_final: None,
             construction_time: chrono::Local::now(),
             cwd: String::new(),
+            title: None,
         };
 
         let (_, _, _, ruler) = pm.get_ps1_lines(false, false, false, true);
@@ -3024,6 +3131,7 @@ mod tests {
             prompt_ruler_final: Some(PromptRuler::EmptyLine),
             construction_time: chrono::Local::now(),
             cwd: String::new(),
+            title: None,
         };
 
         // When running (interactive):

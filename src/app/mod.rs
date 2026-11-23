@@ -790,6 +790,18 @@ impl<'a> App<'a> {
             }
         });
 
+        // The prompt renderer drops OSC sequences, so write the window title PS1
+        // sets (Debian's default PS1, Ghostty's and Kitty's shell integration)
+        // ourselves, as readline would have printed it with the prompt.
+        if let Some(title) = self.prompt_manager.title() {
+            shell_integration::write_escape_codes(&[shell_integration::EscapeCodes::WindowTitle {
+                title: title.to_string(),
+            }])
+            .unwrap_or_else(|e| {
+                log::error!("Failed to write window title: {}", e);
+            });
+        }
+
         shell::backend().prep_terminal();
 
         let event_reader = self.terminal.backend_mut().terminal_mut().event_reader();

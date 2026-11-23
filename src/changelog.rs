@@ -138,6 +138,7 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 ## v2.0.3 (2026-11-23)
 - **Space-prefixed commands stay private**: With `HISTCONTROL=ignorespace` or `ignoreboth`, the JSONL history no longer records commands that start with a space when bash-preexec (loaded by `atuin init bash`) has removed `ignorespace` from `HISTCONTROL`.
 - **First command in a new history file**: When the JSONL file is created, the first command is no longer written twice, and space-prefixed commands from Bash's history are left out.
+- **Window title from PS1**: flyline now sets the window title that PS1 sets with an OSC 0 or OSC 2 sequence, as readline does. Debian's default prompt and Ghostty's shell integration set the title this way; before, the tab kept showing the last command after it finished.
 "#;
 
 pub(crate) fn pretty_changelog() -> String {
