@@ -1,3 +1,6 @@
+# Stays on 24.04 (GCC 13): 26.04's GCC 15 defaults to C23, where the K&R
+# declarations in bash 3.2/4.4 sources are errors (mkbuiltins.c: "too many
+# arguments to function 'xmalloc'").
 FROM ubuntu:24.04
 
 ARG DOCKER_BASH_VERSION

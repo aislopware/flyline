@@ -1,7 +1,7 @@
 # Base image for demo generation
 
 # Use a recent Ubuntu base image
-FROM ubuntu:24.04 AS demo-base
+FROM ubuntu:26.04 AS demo-base
 
 # Create a non-root user for demos
 RUN useradd -m -s /bin/bash john

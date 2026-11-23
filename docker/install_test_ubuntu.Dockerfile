@@ -1,4 +1,5 @@
-FROM ubuntu:22.04 
+# An older supported LTS on purpose; newer distros are covered by arch/alpine.
+FROM ubuntu:22.04
 
 ARG FLYLINE_INSTALL_VERSION
 

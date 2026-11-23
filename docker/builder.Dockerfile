@@ -19,11 +19,15 @@ RUN apt-get update && apt-get install -y \
     binutils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Install rustup only; the toolchain itself is the one pinned in
+# rust-toolchain.toml, so the release library is built with the same compiler
+# CI lints with. A toolchain bump invalidates this layer and everything below.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /app
-RUN cargo install cargo-chef --locked
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
+RUN cargo install cargo-chef@0.1.78 --locked
 
 
 # Stage 2: Planner

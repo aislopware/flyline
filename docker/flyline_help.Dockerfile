@@ -1,6 +1,6 @@
-FROM ubuntu:20.04 AS help-runner
+FROM ubuntu:26.04 AS help-runner
 
-# ubuntu:20.04 ships with bash 5.0; no extra install needed.
+# Any bash >= 4.4 loads the library; the help text does not depend on its version.
 # Prevent interactive prompts during any potential package installation
 ENV DEBIAN_FRONTEND=noninteractive
 # Disable color output from clap so the saved text is plain ASCII
