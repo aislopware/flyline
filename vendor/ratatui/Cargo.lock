@@ -1770,6 +1770,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inline-resizable"
+version = "0.0.0"
+dependencies = [
+ "color-eyre",
+ "crossterm 0.29.0",
+ "ratatui",
+]
+
+[[package]]
 name = "input-form"
 version = "0.0.0"
 dependencies = [
@@ -2836,6 +2845,7 @@ dependencies = [
  "fakeit",
  "indoc",
  "instability",
+ "log",
  "palette",
  "pretty_assertions",
  "rand 0.10.1",
@@ -2865,6 +2875,7 @@ dependencies = [
  "indoc",
  "itertools 0.14.0",
  "kasuari",
+ "log",
  "lru",
  "palette",
  "pretty_assertions",
@@ -2916,6 +2927,7 @@ dependencies = [
  "color-eyre",
  "document-features",
  "instability",
+ "log",
  "ratatui",
  "ratatui-core",
  "termina",
