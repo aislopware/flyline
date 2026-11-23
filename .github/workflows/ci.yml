@@ -7,9 +7,12 @@ on:
     branches: [ "**" ]
   workflow_dispatch:
 
+# A newer push to the same PR supersedes the older run. A single global group
+# made every PR queue behind every other and cancelled whichever was pending.
+# Never cancel master/dispatch runs.
 concurrency:
-  group: ci
-  cancel-in-progress: false
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
