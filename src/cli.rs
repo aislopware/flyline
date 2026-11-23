@@ -624,7 +624,7 @@ enum Commands {
         #[arg(long = "backend", value_enum)]
         backend: Option<crate::settings::HistoryBackend>,
 
-        /// Specify a custom path for Flyline's JSONL history file (defaults to ~/.local/share/flyline/history.jsonl)
+        /// Specify a custom path for Flyline's JSONL history file (defaults to ~/.local/share/flyline/history.jsonl on Linux, ~/Library/Application Support/flyline/history.jsonl on macOS)
         #[arg(long = "jsonl-path", value_name = "PATH")]
         jsonl_path: Option<String>,
     },

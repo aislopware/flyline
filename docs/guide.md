@@ -520,7 +520,7 @@ Optionally read Zsh history entries to make migrating to Bash easier.
 
 ## Flyline JSONL history backend
 
-Flyline can use a structured JSONL history storage backend (`~/.local/share/flyline/history.jsonl`) that you can opt to use instead `~/.bash_history`.
+Flyline can use a structured JSONL history storage backend (`~/.local/share/flyline/history.jsonl` on Linux, `~/Library/Application Support/flyline/history.jsonl` on macOS) that you can opt to use instead `~/.bash_history`.
 
 The main improvements are:
 - **Real-time syncing between sessions**: Synchronize command history instantly across open terminal windows and tabs.

@@ -16,7 +16,7 @@ pub use flycontent::palette::ColourTheme;
     Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
 )]
 pub enum HistoryBackend {
-    /// Use Flyline's JSONL history file (~/.local/share/flyline/history.jsonl).
+    /// Use Flyline's JSONL history file (~/.local/share/flyline/history.jsonl on Linux, ~/Library/Application Support/flyline/history.jsonl on macOS).
     #[value(name = "flyline")]
     #[serde(rename = "flyline")]
     Flyline,
