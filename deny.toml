@@ -39,10 +39,10 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The patched ratatui/termina and the skim/ansi-to-tui/flycomp forks have no
-# crates.io release carrying flyline's changes. Nothing else may come from git.
+# ratatui (inline viewport), termina (terminal responses) and skim (matcher-only
+# build) are forks with no crates.io release carrying flyline's changes;
+# flycomp is HalFrgrd's own unpublished crate. Nothing else may come from git.
 allow-git = [
-    "https://github.com/HalFrgrd/ansi-to-tui.git",
     "https://github.com/HalFrgrd/flycomp.git",
     "https://github.com/HalFrgrd/ratatui.git",
     "https://github.com/HalFrgrd/skim",
