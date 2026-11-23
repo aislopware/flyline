@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "flyline"
-version = "1.11.0"
+version = "2.0.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
