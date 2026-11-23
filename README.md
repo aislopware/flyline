@@ -5,8 +5,8 @@
   <a href="https://github.com/skim-rs/skim/actions?query=workflow%3A%22Build+%26+Test%22+event%3Apush">
     <img src="https://github.com/skim-rs/skim/actions/workflows/test.yml/badge.svg?event=push" alt="Build & Test" />
   </a>
-  <a href="https://codecov.io/gh/skim-rs/skim" >
-    <img src="https://codecov.io/gh/skim-rs/skim/graph/badge.svg?token=RtIDgmDdzX" alt="codecov badge" />
+  <a href="https://skim-rs.github.io/skim/coverage" >
+    <img src="https://skim-rs.github.io/skim/coverage/coverage.svg" alt="coverage badge" />
   </a>
   <a href="https://repology.org/project/skim-fuzzy-finder/versions">
     <img src="https://repology.org/badge/tiny-repos/skim-fuzzy-finder.svg" alt="Packaging status" />
@@ -21,6 +21,8 @@
     <img alt="Built with Ratatui" src="https://ratatui.rs/built-with-ratatui/badge.svg" />
   </a>
 </p>
+
+<p align="center"><a href="https://build.demoshell.com/launch?snapshot=skim%2Ftui%3Askim&utm_source=badge" title="Live demo by Demoshell"><img src="https://build.demoshell.com/v1/embed/badge.svg"></a></p>
 
 > Life is short, skim!
 
@@ -81,28 +83,72 @@ The skim project contains several components:
 
 ## Package Managers
 
-| OS             | Package Manager   | Command                      |
-| -------------- | ----------------- | ---------------------------- |
-| macOS          | Homebrew          | `brew install sk`            |
-| macOS          | MacPorts          | `sudo port install skim`     |
-| Alpine         | apk               | `apk add skim`               |
-| Arch           | pacman            | `pacman -S skim`             |
-| Fedora         | COPR              |   see below                  |
-| Gentoo         | Portage           | `emerge --ask app-misc/skim` |
-| Guix           | guix              | `guix install skim`          |
-| Void           | XBPS              | `xbps-install -S skim`       |
+| OS             | Package Manager | Command                      |
+| -------------- | --------------- | ---------------------------- |
+| macOS          | Homebrew        | `brew install sk`            |
+| macOS          | MacPorts        | `sudo port install skim`     |
+| Alpine         | apk             | `apk add skim`               |
+| Arch           | pacman          | `pacman -S skim`             |
+| Fedora         | COPR            |   see below                  |
+| Gentoo         | Portage         | `emerge --ask app-misc/skim` |
+| Guix           | guix            | `guix install skim`          |
+| Void           | XBPS            | `xbps-install -S skim`       |
+| Windows        | winget          | `winget install skim`        |
+| Windows        | Scoop           | `scoop install skim`         |
+| Debian/Ubuntu  | apt             |   see below                  |
+| Fedora/RHEL    | dnf             |   see below                  |
 
 <a href="https://repology.org/project/skim-fuzzy-finder/versions">
     <img src="https://repology.org/badge/vertical-allrepos/skim-fuzzy-finder.svg?columns=4" alt="Packaging status">
 </a>
 
-### Fedora
-Up to date Fedora packages are provided via an unofficial community-maintained COPR repository.
+### Debian/Ubuntu
+
+A custom APT repository is available and updated automatically during each release:
+
+1. Import the signing key
+
+With wget:
+
+```sh
+sudo mkdir -p /etc/apt/keyrings
+sudo wget -O /etc/apt/keyrings/skim.asc https://skim-rs.github.io/skim/apt/skim-archive-keyring.asc
+```
+
+Or with cURL:
+
+```sh
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://skim-rs.github.io/skim/apt/skim-archive-keyring.asc | sudo tee /etc/apt/keyrings/skim.asc > /dev/null
+```
+
+2. Add the repository
+
+```sh
+echo 'deb [signed-by=/etc/apt/keyrings/skim.asc] https://skim-rs.github.io/skim/apt ./' | sudo tee /etc/apt/sources.list.d/skim.list
+sudo apt-get update
+```
+
+3. Install
+
+```sh
+sudo apt-get install skim
+```
+
+Alternatively, `.deb` packages are attached directly to every [release](https://github.com/skim-rs/skim/releases/latest).
+Download the one matching your architecture and run `sudo dpkg -i skim_*_amd64.deb`
+
+
+### Fedora/RHEL
+
+Up-to-date Fedora/RHEL packages are provided via an unofficial community-maintained COPR repository.
 ```bash
 sudo dnf copr enable sisyphus1813/skim
 sudo dnf install skim
 ```
 
+Alternatively, `.rpm` packages are attached directly to every [release](https://github.com/skim-rs/skim/releases/latest).
+Download it and run `sudo rpm -i skim-*.x86_64.rpm`
 
 ## Manually
 
@@ -194,6 +240,8 @@ Bindings for Fish, Bash and Zsh are available in the `shell` directory:
     - `alt-c`  to `cd` into a directory selected through `sk`
     - (not available in `fish`) `**` to complete file paths, for example `ls **<tab>` will show a `sk` widget to select a folder
 
+When these widgets open in a tmux or Zellij popup (`--popup`), the popup is named after what it is for — `skim: files`, `skim: command history` or `skim: directories` — so it is easy to tell apart from other popups. Use `--popup-name` to name your own.
+
 To enable these features, source the `key-bindings.{shell}` file and set up completions according to your shell's documentation or see below.
 
 ### Shell Completions
@@ -246,14 +294,15 @@ page](https://github.com/skim-rs/skim/blob/master/man/man1/sk.1) (`man sk`).
 
 `skim` borrows `fzf`'s syntax for matching items:
 
-| Token    | Match type                 | Description                       |
-|----------|----------------------------|-----------------------------------|
-| `text`   | fuzzy-match                | items that match `text`           |
-| `^music` | prefix-exact-match         | items that start with `music`     |
-| `.mp3$`  | suffix-exact-match         | items that end with `.mp3`        |
-| `'wild`  | exact-match (quoted)       | items that include `wild`         |
-| `!fire`  | inverse-exact-match        | items that do not include `fire`  |
-| `!.mp3$` | inverse-suffix-exact-match | items that do not end with `.mp3` |
+| Token     | Match type                 | Description                          |
+|-----------|----------------------------|--------------------------------------|
+| `text`    | fuzzy-match                | items that match `text`              |
+| `^music`  | prefix-exact-match         | items that start with `music`        |
+| `.mp3$`   | suffix-exact-match         | items that end with `.mp3`           |
+| `'wild`   | exact-match (quoted)       | items that include `wild`            |
+| `!fire`   | inverse-exact-match        | items that do not include `fire`     |
+| `!^music` | inverse-prefix-exact-match | items that do not start with `music` |
+| `!.mp3$`  | inverse-suffix-exact-match | items that do not end with `.mp3`    |
 
 `skim` also supports the combination of tokens.
 
@@ -399,6 +448,7 @@ The following UI elements can be customized:
 | `selected`         | Selected item marker color                  | `--color=selected:168`         |
 | `header`           | Header text color                           | `--color=header:109`           |
 | `border`           | Border color for preview/layout             | `--color=border:59`            |
+| `scrollbar`        | Item list scrollbar thumb color             | `--color=scrollbar:59`         |
 
 ### Examples
 
@@ -453,11 +503,48 @@ You can configure key bindings to start external processes without leaving Skim 
 sk --bind 'f1:execute(less -f {}),ctrl-y:execute-silent(echo {} | pbcopy)+abort'
 ```
 
+### Environment variables exported to child processes
+
+Commands run by `--preview`, `execute`, `execute-silent` and `reload` inherit a snapshot of
+skim's state as environment variables. Each value is exported twice: once under a `SKIM_`
+prefix and once under the same name with an `FZF_` prefix, so fzf-style scripts work
+unchanged. This avoids quoting issues and keeps commands short.
+
+| Variable | Value |
+|---|---|
+| `QUERY` | Current query input |
+| `CURRENT_ITEM` | Text of the current item (ANSI-stripped); unset if there is none |
+| `SELECTED_ITEMS` | Selected items, newline-separated |
+| `POS` | 1-based position of the current item |
+| `TOTAL_COUNT` | Total number of items |
+| `MATCH_COUNT` | Number of matched items |
+| `SELECT_COUNT` | Number of selected items |
+| `LINES`, `COLUMNS` | Height and width of the skim area |
+| `DIRECTION` | List direction (`up` or `down`) |
+| `INPUT_STATE` | `enabled` or `disabled` |
+| `PROMPT` | Current prompt string |
+| `POINTER` | Current pointer (selector) string |
+| `ACTION`, `KEY` | Name of the running action and of the last key pressed (empty before any input); a follow-up such as `act-up:execute-silent(...)` reports `execute-silent` |
+| `WRAP` | `char` when item wrapping is on |
+| `PREVIEW_LINES`, `PREVIEW_COLUMNS`, `PREVIEW_TOP`, `PREVIEW_LEFT` | Geometry of the preview window (only set when a preview is configured) |
+| `NTH`, `WITH_NTH` | Current `--nth` and `--with-nth` values (only set when configured) |
+
+```sh
+# Equivalent to --preview 'echo {}', without the quoting pitfalls of {}
+sk --preview 'printf "%s" "$SKIM_CURRENT_ITEM"'
+```
+
+A variable that does not apply to the current state (no preview, no `--nth`, an oversized value,
+…) is removed from the child's environment instead of being left at its inherited value, so a skim
+started inside another skim or fzf never leaks the enclosing process's values into its children.
+The same variables are passed to the very first `--cmd` and to a `reload`, the latter capturing the
+focused and selected items as they were when the reload was triggered.
+
 ## Algorithms
 
 Skim offers multiple algorithms, check the help or manpage for an exhaustive list. Among them are:
 - `skim_v2`, the default algorithm, loosely based on `fzf`'s algorithm
-- `frizbee`, uses [frizbee](https://crates.io/frizbee), the typo-resistant algorithm from in the [blink.cmp](https://github.com/saghen/blink.cmp) neovim plugin (**x86_64 and aarch64 only**)
+- `frizbee`, uses [frizbee](https://crates.io/frizbee), the typo-resistant algorithm from the [blink.cmp](https://github.com/saghen/blink.cmp) neovim plugin
 - `fzy`, based on [fzy](https://github.com/jhawthorn/fzy/)'s algorithm expanded for basic typo-resistance
 - `arinae`, skim's newest algorithm, designed in-house with typo-resistance in mind, expanding on all the above to make typo-resistant matching feel more natural while keeping the per-item performance up to the best standards
 

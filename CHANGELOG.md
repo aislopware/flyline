@@ -5,6 +5,443 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking Changes
+
+- Make `SkimWidget` crate-private. Downstream code can no longer import or implement this internal trait, or call its methods.
+
+## [5.9.0] - 2026-10-27
+
+### 🚀 Features
+
+- Add separator flag (#1208)
+
+### 🐛 Bug Fixes
+
+- Properly clear the inline frame even if a resize is not necessary (#1212)
+
+## [5.8.0] - 2026-10-20
+
+### 🚀 Features
+
+- *(lib)* Add preview streaming (#1188)
+- Use `--popup-name` to name popup panes (#1203)
+
+### 🐛 Bug Fixes
+
+- *(fzy)* Keep the best first-character match when computing indices (#1198)
+- *(fzy)* Make highlighted indices follow the scored path (#1202)
+- Quote args on windows too (#1205)
+
+### 📚 Documentation
+
+- Add link to a live browser demo (#1204)
+
+### New Contributors
+* @kooler made their first contribution in [#1204](https://github.com/skim-rs/skim/pull/1204)
+* @ybai08 made their first contribution in [#1202](https://github.com/skim-rs/skim/pull/1202)
+
+## [5.7.4] - 2026-10-04
+
+### 🐛 Bug Fixes
+
+- Make min-query-length control interactive command runs (#1191)
+
+### 📚 Documentation
+
+- *(readme)* Document inverse prefix match (`!^`) (#1189)
+
+### New Contributors
+* @cohei made their first contribution in [#1189](https://github.com/skim-rs/skim/pull/1189)
+
+## [5.7.3] - 2026-10-02
+
+### 🐛 Bug Fixes
+
+- *(tui)* Stop the scrollbar thumb inheriting the row's modifiers (#1183)
+- Merge repeated --color options (#1185)
+
+### New Contributors
+* @kvnxiao made their first contribution in [#1185](https://github.com/skim-rs/skim/pull/1185)
+
+## [5.7.2] - 2026-09-27
+
+### 🐛 Bug Fixes
+
+- *(lib)* Make run_items close the channel before starting the TUI
+
+## [5.7.1] - 2026-09-21
+
+### 🐛 Bug Fixes
+
+- Smart case detection treated special chars as uppercase (#1180)
+
+### 📚 Documentation
+
+- Fix some typos (#1177)
+
+### New Contributors
+* @ErikKarlgren made their first contribution in [#1177](https://github.com/skim-rs/skim/pull/1177)
+
+## [5.7.0] - 2026-09-08
+
+### 🐛 Bug Fixes
+
+- Stream preview command instead of waiting for completion (#1176)
+
+### 📚 Documentation
+
+- Update benchmarks
+
+### 🤖 CI
+
+- Lock everything to make sure dependencies match (#1170)
+
+### ⚙️ Miscellaneous Tasks
+
+- Nitpicks after multithreading review (#1172)
+
+## [5.6.7] - 2026-09-04
+
+### 🐛 Bug Fixes
+
+- Make min-height work again (#1168)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update dependencies after tinyvec breakage
+
+## [5.6.6] - 2026-08-22
+
+### 🐛 Bug Fixes
+
+- *(matcher)* An inverse query only checks the first --nth field (#1159)
+- Do not feed items through a fifo in zsh completions (#1164)
+- *(filter)* --filter hangs when the query is below --min-query-length (#1158)
+- Path_name_offset returns bytes while Rank::begin is a char index (#1160)
+
+### 🤖 CI
+
+- Automatically update PRs on pushes to master
+- Fix auto update branch
+
+### ⚙️ Miscellaneous Tasks
+
+- Clippy & fmt after cargo update
+
+## [5.6.5] - 2026-08-16
+
+### 🐛 Bug Fixes
+
+- Add allow_hyphen_values to --with-nth (#1156)
+- *(field)* An out-of-range field index silently matches field 1 (#1155)
+
+### New Contributors
+* @VXNCXNX made their first contribution in [#1155](https://github.com/skim-rs/skim/pull/1155)
+
+## [5.6.4] - 2026-08-10
+
+### 🐛 Bug Fixes
+
+- *(image)* Detect picker from tty to support protocol detection with piped input
+- Platform-dependant timevals
+- Different suseconds and time per platform
+- Avoid truncation by casting up instead of down
+
+## [5.6.3] - 2026-08-07
+
+### 🐛 Bug Fixes
+
+- Advance the input cursor by byte length in insert_str (#1151)
+
+### New Contributors
+* @vimsucks made their first contribution in [#1151](https://github.com/skim-rs/skim/pull/1151)
+
+## [5.6.2] - 2026-08-07
+
+### 🐛 Bug Fixes
+
+- Assymetry in char_equal causing panic with some unicode characters
+- Reorder batches in `--tac` mode (#1150)
+- Match double-width roman characters (closes #1149)
+
+### 📚 Documentation
+
+- Preview command runs with sh/cmd, not SHELL
+
+## [5.6.1] - 2026-07-27
+
+### 🤖 CI
+
+- Do not fail release on public API breakage
+
+## [5.6.0] - 2026-07-26
+
+### 🚀 Features
+
+- Add the `set-cmd` action to change interactive mode command from bindings (#1142)
+
+### 🐛 Bug Fixes
+
+- *(examples)* Gate malloc_trim to gcc in the multiple_runs example
+
+### 📚 Documentation
+
+- Readd default keybindings to the manpage as an auto-generated separate subsection
+
+### 🧪 Testing
+
+- Replace tmux e2e harness with cross-platform Zellij harness (#1139)
+
+### 🤖 CI
+
+- Make coverage non-blocking to avoid issues with nightly rust
+
+## [5.5.0] - 2026-07-23
+
+### 🚀 Features
+
+- Add double-click as a bindable trigger (#1134)
+
+### 🐛 Bug Fixes
+
+- Do not panic on push/pop keyboard enhancement flags failure
+
+## [5.4.0] - 2026-07-21
+
+### 🚀 Features
+
+- Allow binding actions & more events (#1125)
+
+### 🐛 Bug Fixes
+
+- Allow execute actions to run interactive commands (#1132)
+
+### 📚 Documentation
+
+- Update coverage url
+
+### 🤖 CI
+
+- Publish apt repo
+- Actually push apt
+
+## [5.3.2] - 2026-07-20
+
+### 🤖 CI
+
+- Publish .deb, .rpm and winget packages on release (#1129)
+
+## [5.3.1] - 2026-07-19
+
+### 🐛 Bug Fixes
+
+- Ignore KeyEventState (#1127)
+
+## [5.3.0] - 2026-07-19
+
+### 🚀 Features
+
+- Add 'left' and `right` info display modes (#1120)
+- Add `--hide-nth` to hide fields from display but keep them searchable (#1122)
+- Add bind and unbind actions (#1121)
+
+### 🐛 Bug Fixes
+
+- Kitty keyboard protocol
+
+### 🤖 CI
+
+- Add public-api check (#1124)
+
+## [5.2.0] - 2026-07-17
+
+### 🚀 Features
+
+- Collapsed borders by default and `--border-no-collapse` flag (#1117)
+- Reduce binary size by removing uncommon image formats and color_eyre (#1118)
+
+## [5.1.4] - 2026-07-17
+
+### 🐛 Bug Fixes
+
+- Preserve input order with --no-sort (#1115)
+
+### New Contributors
+* @juneboku made their first contribution in [#1115](https://github.com/skim-rs/skim/pull/1115)
+
+## [5.1.3] - 2026-07-16
+
+### 🐛 Bug Fixes
+
+- Manually resize the Tui when not in fullscreen mode
+
+### 🤖 CI
+
+- Fix fixed viewport resize test in non-interactive env (#1114)
+
+### ⚙️ Miscellaneous Tasks
+
+- Fix CHANGELOG duplication
+
+## [5.1.2] - 2026-07-16
+
+### 🤖 CI
+
+- Add Release PR workflow
+- Update app-id to client-id
+- Add changelog as job output
+
+## [5.1.1] - 2026-07-16
+
+### 🐛 Bug Fixes
+
+- Handle deprecated --expect flag in sk 4.x vim plugin (#1057)
+
+### New Contributors
+* @antiagainst made their first contribution in [#1057](https://github.com/skim-rs/skim/pull/1057)
+
+## [5.1.0] - 2026-07-09
+
+### 🚀 Features
+
+- Bump frizbee to 0.10.0, thread local matcher (#1105)
+- Add cargo-fuzz targets for hand-rolled text parsers (#1106)
+
+### 🐛 Bug Fixes
+
+- Less restrictive max pattern in ari matcher
+- Unknown border values fallback to plain (closes #1107)
+
+### 🧪 Testing
+
+- Fix arinae max pat len test after constant update
+
+### New Contributors
+* @saghen made their first contribution in [#1105](https://github.com/skim-rs/skim/pull/1105)
+
+## [5.0.0] - 2026-07-02
+
+**Note:** this release is not breaking for CLI users or library users who used the default features.
+
+A lot has happened since skim v4, and this is a good opportunity for a quick recap :
+
+ - *Windows support* has been available for quite a while now, and a lot of work has been put into making skim as cross-platform as possible, with almost the same test coverage on Windows than Unix(-likes).
+ - *Image support in preview* is easily achievable through the `--image` flag, using whatever we detect is available (kitty image protocol, sixel or a unicode half-blocks fallback)
+ - *Zellij support* was added and grouped with tmux under the `--popup` flag
+ - *Multiline items* can be rendered for more complex interfaces
+ - *Various performance improvements* allow us to slowly but steadily keep gaining performance across our benchmarks
+
+Check the changelog for more details !
+
+### 🚀 Features
+
+- [**breaking**] Feature-gate listen and image to allow opting out (#1103)
+
+## [4.10.0] - 2026-06-28
+
+### 🚀 Features
+
+- *(theme)* Add a themeable scrollbar color for the item list (#1101)
+
+### 🧪 Testing
+
+- Improve coverage on matchers & algos (#1100)
+
+### New Contributors
+* @max-sixty made their first contribution in [#1101](https://github.com/skim-rs/skim/pull/1101)
+
+## [4.9.0] - 2026-06-25
+
+### 🚀 Features
+
+- *(ci)* Upload coverage report to pages for easier browsing (#1096)
+
+### 🐛 Bug Fixes
+
+- Refresh preview after mouse selection (#1095)
+
+### 🧪 Testing
+
+- Add unit tests for the shell & manpage generators (#1098)
+- Improve coverage to 90% (#1099)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Use github's coverage (#1094)
+
+### New Contributors
+* @wang-borong made their first contribution in [#1095](https://github.com/skim-rs/skim/pull/1095)
+
+## [4.8.0] - 2026-06-17
+
+### 🚀 Features
+
+- Add image preview support & preview spinner while loading (#1081)
+
+### 🐛 Bug Fixes
+
+- Multiline popup cmd misread (#1088)
+- Tmux sigpipe (#1090)
+
+### 📚 Documentation
+
+- Update ARCHITECTURE.md
+
+### ⚡ Performance
+
+- Optimize --tac pipeline (#1089)
+
+### ⚙️ Miscellaneous Tasks
+
+- Add msrv checks (#1083)
+- Add image tests & examples
+- Format imports
+
+## [4.7.0] - 2026-05-21
+
+### 🚀 Features
+
+- Add `--disable-pattern` option to selectively disable items (#1077)
+
+### 🐛 Bug Fixes
+
+- *(ari)* Tweak previous char bonuses
+
+### ⚙️ Miscellaneous Tasks
+
+- Crate-level lints
+
+## [4.6.3] - 2026-05-20
+
+### 🐛 Bug Fixes
+
+- Re-enable `--no-mouse` (#1074)
+- Item matching mismatching (closes #1071) (#1073)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Readd PR check (#1068)
+
+## [4.6.2] - 2026-05-02
+
+### 🐛 Bug Fixes
+
+- *(windows)* Use 1-based cursor position (closes #1065)
+
+## [4.6.1] - 2026-04-26
+
+### 🐛 Bug Fixes
+
+- *(windows)* Raw_arg to avoid escape issue (#1061)
+- Do not truncate display when longer than text (#1064)
+
+### ⚙️ Miscellaneous Tasks
+
+- Delete dangerous (and not that useful) PR action in favor of a just recipe
+- Frizbee as a feature and remove quotes from output-format (#1062)
+
 ## [4.6.0] - 2026-04-14
 
 ### 🚀 Features

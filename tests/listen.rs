@@ -1,27 +1,30 @@
 // TODO: automate listen tests on windows
 // Maybe using smaller tests ? actions processing is already tested, only the IPC part needs testing
-#![cfg(unix)]
+#![allow(missing_docs, clippy::pedantic)]
+// The Zellij harness is cross-platform, but this file stays unix-only for
+// reasons unrelated to the multiplexer: skim's `--listen`/`--remote` IPC binds a
+// unix domain socket here. (`#![cfg(unix)]` already covers both Linux and macOS.)
+#![cfg(all(unix, feature = "listen"))]
 #[allow(dead_code)]
 #[macro_use]
 mod common;
 
-use common::tmux::Keys::*;
-use rand::{RngExt as _, distr::Alphabetic};
-use std::{
-    io::{Result, Write as _},
-    process::{Child, Command, Stdio},
-};
+use common::zellij::Keys::*;
+use rand::RngExt as _;
+use rand::distr::Alphabetic;
+use std::io::{Result, Write as _};
+use std::process::{Child, Command, Stdio};
 
-use common::tmux::TmuxController;
+use common::zellij::ZellijController;
 
-use crate::common::SK;
+use crate::common::{SK, SKIM_ENV_REMOVES};
 
 fn connect(name: &str) -> Result<Child> {
-    Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!("{SK} --remote {name}"))
-        .stdin(Stdio::piped())
-        .spawn()
+    let mut cmd = Command::new(SK);
+    for var in SKIM_ENV_REMOVES {
+        cmd.env_remove(var);
+    }
+    cmd.args(["--remote", name]).stdin(Stdio::piped()).spawn()
 }
 fn send(child: &mut Child, msg: &str) -> Result<()> {
     let mut b = msg.bytes().collect::<Vec<_>>();
@@ -30,8 +33,8 @@ fn send(child: &mut Child, msg: &str) -> Result<()> {
     Ok(())
 }
 
-fn setup(name: &str, extra_args: &[&str]) -> Result<(TmuxController, Child)> {
-    let mut tmux = TmuxController::new_named(name)?;
+fn setup(name: &str, extra_args: &[&str]) -> Result<(ZellijController, Child)> {
+    let mut tmux = ZellijController::new_named(name)?;
     let socket_name = format!(
         "sk-test-{name}{}",
         rand::rng()
@@ -417,6 +420,39 @@ fn listen_yank() -> std::io::Result<()> {
         @capture[0]trim().eq(">");
         send(&mut stream, "yank")?;
         @capture[0]trim().eq("> hello");
+    );
+    Ok(())
+}
+
+// Bind a previously-unbound key over IPC, then trigger it from the keyboard.
+#[test]
+fn listen_bind() -> std::io::Result<()> {
+    let (tmux, mut stream) = setup("bind", &[])?;
+    sk_test!(@expand tmux;
+        @capture[2]starts_with("> a");
+        // The header acknowledges that the preceding bind has been processed
+        // before terminal key events are sent through a separate channel.
+        send(&mut stream, "bind(ctrl-x:up)+set-header(ready)")?;
+        @capture[*]trim().eq("ready");
+        @keys Ctrl(&Key('x')), Ctrl(&Key('x'));
+        @capture[*]starts_with("> c");
+    );
+    Ok(())
+}
+
+// Unbind a key over IPC so its keypress becomes a no-op. The trailing `x`
+// distinguishes the two cases: if ctrl-u were still bound to unix-line-discard
+// the query would read `> x`, but with it unbound the query is preserved.
+#[test]
+fn listen_unbind() -> std::io::Result<()> {
+    let (tmux, mut stream) = setup("unbind", &[])?;
+    sk_test!(@expand tmux;
+        @keys Str("hello");
+        @capture[0]trim().eq("> hello");
+        send(&mut stream, "unbind(ctrl-u)+set-header(ready)")?;
+        @capture[*]trim().eq("ready");
+        @keys Ctrl(&Key('u')), Key('x');
+        @capture[0]trim().eq("> hellox");
     );
     Ok(())
 }

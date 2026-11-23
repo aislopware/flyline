@@ -44,10 +44,8 @@ use self::constants::{CAMEL_CASE_BONUS, START_OF_STRING_BONUS};
 use self::prefilter::cheap_typo_prefilter;
 
 use self::matrix::{CELL_ZERO, Cell, Dir, SWMatrix};
-use crate::{
-    CaseMatching,
-    fuzzy_matcher::{FuzzyMatcher, MatchIndices, ScoreType},
-};
+use crate::CaseMatching;
+use crate::fuzzy_matcher::{FuzzyMatcher, MatchIndices, ScoreType};
 
 type Score = i16;
 
@@ -98,7 +96,7 @@ impl ArinaeMatcher {
     #[inline(always)]
     fn respect_case<C: Atom>(&self, pattern: &[C]) -> bool {
         self.case == CaseMatching::Respect
-            || (self.case == CaseMatching::Smart && !pattern.iter().all(|b| b.is_lowercase()))
+            || (self.case == CaseMatching::Smart && pattern.iter().any(|&b| Into::<char>::into(b).is_uppercase()))
     }
 
     /// Dispatch to `full_dp` with the appropriate const generics.

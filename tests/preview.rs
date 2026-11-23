@@ -1,3 +1,5 @@
+#![allow(missing_docs, clippy::pedantic)]
+
 #[allow(dead_code)]
 #[macro_use]
 mod common;
@@ -50,13 +52,34 @@ insta_test!(preview_wrap, ["x"], &["--preview", "echo a      bbbbbbbb", "--previ
 });
 
 // Test that preview updates when navigating between items
-insta_test!(preview_navigation, ["a", "b", "c"], &["--preview", "echo {}"], {
+insta_test!(preview_navigation, ["a", "b", "c"], &["--preview", &common::echo_command("{}")], {
     @snap;
     @key Up;
     @snap;
 });
 
-insta_test!(preview_plus, ["a", "b", "c"], &["--preview", "echo {+}", "-m"], {
+#[cfg(unix)]
+insta_test!(
+    preview_env_vars,
+    ["aaa", "bbb"],
+    &[
+        "--preview",
+        "echo Q=$SKIM_QUERY FQ=$FZF_QUERY C=$SKIM_CURRENT_ITEM M=$SKIM_MATCH_COUNT S=$SKIM_SELECT_COUNT D=$SKIM_DIRECTION IS=$SKIM_INPUT_STATE P=$SKIM_PROMPT PT=$SKIM_POINTER W=$SKIM_WRAP N=$SKIM_NTH A=$SKIM_ACTION K=$SKIM_KEY T=$SKIM_PREVIEW_TOP L=$SKIM_PREVIEW_LEFT PL=$SKIM_PREVIEW_LINES PC=$SKIM_PREVIEW_COLUMNS",
+        "--preview-window",
+        "up:wrap",
+        "--wrap",
+        "--nth",
+        "1"
+    ],
+    {
+        @snap;
+        @type "bbb";
+        @snap;
+    }
+);
+
+insta_test!(preview_plus, ["a", "b", "c"], &["--preview", &common::echo_command("{+}"), "-m"], {
+
     @snap;
     @key Up;
     @snap;
@@ -65,6 +88,24 @@ insta_test!(preview_plus, ["a", "b", "c"], &["--preview", "echo {+}", "-m"], {
     @shift Tab;
     @snap;
     @action DeselectAll;
+    @snap;
+});
+
+insta_test!(preview_image_lenna, ["examples/Lenna.png"], &["--preview", "{}", "--image", "halfblocks"], {
+    @snap;
+});
+
+insta_test!(preview_image_missing, ["examples/missing.png"], &["--preview", "{}", "--image", "halfblocks"], {
+    @snap;
+});
+
+insta_test!(preview_image_navigation, ["examples/missing.png", "examples/Lenna.png"], &["--preview", "{}", "--image", "halfblocks"], {
+    @snap;
+    @key Up;
+    @snap;
+});
+
+insta_test!(preview_image_window_down, ["examples/Lenna.png"], &["--preview", "{}", "--image", "halfblocks", "--preview-window", "down:40%"], {
     @snap;
 });
 

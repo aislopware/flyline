@@ -1,12 +1,16 @@
 //! Provides what's needed to generate skim's man page
+use std::fmt::Write as _;
 use std::io::Write;
 
 use clap::CommandFactory;
 use clap_mangen::Man;
-use color_eyre::eyre::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use eyre::Result;
 use roff::{Inline, Roff};
 
 use crate::SkimOptions;
+use crate::binds::{SkimEvent, get_default_key_map};
+use crate::tui::actions::{ACTION_CATALOG, Action};
 
 const THEME_SECTION: &str = "
 Available themes:
@@ -36,6 +40,8 @@ Available color names:
     * selected (or marker): selected item marker
     * header: header text
     * border: border lines
+    * separator: horizontal separator (independent of borders and headers)
+    * scrollbar: item list scrollbar thumb
 
 Adding `-fg`, `_fg`, `-bg`, `_bg`, `-underline`, `_underline` sets the corresponding part of
 the color. For instance, `normal-fg` (or simply `fg`) will set the foreground normal color.
@@ -47,7 +53,7 @@ Color formats:
 Available attrs:
     * x | regular: resets the modifiers, use it before the others
     * b | bold
-    * u | underline
+    * u | underlined
     * c | crossed-out
     * d | dim
     * i | italic
@@ -76,7 +82,7 @@ the results. It is enabled by the `--interactive` (or `-i`) option or by binding
 `toggle-interactive` action (default: <ctrl-q>).
 The command is specified with the `--cmd` option.
 
-Example: `sk --cmd 'rg {} --color=always' --interactive` will use `rg` to search for the query
+Example: `sk --cmd 'rg {q} --color=always' --interactive` will use `rg` to search for the query
 in the current directory and display the results interactively.
 ";
 
@@ -118,81 +124,123 @@ const KEYS_SS: &str = "
 * alt-shift-down
 * alt-shift-left
 * alt-shift-right
+* double-click
 * any single character
 ";
-const ACTIONS_SS: &str = "
-* abort: ctrl-c  ctrl-q  esc
-* accept(...): enter *the argument will be printed when the binding is triggered*
-* append-and-select
-* backward-char: ctrl-b  left
-* backward-delete-char: ctrl-h  bspace
-* backward-delete-char/eof
-* backward-kill-word: alt-bs
-* backward-word: alt-b   shift-left
-* beginning-of-line: ctrl-a  home
-* clear-screen: ctrl-l
-* delete-char: del
-* delete-char/eof: ctrl-d
-* deselect-all
-* down: ctrl-j  ctrl-n  down
-* end-of-line: ctrl-e  end
-* execute(...): *arg will be a command, see COMMAND EXPANSION for details
-* execute-silent(...): *arg will be a command, see COMMAND EXPANSION for details
-* forward-char: ctrl-f  right
-* forward-word: alt-f   shift-right
-* if-non-matched
-* if-query-empty
-* if-query-not-empty
-* ignore
-* kill-line
-* kill-word: alt-d
-* next-history: ctrl-n with `--history` or `--cmd-history`
-* page-down: pgdn
-* page-up: pgup
-* half-page-down
-* half-page-up
-* preview-up: shift-up
-* preview-down: shift-down
-* preview-left
-* preview-right
-* preview-page-down
-* preview-page-up
-* previous-history: ctrl-p with `--history` or `--cmd-history`
-* redraw
-* refresh-cmd
-* refresh-preview
-* reload(...)
-* select-all
-* select-row
-* set-preview-cmd(...): *arg will be a expanded expression, see COMMAND EXPANSION for details
-* set-query(...): *arg will be a expanded expression, see COMMAND EXPANSION for details
-* toggle
-* toggle-all
-* toggle+down: ctrl-i  tab
-* toggle-in: (--layout=reverse ? toggle+up:  toggle+down)
-* toggle-interactive
-* toggle-out: (--layout=reverse ? toggle+down:  toggle+up)
-* toggle-preview
-* toggle-preview-wrap
-* toggle-sort
-* toggle+up: btab    shift-tab
-* top
-* unix-line-discard: ctrl-u
-* unix-word-rubout: ctrl-w
-* up: ctrl-k  ctrl-p  up
-* yank: ctrl-y
-";
+const BINDABLE_EVENTS_SS: &str = concat!(
+    "\n",
+    "* change: the query changes\n",
+    "* start: skim enters its event loop; fired once\n",
+    "* load: the reader and matcher finish consuming the current input; ",
+    "fired once per read, including reloads\n",
+    "* result: filtering for the current query completes\n",
+    "* focus: the focused item changes because of cursor movement or a result update\n",
+    "* zero: the input stream is complete and the final search has no matches\n",
+    "* one: the input stream is complete and the final search has exactly one match\n",
+);
 
+const ACTION_BINDINGS_SS: &str = concat!(
+    "\n",
+    "Actions can also be used as binding triggers. A follow-up chain bound to an action name runs immediately ",
+    "after that action. Use the `act-` prefix for action triggers; it is recommended to avoid ambiguity and ",
+    "required when the action name is also a key, for example `act-up:last`.\n\n",
+    "Follow-up chains use non-recursive (`noremap`) semantics: their actions do not trigger further action ",
+    "bindings. Add `suppress` to skip the triggering action's default behavior, for example ",
+    "`act-up:suppress+down`.\n",
+);
+
+#[cfg(feature = "listen")]
 const REMOTE_SECTION: &str = "
 skim can be controlled from other processes, using the `--listen` (and optionally `--remote`) flags.
 
 To achieve this, run the server instance using `sk --listen optional_address` (the address defaults to `sk`).
-It will then start listening on a named socket for instructions.
+It will then start listening on a named socket for instructions. Only clients that run as the same user can send instructions.
 
 To send instructions, you can use `sk --remote optional_address` or any other tool that allows us to interact with such sockets,
 such as `socat` on linux: `echo 'ToggleIn' | socat -u STDIN ABSTRACT-CONNECT:optional_address`. Instructions correspond to skim's Actions and need to be sent in Ron format.
 When using `sk --remote`, pipe in action chains (see the KEYBINDS section), for instance `echo 'up+select-row' | sk --remote optional_address`
 ";
+
+/// Renders the list of bindable actions from the action catalog.
+///
+/// The list is generated from `define_action_catalog!` in `src/tui/actions.rs`,
+/// so a new action shows up here (with its doc comment) automatically.
+fn actions_ss() -> String {
+    let mut res = String::from("\n");
+    for action in ACTION_CATALOG.iter().filter(|action| action.is_bindable()) {
+        let _ = writeln!(res, "* {}: {}", action.display_name(), action.summary());
+    }
+    res
+}
+
+/// Renders the runtime default keymap, keeping the manpage in sync with
+/// [`get_default_key_map`].
+fn default_keys_ss() -> String {
+    let mut bindings = get_default_key_map()
+        .iter()
+        .map(|(key, actions)| {
+            let actions = actions.iter().map(Action::name).collect::<Vec<_>>().join("+");
+            (key_name(key), actions)
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    let mut res = String::from("\n");
+    for (key, actions) in bindings {
+        let _ = writeln!(res, "* {key}: {actions}");
+    }
+    res
+}
+
+fn key_name(key: &KeyEvent) -> String {
+    if *key == SkimEvent::DoubleClick.key_event() {
+        return "double-click".to_string();
+    }
+
+    // Crossterm can report back-tab with every modifier set. Keep the familiar
+    // binding spelling instead of exposing that terminal representation.
+    if key.code == KeyCode::BackTab && key.modifiers == KeyModifiers::all() {
+        return "btab".to_string();
+    }
+
+    let mut parts = Vec::new();
+    for (modifier, name) in [
+        (KeyModifiers::CONTROL, "ctrl"),
+        (KeyModifiers::ALT, "alt"),
+        (KeyModifiers::SHIFT, "shift"),
+        (KeyModifiers::SUPER, "super"),
+        (KeyModifiers::HYPER, "hyper"),
+        (KeyModifiers::META, "meta"),
+    ] {
+        if key.modifiers.contains(modifier) {
+            parts.push(name.to_string());
+        }
+    }
+
+    parts.push(match key.code {
+        KeyCode::Backspace => "bspace".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pgup".to_string(),
+        KeyCode::PageDown => "pgdn".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "btab".to_string(),
+        KeyCode::Delete => "del".to_string(),
+        KeyCode::Insert => "insert".to_string(),
+        KeyCode::F(number) => format!("f{number}"),
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(character) => character.to_string(),
+        KeyCode::Null => "null".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        _ => format!("{:?}", key.code).to_lowercase(),
+    });
+    parts.join("-")
+}
 
 fn parse_str(src: &str) -> Vec<Inline> {
     let mut res = Vec::new();
@@ -280,20 +328,26 @@ Exact search can be enabled by default by the `--exact` command-line flag. In ex
     section(
         &mut custom,
         "KEYBINDS",
-        "
-Keybinds can be set by the `--bind` option, which takes a comma-separated list of [key]:[action[+action2].
-Actions can take arguments, specified either between parentheses `reload(ls)` or after a colon `reload:ls`
-",
+        concat!(
+            "\nBindings can be set by the `--bind` option, which takes a comma-separated list of ",
+            "`<trigger>:<action>[+action2]` expressions. A trigger can be a key, a finder event, or an action ",
+            "name.\n",
+            "Actions can take arguments, specified either between parentheses `reload(ls)` or after a colon ",
+            "`reload:ls`.\n",
+        ),
     );
     subsection(&mut custom, "Available keys (aliases in parentheses)", KEYS_SS);
-    subsection(&mut custom, "Actions[:default keys][*notes]", ACTIONS_SS);
+    subsection(&mut custom, "Bindable finder events", BINDABLE_EVENTS_SS);
+    subsection(&mut custom, "Actions as binding triggers", ACTION_BINDINGS_SS);
+    subsection(&mut custom, "Actions", &actions_ss());
+    subsection(&mut custom, "Default key bindings", &default_keys_ss());
 
     section(
         &mut custom,
         "COMMAND EXPANSION",
         "
 In the `preview` flag, `execute`, `reload`, `set-query`... binds, sk will expand placeholders:
-* {} (or --replstr if used) will be expanded to the current item.
+* {} (or the string set with -I) will be expanded to the current item.
 * {q} (or {cq} for legacy reasons) will be expanded to the current query input.
 * {+} will be expanded to either the currently selected items in multi-select mode, or the current
  item in single-select.
@@ -303,6 +357,8 @@ In the `preview` flag, `execute`, `reload`, `set-query`... binds, sk will expand
  item.
 * {+FIELD_INDEX_EXPRESSION} will be expanded to the field index expression run against the {+}
  item(s).
+
+Instead of placeholders, child commands can also read the same state from the `SKIM_*`/`FZF_*` variables listed under ENVIRONMENT VARIABLES.
 ",
     );
     subsection(
@@ -353,8 +409,39 @@ Example:
         "If set to a non-empty value, will disable coloring",
     );
 
+    subsection(
+        &mut custom,
+        "Variables exported to child processes",
+        "
+Commands spawned by `--preview`, `execute`, `execute-silent` and `reload` inherit these variables.
+Every value is exported twice: under a `SKIM_` prefix and under the same name with an `FZF_` prefix.
+* `QUERY`: current query input.
+* `CURRENT_ITEM`: text of the current item, with ANSI sequences stripped; unset when there is none.
+* `SELECTED_ITEMS`: selected items, newline-separated.
+* `POS`: 1-based position of the current item in the list.
+* `TOTAL_COUNT`: total number of items.
+* `MATCH_COUNT`: number of matched items.
+* `SELECT_COUNT`: number of selected items.
+* `LINES`, `COLUMNS`: height and width of the skim area.
+* `DIRECTION`: list direction, `up` or `down`.
+* `INPUT_STATE`: `enabled` or `disabled`.
+* `PROMPT`, `POINTER`: current prompt and pointer (selector) strings.
+* `ACTION`, `KEY`: name of the last action performed and last key pressed (empty before any input).
+  `ACTION` is the action that is running, so a child spawned by a follow-up
+  (`act-up:execute-silent(...)`) sees `execute-silent`.
+* `WRAP`: `char` when item wrapping is enabled, otherwise unset.
+* `PREVIEW_LINES`, `PREVIEW_COLUMNS`, `PREVIEW_TOP`, `PREVIEW_LEFT`: geometry of the preview
+  window; only set when a preview is configured.
+* `NTH`, `WITH_NTH`: current `--nth` and `--with-nth` values, when set.
+A variable that does not apply to the current state is removed from the child's environment, so a
+skim started inside another skim or fzf never passes the enclosing process's values through.
+Example: `sk --preview 'printf %s \"$SKIM_QUERY\"'`.
+",
+    );
+
     section(&mut custom, "THEME", THEME_SECTION);
 
+    #[cfg(feature = "listen")]
     section(&mut custom, "LISTEN/REMOTE", REMOTE_SECTION);
 
     section(&mut custom, "EXIT CODES", EXIT_CODES_SECTION);
@@ -364,4 +451,136 @@ Example:
     // Finish with mangen version section
     base.render_version_section(w)?;
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+
+    fn manpage_str() -> String {
+        let mut buf = Vec::new();
+        generate(&mut buf).expect("manpage generation should not fail");
+        String::from_utf8(buf).expect("manpage output is valid UTF-8")
+    }
+
+    #[test]
+    fn manpage_contains_version() {
+        let out = manpage_str();
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(
+            out.contains(version),
+            "manpage should contain package version {version}"
+        );
+    }
+
+    #[test]
+    fn help_and_manpage_document_every_visible_option() {
+        let mut command = SkimOptions::command();
+        let help = command.render_long_help().to_string();
+        let man = manpage_str();
+        for arg in command.get_arguments().filter(|arg| !arg.is_hide_set()) {
+            if let Some(short) = arg.get_short() {
+                assert!(help.contains(&format!("-{short}")), "help is missing -{short}");
+                assert!(man.contains(&format!("\\-{short}")), "manpage is missing -{short}");
+            }
+            if let Some(long) = arg.get_long() {
+                assert!(help.contains(&format!("--{long}")), "help is missing --{long}");
+                let escaped = format!("\\-\\-{}", long.replace('-', "\\-"));
+                assert!(man.contains(&escaped), "manpage is missing --{long}");
+            }
+        }
+    }
+
+    #[cfg(all(feature = "image", feature = "listen", feature = "frizbee"))]
+    #[test]
+    fn shipped_manpage_matches_generator() {
+        assert_eq!(manpage_str(), include_str!("../man/man1/sk.1").replace("\r\n", "\n"));
+    }
+
+    #[test]
+    fn manpage_contains_key_options() {
+        let out = manpage_str();
+        for flag in ["query", "multi", "preview", "bind", "color"] {
+            assert!(out.contains(flag), "manpage should mention '--{flag}'");
+        }
+    }
+
+    #[test]
+    fn manpage_contains_sections() {
+        let out = manpage_str();
+        for section in ["MODES", "SEARCH", "KEYBINDS", "EXIT CODES"] {
+            assert!(out.contains(section), "manpage should contain section '{section}'");
+        }
+    }
+
+    #[test]
+    fn manpage_documents_child_env_vars() {
+        let out = manpage_str();
+        assert!(out.contains("Variables exported to child processes"));
+        for var in [
+            "SKIM_",
+            "FZF_",
+            "CURRENT_ITEM",
+            "SELECTED_ITEMS",
+            "DIRECTION",
+            "INPUT_STATE",
+            "ACTION",
+            "KEY",
+            "PREVIEW_LINES",
+            "PREVIEW_TOP",
+        ] {
+            assert!(out.contains(var), "manpage should mention child env var '{var}'");
+        }
+    }
+
+    #[test]
+    fn manpage_documents_default_key_bindings() {
+        let out = manpage_str();
+        assert!(out.contains("Default key bindings"));
+        for binding in [
+            "* ctrl\\-a: beginning\\-of\\-line",
+            "* enter: accept",
+            "* tab: toggle+down",
+            "* double\\-click: accept",
+        ] {
+            assert!(
+                out.contains(binding),
+                "manpage should contain default binding '{binding}'"
+            );
+        }
+    }
+
+    #[test]
+    fn manpage_documents_every_bindable_action() {
+        let out = manpage_str();
+        for action in ACTION_CATALOG.iter().filter(|action| action.is_bindable()) {
+            // roff escapes dashes in the rendered output
+            let rendered = format!("* {}", action.display_name().replace('-', "\\-"));
+            assert!(
+                out.contains(&rendered),
+                "manpage should document the '{}' action",
+                action.name
+            );
+            assert!(
+                !action.summary().is_empty(),
+                "action '{}' needs a doc comment to document it",
+                action.name
+            );
+        }
+        // `custom` only exists for library users, it cannot be bound by name.
+        assert!(!out.contains("* custom"), "the custom action should not be listed");
+    }
+
+    #[test]
+    fn manpage_documents_bindable_events_and_actions() {
+        let out = manpage_str();
+        for event in ["change", "start", "load", "result", "focus", "zero", "one"] {
+            assert!(out.contains(event), "manpage should document the '{event}' event");
+        }
+        assert!(out.contains("Actions as binding triggers"));
+        assert!(out.contains("act\\-"));
+        assert!(out.contains("noremap"));
+        assert!(out.contains("suppress"));
+    }
 }

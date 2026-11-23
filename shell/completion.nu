@@ -5,7 +5,7 @@ module completions {
   }
 
   def "nu-complete sk algorithm" [] {
-    [ "skim_v2" "clangd" "fzy" "frizbee" "arinae" ]
+    [ "arinae" "clangd" "fzy" "frizbee" "skim_v2" ]
   }
 
   def "nu-complete sk case" [] {
@@ -24,6 +24,10 @@ module completions {
     [ "force-off" "none" "plain" "rounded" "double" "thick" "light-double-dashed" "heavy-double-dashed" "light-triple-dashed" "heavy-triple-dashed" "light-quadruple-dashed" "heavy-quadruple-dashed" "quadrant-inside" "quadrant-outside" ]
   }
 
+  def "nu-complete sk image" [] {
+    [ "detect" "halfblocks" ]
+  }
+
   def "nu-complete sk shell" [] {
     [ "bash" "elvish" "fish" "nushell" "power-shell" "zsh" ]
   }
@@ -40,18 +44,19 @@ module completions {
     --tiebreak(-t): string@"nu-complete sk tiebreak" # Comma-separated list of sort criteria to apply when the scores are tied.
     --nth(-n): string         # Fields to be matched
     --with-nth: string        # Fields to be transformed
+    --hide-nth: string        # Fields to hide from display while keeping them searchable
     --delimiter(-d): string   # Delimiter between fields
     --exact(-e)               # Run in exact mode
     --regex                   # Start in regex mode instead of fuzzy-match
     --algo: string@"nu-complete sk algorithm" # Fuzzy matching algorithm
     --case: string@"nu-complete sk case" # Case sensitivity
     --typos: string           # Enable typo-tolerant matching
-    --no-typos                # Disable typo-resistant matching
+    --no-typos                # Disable typo-tolerant matching
     --normalize               # Normalize unicode characters
     --split-match: string     # Enable split matching and set delimiter
-    --last-match              # Highlight the last match found, not the first one This makes tiebreak more pertinent on path items where we want to prioritize a match on the last parts
-    --scheme: string@"nu-complete sk scheme"
-    --bind(-b): string        # Comma separated list of bindings
+    --last-match              # Prefer the last equally scoring match with the Arinae algorithm
+    --scheme: string@"nu-complete sk scheme" # Matching preset: default, path (prefer the last path component), or history (prefer input order)
+    --bind(-b): string        # Comma-separated key, event, and action bindings
     --multi(-m)               # Enable multiple selection
     --no-multi                # Disable multiple selection
     --no-mouse                # Disable mouse
@@ -64,21 +69,22 @@ module completions {
     --keep-right              # Keep the right end of the line visible on overflow
     --skip-to-pattern: string # Show the matched pattern at the line start
     --no-clear-if-empty       # Do not clear previous line if the command returns an empty result
-    --no-clear-start          # Do not clear items on start
+    --no-clear-start          # Keep previous items while a reload command starts
     --no-clear                # Do not clear screen on exit
     --show-cmd-error          # Show error message if command fails
     --cycle                   # Cycle the results by wrapping around when scrolling
     --disabled                # Disable matching entirely
+    --disable-pattern: string # Disable items based on this regex pattern
     --layout: string@"nu-complete sk layout" # Set layout
     --reverse                 # Shorthand for reverse layout
     --height: string          # Height of skim's window
     --no-height               # Disable height (force full screen)
-    --min-height: string      # Minimum height of skim's window
+    --min-height: string      # Minimum height of skim's window as a non-negative row count
     --margin: string          # Screen margin
     --prompt(-p): string      # Set prompt
     --cmd-prompt: string      # Set prompt in command mode
     --selector: string        # Set selected item icon
-    --multi-selector: string  # Set selected item icon
+    --multi-selector: string  # Set multi-selected item icon
     --ansi                    # Parse ANSI color codes in input strings
     --tabstop: string         # Number of spaces that make up a tab
     --ellipsis: string        # The characters used to display truncated lines
@@ -87,7 +93,10 @@ module completions {
     --inline-info             # Alias for --info=inline
     --header: string          # Set header, displayed next to the info
     --header-lines: string    # Number of lines of the input treated as header
+    --separator: string       # Draw a repeating horizontal separator on the status line
+    --no-separator            # Disable the horizontal separator
     --border: string@"nu-complete sk border" # Draw borders around the UI components
+    --border-no-collapse      # Do not collapse adjacent borders into a shared row or column
     --no-border               # Disables all borders, including in tmux/zellij popups
     --wrap                    # Wrap items in the item list
     --multiline: string       # Split item text into multiple display lines at the given separator character defaults to \n if read0 is set, and \\n if not (matching literal \n in text)
@@ -99,6 +108,7 @@ module completions {
     --cmd-history-size: string # Maximum number of query history entries to keep
     --preview: string         # Preview command
     --preview-window: string  # Preview window layout
+    --image: string@"nu-complete sk image" # Enable image preview
     --query(-q): string       # Initial query
     --cmd-query: string       # Initial query in interactive mode
     --read0                   # Read input delimited by ASCII NUL(\0) characters
@@ -106,7 +116,7 @@ module completions {
     --print-query             # Print the query as the first line
     --print-cmd               # Print the command as the first line (after print-query)
     --print-score             # Print the score after each item
-    --print-header            # Print the header as the first line (after print-score)
+    --print-header            # Print the header before the items (after print-query and print-cmd)
     --print-current           # Print the current (highlighted) item as the first line (after print-header)
     --output-format: string   # Set the output format If set, overrides all print_ options Will be expanded the same way as preview or commands
     --no-strip-ansi           # Print the ANSI codes, making the output exactly match the input even when --ansi is on
@@ -124,6 +134,7 @@ module completions {
     --listen: string          # Run an IPC socket with optional name (defaults to sk)
     --remote: string          # Send commands to an IPC socket with optional name (defaults to sk)
     --popup: string           # Run in a tmux or zellij popup
+    --popup-name: string      # Name of the popup pane (Zellij) / title of the popup (tmux)
     --log-level: string       # Set the log level
     --log-file: string        # Pipe log output to a file
     --flags: string@"nu-complete sk flags" # Feature flags
@@ -138,7 +149,6 @@ module completions {
     --style: string
     --no-color
     --padding: string
-    --border-label: string
     --border-label-pos: string
     --wrap-sign: string
     --no-multi-line
@@ -157,8 +167,6 @@ module completions {
     --list-label-pos: string
     --no-input
     --info-command: string
-    --separator: string
-    --no-separator
     --ghost: string
     --input-border: string
     --input-label: string
@@ -173,7 +181,7 @@ module completions {
     --footer-label: string
     --footer-label-pos: string
     --with-shell: string
-    --expect: string          # Deprecated, kept for compatibility purposes. See accept() bind instead
+    --expect: string          # Accepted for compatibility; has no effect. Use --bind 'KEY:accept(KEY)' instead
     --help(-h)                # Print help (see more with '--help')
     --version(-V)             # Print version
   ]

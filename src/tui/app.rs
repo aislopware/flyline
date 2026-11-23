@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::helper::item::strip_ansi;
 use crate::item::{ItemPool, MatchedItem};
 use crate::matcher::{Matcher, MatcherControl};
 use crate::prelude::ExactOrFuzzyEngineFactory;
@@ -12,18 +14,20 @@ use crate::tui::options::TuiLayout;
 use crate::tui::statusline::InfoDisplay;
 use crate::tui::widget::SkimWidget;
 use crate::tui::{SkimRender, TICK_RATE};
-use crate::{ItemPreview, PreviewContext, SkimItem, SkimOptions};
-use crate::{Rank, util};
+use crate::{ItemPreview, PreviewContext, Rank, SkimItem, SkimOptions, util};
 
-use super::Event;
-use super::Tui;
-use super::event::Action;
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;
+
+use super::actions::Action;
 use super::header::Header;
 use super::item_list::ItemList;
-use super::{input, preview};
+use super::{Event, Tui, input, preview};
+use crate::binds::SkimEvent;
 use crate::thread_pool::{self, ThreadPool};
-use color_eyre::eyre::{Result, bail};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use eyre::{Result, bail};
 use input::Input;
 use preview::Preview;
 use ratatui::buffer::Buffer;
@@ -40,9 +44,19 @@ static NUM_THREADS: LazyLock<usize> = LazyLock::new(|| {
 });
 
 const MATCHER_DEBOUNCE_MS: u128 = 200;
+/// Largest value skim exports to child processes. Mirrors fzf's 64 KiB cap on
+/// `FZF_CURRENT_ITEM`: a bigger value could exceed the environment size limit
+/// and break every child command.
+const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
+
+/// The exported pairs plus the names to remove from the inherited environment
+/// (see [`App::child_env`] and [`App::child_env_unset`]).
+type ChildEnv = (Vec<(String, String)>, Vec<String>);
 const HIDE_GRACE_MS: u128 = 500;
+const DOUBLE_CLICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Application state for skim's TUI
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     /// Pool of items to be filtered
     pub item_pool: Arc<ItemPool>,
@@ -52,9 +66,20 @@ pub struct App {
     pub reader_pool: Arc<ThreadPool>,
     /// Whether the application should quit
     pub should_quit: bool,
+    /// The terminating action, including one dispatched inside a follow-up or conditional chain.
+    pub(crate) final_action: Option<Action>,
+    /// Name of the last action performed, exported as `SKIM_ACTION`/`FZF_ACTION`.
+    pub(crate) last_action: Option<String>,
+    /// Name of the last real key pressed, exported as `SKIM_KEY`/`FZF_KEY`.
+    pub(crate) last_key: Option<String>,
+    /// Environment snapshots for reload events, captured before actions clear the selection.
+    pub(crate) pending_reload_env: VecDeque<ChildEnv>,
 
     /// Current cursor position (x, y)
     pub cursor_pos: (u16, u16),
+    /// The area skim draws into, recorded on every render so child processes
+    /// can be told the current terminal size (see [`Self::child_env`]).
+    pub(crate) term_area: Rect,
     /// Control handle for the matcher thread
     pub matcher_control: MatcherControl,
     /// The matcher for filtering items
@@ -125,11 +150,27 @@ pub struct App {
     items_just_updated: bool,
     /// Records if we are scrolling (mouse down on the scrollbar and no mouse up yet)
     currently_scrolling: bool,
+    /// Time of the previous left click, used to recognize `double-click` bindings.
+    last_left_click: std::time::Instant,
+    /// Set by [`Skim::check_reader`] once the reader has finished producing
+    /// items. Reset on `reload`. Drives the one-shot `load` event.
+    pub(crate) reader_done: bool,
+    /// Whether the `load` event has been fired for the current read. Reset on
+    /// `reload` so a new read fires `load` again.
+    pub(crate) load_event_fired: bool,
+    /// Set whenever a matcher run is (re)started; edge-triggers the one-shot
+    /// `result` (and `zero`/`one`) events once that run completes, polled from
+    /// the heartbeat.
+    pub(crate) result_pending: bool,
+    /// The last item that had focus, tracked so the `focus` event fires only
+    /// when the focused item actually changes on cursor movement.
+    last_focused: Option<Arc<dyn SkimItem>>,
 }
 
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mut res = SkimRender::default();
+        self.term_area = area;
         let has_border = self.options.border.is_some();
 
         // Update header with reserved items (from --header-lines).  When
@@ -153,6 +194,15 @@ impl Widget for &mut App {
             res |= self.preview.render(preview_area, buf);
         }
 
+        if self.item_list.keep_on_reload
+            && self.reader_done
+            && self.matcher_control.stopped()
+            && self.item_pool.num_not_taken() == 0
+            && self.matcher_control.get_num_matched() == 0
+            && !self.options.no_clear_if_empty
+        {
+            self.item_list.clear();
+        }
         res |= self.item_list.render(self.layout.list_area, buf);
 
         // Render the input after the item list so that the status shows correct information.
@@ -188,7 +238,13 @@ impl Widget for &mut App {
         self.cursor_pos = (
             self.layout.input_area.x + self.input.cursor_pos() + u16::from(has_border),
             self.layout.input_area.y
-                + u16::from(!(self.options.layout == TuiLayout::Reverse && self.options.border.is_none())),
+                + if has_border {
+                    1
+                } else if self.options.layout == TuiLayout::Reverse {
+                    0
+                } else {
+                    self.layout.input_area.height.saturating_sub(1)
+                },
         );
         if res.run_preview {
             self.pending_preview_run = true;
@@ -215,7 +271,12 @@ impl Default for App {
             item_pool: Arc::default(),
             theme,
             should_quit: false,
+            final_action: None,
+            last_action: None,
+            last_key: None,
+            pending_reload_env: VecDeque::new(),
             cursor_pos: (0, 0),
+            term_area: Rect::default(),
             matcher: Matcher::builder(Rc::new(ExactOrFuzzyEngineFactory::builder().build()))
                 .case(crate::CaseMatching::default())
                 .build(),
@@ -248,6 +309,13 @@ impl Default for App {
             reader_timer: std::time::Instant::now(),
             items_just_updated: false,
             currently_scrolling: false,
+            last_left_click: std::time::Instant::now()
+                .checked_sub(DOUBLE_CLICK_INTERVAL * 2)
+                .unwrap(),
+            reader_done: false,
+            load_event_fired: false,
+            result_pending: false,
+            last_focused: None,
         }
     }
 }
@@ -281,7 +349,12 @@ impl App {
             item_list: ItemList::from_options(&options, theme.clone()),
             theme,
             should_quit: false,
+            final_action: None,
+            last_action: None,
+            last_key: None,
+            pending_reload_env: VecDeque::new(),
             cursor_pos: (0, 0),
+            term_area: Rect::default(),
             matcher: Matcher::from_options(&options),
             yank_register: String::new(),
             matcher_control: MatcherControl::default(),
@@ -314,6 +387,13 @@ impl App {
                 .unwrap(),
             pending_preview_run: false,
             currently_scrolling: false,
+            last_left_click: std::time::Instant::now()
+                .checked_sub(DOUBLE_CLICK_INTERVAL * 2)
+                .unwrap(),
+            reader_done: false,
+            load_event_fired: false,
+            result_pending: false,
+            last_focused: None,
         }
     }
 
@@ -327,9 +407,7 @@ impl App {
         self.layout_template = LayoutTemplate::from_options(&self.options, self.header.height());
         self.layout = self.layout_template.apply(Rect::new(0, 0, cols, rows));
     }
-}
 
-impl App {
     /// Calculate preview offset from offset expression (e.g., "+123", "+{2}", "+{2}-2")
     fn calculate_preview_offset(&self, offset_expr: &str) -> u16 {
         // Remove the leading '+'
@@ -373,21 +451,82 @@ impl App {
         self.items_just_updated = true;
     }
 
-    /// Call after selection changes (e.g., selection actions, `Event::Key`)
-    fn on_selection_changed() -> Vec<Event> {
-        vec![Event::RunPreview]
+    /// Call after selection changes (e.g., selection actions, `Event::Key`).
+    ///
+    /// Emits the `focus` event when the focused item actually changed, so a
+    /// `focus:<action>` binding runs on cursor movement.
+    fn on_selection_changed(&mut self) -> Vec<Event> {
+        let mut events = vec![Event::RunPreview];
+        events.extend(self.take_focus_event());
+        events
+    }
+
+    /// Returns a `focus` event if the focused item changed since the last call,
+    /// updating the tracked item. Used by [`Self::on_selection_changed`].
+    fn take_focus_event(&mut self) -> Option<Event> {
+        let focused = self.item_list.selected().map(|m| m.item);
+        let changed = match (&self.last_focused, &focused) {
+            (Some(prev), Some(curr)) => !Arc::ptr_eq(prev, curr),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            self.last_focused = focused;
+            Some(Event::Key(SkimEvent::Focus.into()))
+        } else {
+            None
+        }
+    }
+
+    /// Polls the async reader/matcher state and returns any newly-due
+    /// completion events (`load`, `result`, `zero`, `one`).
+    ///
+    /// Each is edge-triggered by a flag so it fires once per read / search:
+    /// `load` when the reader finishes, `result` (plus `zero`/`one` from the
+    /// matcher's authoritative count) when a search completes. Called from the
+    /// heartbeat.
+    fn poll_completion_events(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+
+        if self.reader_done
+            && !self.load_event_fired
+            && self.matcher_control.stopped()
+            && self.item_pool.num_not_taken() == 0
+        {
+            self.load_event_fired = true;
+            events.push(Event::Key(SkimEvent::Load.into()));
+        }
+
+        if self.result_pending && self.matcher_control.stopped() {
+            self.result_pending = false;
+            events.push(Event::Key(SkimEvent::Result.into()));
+            if self.reader_done {
+                match self.matcher_control.get_num_matched() {
+                    0 => events.push(Event::Key(SkimEvent::Zero.into())),
+                    1 => events.push(Event::Key(SkimEvent::One.into())),
+                    _ => {}
+                }
+            }
+        }
+
+        events
     }
 
     /// Call when query changes (e.g., `AddChar`, `BackwardDeleteChar`, etc.)
     fn on_query_changed(&mut self) -> Vec<Event> {
         // In interactive mode with --cmd, execute the command with {} substitution
         if self.options.interactive && self.options.cmd.is_some() {
-            let expanded_cmd = self.expand_cmd(&self.cmd, true);
-            return vec![Event::Reload(expanded_cmd)];
+            return match self.expand_shell_cmd(&self.cmd, true) {
+                Ok(cmd) => vec![self.reload_event(cmd)],
+                Err(err) => {
+                    log::warn!("Command expansion rejected: {err}");
+                    vec![]
+                }
+            };
         }
         self.restart_matcher_debounced();
         vec![
-            Event::Key(KeyEvent::new(KeyCode::F(255), KeyModifiers::NONE)), // Send F255 which is the change bind
+            Event::Key(crate::binds::SkimEvent::Change.into()), // fire the `change` event binding
             Event::RunPreview,
         ]
     }
@@ -464,14 +603,25 @@ impl App {
                 preview,
                 ItemPreview::Global | ItemPreview::Command(_) | ItemPreview::CommandWithPos(_, _)
             );
+            #[cfg(feature = "image")]
+            let quote_cmd = self.options.image.is_none();
+            #[cfg(not(feature = "image"))]
+            let quote_cmd = true;
             match preview {
-                ItemPreview::Command(cmd) => self.preview.spawn(tui, &self.expand_cmd(&cmd, true))?,
+                ItemPreview::Command(cmd) => {
+                    let (env, unset) = self.child_env_snapshot();
+                    self.preview
+                        .spawn(tui, &self.expand_shell_cmd(&cmd, quote_cmd)?, &env, &unset)?;
+                }
                 ItemPreview::Text(t) | ItemPreview::AnsiText(t) => {
                     self.preview.content(&t.bytes().collect::<Vec<_>>())?;
                 }
                 ItemPreview::CommandWithPos(cmd, preview_position) => {
                     // Execute command and apply position after content is ready
-                    self.preview.spawn(tui, &self.expand_cmd(&cmd, true))?;
+                    let (env, unset) = self.child_env_snapshot();
+                    self.preview
+                        .spawn(tui, &self.expand_shell_cmd(&cmd, quote_cmd)?, &env, &unset)?;
+
                     // Apply position offsets
                     let v_scroll = match preview_position.v_scroll {
                         crate::tui::Size::Fixed(n) => n,
@@ -487,7 +637,7 @@ impl App {
                             u16::try_from(u32::from(self.preview.rows) * u32::from(p) / 100).unwrap_or(u16::MAX)
                         }
                     };
-                    self.preview.scroll_y = v_scroll;
+                    self.preview.scroll_y = usize::from(v_scroll);
                     self.preview.scroll_down(v_offset);
 
                     let h_scroll = match preview_position.h_scroll {
@@ -504,12 +654,16 @@ impl App {
                             u16::try_from(u32::from(self.preview.cols) * u32::from(p) / 100).unwrap_or(u16::MAX)
                         }
                     };
-                    self.preview.scroll_x = h_scroll.saturating_add(h_offset);
+                    self.preview.scroll_x = usize::from(h_scroll).saturating_add(usize::from(h_offset));
                 }
                 ItemPreview::TextWithPos(t, preview_position) | ItemPreview::AnsiWithPos(t, preview_position) => self
                     .preview
                     .content_with_position(&t.bytes().collect::<Vec<_>>(), preview_position)?,
-                ItemPreview::Global => self.preview.spawn(tui, &self.expand_cmd(preview_opt, true))?,
+                ItemPreview::Global => {
+                    let (env, unset) = self.child_env_snapshot();
+                    self.preview
+                        .spawn(tui, &self.expand_shell_cmd(preview_opt, quote_cmd)?, &env, &unset)?;
+                }
             }
             if preview_ready {
                 let _ = tui.event_tx.try_send(Event::PreviewReady);
@@ -523,7 +677,9 @@ impl App {
             } else {
                 selection = Vec::new();
             }
-            self.preview.content(&cb(selection).join("\n").into_bytes())?;
+            let current = self.item_list.selected().map(|item| item.item);
+            self.preview
+                .spawn_callback(tui, cb, self.options.preview_window.pty, selection, current);
         }
         Ok(())
     }
@@ -538,6 +694,7 @@ impl App {
     where
         B::Error: Send + Sync + 'static,
     {
+        trace!("handling event {event:?}");
         match event {
             Event::Render => {
                 // Always render to avoid freezing, but the render function itself can optimize
@@ -546,10 +703,18 @@ impl App {
                     f.render_widget(&mut *self, f.area());
                     f.set_cursor_position(self.cursor_pos);
                 })?;
+                // Matcher output is merged into the item list during rendering,
+                // so this is where result-driven focus changes become observable.
+                if let Some(event) = self.take_focus_event() {
+                    tui.event_tx.try_send(event)?;
+                }
             }
             Event::Heartbeat | Event::Tick => {
                 // Heartbeat is used for periodic UI updates
                 self.update_spinner();
+                if self.preview.is_loading() {
+                    self.needs_render.store(true, Ordering::Relaxed);
+                }
 
                 if self.pending_matcher_restart {
                     self.restart_matcher(true);
@@ -561,6 +726,19 @@ impl App {
                     self.needs_render.store(false, Ordering::Relaxed);
                     self.last_render_timer = std::time::Instant::now();
                     tui.event_tx.try_send(Event::Render)?;
+                }
+
+                // Fire the reader/matcher-completion events (`load`, `result`,
+                // `zero`, `one`). These track async state that has no synchronous
+                // callback, so they are polled here on the heartbeat rather than
+                // in the render path. A `Render` is queued first so a binding
+                // that inspects the list (e.g. `load:first`) sees the final one.
+                let completion_events = self.poll_completion_events();
+                if !completion_events.is_empty() {
+                    tui.event_tx.try_send(Event::Render)?;
+                    for evt in completion_events {
+                        tui.event_tx.try_send(evt)?;
+                    }
                 }
 
                 // Check if a debounced preview run needs to be executed
@@ -575,14 +753,32 @@ impl App {
                     warn!("RunPreview: error {e:?}");
                 }
             }
-            Event::Clear | Event::Redraw => {
+            Event::RunExecute(cmd, env, unset) => {
+                tui.run_execute(cmd, env, unset)?;
+                self.handle_event(tui, &Event::Redraw)?;
+            }
+            Event::Clear => {
                 tui.clear()?;
+            }
+            Event::Redraw => {
+                // Avoid `Event::Redraw` (which calls `tui.clear()`): ratatui's
+                // `Terminal::clear` first queries the cursor position, and
+                // crossterm writes that query (`ESC [ 6 n`) to *stdout*. skim
+                // renders to stderr and its stdout is frequently redirected
+                // (`sk > file`, `find | sk | …`); there the query reaches no
+                // terminal, no reply ever comes, and the UI stalls for seconds
+                // before erroring out. Resetting both of ratatui's diff buffers
+                // instead makes the next draw repaint every cell — no cursor
+                // query, and it works for both fullscreen and inline viewports.
+                tui.force_full_redraw();
+                self.handle_event(tui, &Event::Render)?;
             }
             Event::Quit | Event::Close => {
                 tui.exit()?;
                 self.should_quit = true;
             }
             Event::PreviewReady => {
+                self.preview.mark_ready();
                 // Apply preview offset if configured
                 if let Some(offset_expr) = &self.options.preview_window.offset {
                     let offset = self.calculate_preview_offset(offset_expr);
@@ -620,13 +816,26 @@ impl App {
                 }
             }
             Event::Resize(cols, rows) => {
+                // We need to manually resize Fixed viewports
+                if !tui.is_fullscreen {
+                    let curr = tui.terminal.get_frame().area();
+                    let _ = tui.terminal.resize(Rect {
+                        x: curr.x,
+                        y: curr.y,
+                        width: *cols,
+                        height: *rows,
+                    });
+                }
                 self.resize(*cols, *rows);
                 if let Err(e) = self.run_preview(tui) {
                     warn!("error while rerunnig preview after resize: {e}");
                 }
             }
             Event::Mouse(mouse_event) => {
-                self.handle_mouse(*mouse_event, tui)?;
+                let events = self.handle_mouse(*mouse_event)?;
+                for evt in events {
+                    tui.event_tx.try_send(evt)?;
+                }
             }
             Event::InvalidInput => {
                 warn!("Received invalid input");
@@ -653,9 +862,16 @@ impl App {
         self.on_items_updated();
     }
     fn handle_key(&mut self, key: &KeyEvent) -> Vec<Event> {
-        debug!("key event: {key:?}");
+        let normalized_key = KeyEvent::new(key.code, key.modifiers);
+        debug!("key event: {key:?}, normalized: {normalized_key:?}");
 
-        if let Some(act) = &self.options.keymap.get(key) {
+        // Record real key presses for `SKIM_KEY`/`FZF_KEY`, but not the
+        // synthetic `start`/`load`/`change`/… events routed through the keymap.
+        if crate::binds::SkimEvent::from_key_code(key.code).is_none() {
+            self.last_key = Some(crate::binds::key_name(key));
+        }
+
+        if let Some(act) = &self.options.keymap.get(&normalized_key) {
             debug!("{act:?}");
             return act.iter().map(|a| Event::Action(a.clone())).collect();
         }
@@ -680,23 +896,66 @@ impl App {
         vec![]
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Runs an action, then directly dispatches any follow-up actions bound to it.
+    ///
+    /// Follow-ups use non-recursive (`noremap`) semantics: an action in the
+    /// follow-up chain does not trigger its own follow-up binding. If the chain
+    /// contains [`Action::Suppress`], the triggering action is skipped.
     fn handle_action(&mut self, act: &Action) -> Result<Vec<Event>> {
-        use Action::{
-            Abort, Accept, AddChar, AppendAndSelect, BackwardChar, BackwardDeleteChar, BackwardDeleteCharEof,
-            BackwardKillWord, BackwardWord, BeginningOfLine, Cancel, ClearScreen, Custom, DeleteChar, DeleteCharEof,
-            DeselectAll, Down, EndOfLine, Execute, ExecuteSilent, First, ForwardChar, ForwardWord, HalfPageDown,
-            HalfPageUp, IfNonMatched, IfQueryEmpty, IfQueryNotEmpty, Ignore, KillLine, KillWord, Last, NextHistory,
-            PageDown, PageUp, PreviewDown, PreviewLeft, PreviewPageDown, PreviewPageUp, PreviewRight, PreviewUp,
-            PreviousHistory, Redraw, RefreshCmd, RefreshPreview, Reload, RestartMatcher, RotateMode, ScrollLeft,
-            ScrollRight, Select, SelectAll, SelectRow, SetHeader, SetPreviewCmd, SetQuery, Toggle, ToggleAll, ToggleIn,
-            ToggleInteractive, ToggleOut, TogglePreview, TogglePreviewWrap, ToggleSort, Top, UnixLineDiscard,
-            UnixWordRubout, Up, Yank,
+        let follow = self.options.action_binds.get(act.name()).cloned();
+        let suppress_default = follow
+            .as_ref()
+            .is_some_and(|chain| chain.iter().any(|a| matches!(a, Action::Suppress)));
+
+        let mut events = if suppress_default {
+            Vec::new()
+        } else {
+            self.dispatch_action(act)?
         };
+        if let Some(chain) = follow {
+            for action in chain.iter().filter(|a| !matches!(a, Action::Suppress)) {
+                events.extend(self.dispatch_action(action)?);
+            }
+        }
+        Ok(events)
+    }
+
+    fn dispatch_conditional(&mut self, condition: bool, then: &str, otherwise: Option<&str>) -> Result<Vec<Event>> {
+        let Some(chain) = condition.then_some(then).or(otherwise) else {
+            return Ok(Vec::new());
+        };
+        // `if-*` branch chains are stored unparsed (see `parse_action`), so an
+        // invalid action name only surfaces here, at dispatch time. Log and
+        // skip the chain instead of erroring out of the event loop, matching
+        // the invalid-chain handling of `parse_action_binds`.
+        let actions = match crate::binds::parse_action_chain(chain) {
+            Ok(actions) => actions,
+            Err(err) => {
+                warn!("Ignoring conditional action chain `{chain}`: {err}");
+                return Ok(Vec::new());
+            }
+        };
+        let mut events = Vec::new();
+        for action in actions {
+            events.extend(self.dispatch_action(&action)?);
+        }
+        Ok(events)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_action(&mut self, act: &Action) -> Result<Vec<Event>> {
+        #[allow(clippy::enum_glob_use)]
+        use Action::*;
         use ratatui::widgets::ListDirection::{BottomToTop, TopToBottom};
+        // `SKIM_ACTION`/`FZF_ACTION` report the action that is running, so a
+        // child spawned by this action sees its own name even when the action
+        // was reached through a follow-up (`act-up:execute-silent(…)`) or a
+        // conditional chain.
+        self.last_action = Some(act.name().to_string());
         match act {
             Abort | Accept(_) => {
                 self.should_quit = true;
+                self.final_action = Some(act.clone());
             }
             AddChar(c) => {
                 self.input.insert(*c);
@@ -718,7 +977,7 @@ impl App {
                 )]);
                 self.item_list.select_row(self.item_list.items.len() - 1);
                 self.restart_matcher_debounced();
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             BackwardChar => {
                 self.input.move_cursor(-1);
@@ -749,6 +1008,15 @@ impl App {
             BeginningOfLine => {
                 self.input.move_cursor_to(0);
             }
+            Bind(spec) => {
+                // Bind one or more `trigger:action[+action]` pairs, reusing the
+                // same parsing/merging logic as the `--bind` CLI option.
+                // Existing bindings for the same triggers are replaced.
+                self.options.keymap.add_keymaps_str(spec);
+                self.options.action_binds.extend(crate::binds::parse_action_binds(
+                    crate::binds::split_top_level(spec, ',').into_iter(),
+                ));
+            }
             Cancel => {
                 self.matcher_control.kill();
                 self.preview.kill();
@@ -772,7 +1040,7 @@ impl App {
             DeselectAll => {
                 if !self.item_list.selection.is_empty() {
                     self.item_list.selection = Default::default();
-                    return Ok(Self::on_selection_changed());
+                    return Ok(self.on_selection_changed());
                 }
             }
             Down(n) => {
@@ -780,46 +1048,34 @@ impl App {
                     TopToBottom => self.item_list.scroll_by(i32::from(*n)),
                     BottomToTop => self.item_list.scroll_by(-i32::from(*n)),
                 }
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             EndOfLine => {
                 self.input.move_to_end();
             }
             Execute(cmd) => {
-                let expanded_cmd = self.expand_cmd(cmd, true);
+                // Running a foreground process needs the `Tui` (to suspend
+                // skim's input reader and toggle terminal modes), which this
+                // method does not have. Expand the command here and hand it to
+                // the event loop, which runs it via `Event::RunExecute`.
+                let expanded_cmd = self.expand_shell_cmd(cmd, true)?;
                 debug!("execute: {expanded_cmd}");
-                let mut command = crate::shell_cmd(&expanded_cmd);
-                let in_raw_mode = crossterm::terminal::is_raw_mode_enabled()?;
-                if in_raw_mode {
-                    crossterm::terminal::disable_raw_mode()?;
-                }
-                crossterm::execute!(
-                    std::io::stderr(),
-                    crossterm::terminal::LeaveAlternateScreen,
-                    crossterm::event::DisableMouseCapture
-                )?;
-                let _ = command.spawn().and_then(|mut c| c.wait());
-                if in_raw_mode {
-                    crossterm::terminal::enable_raw_mode()?;
-                }
-                crossterm::execute!(
-                    std::io::stderr(),
-                    crossterm::terminal::EnterAlternateScreen,
-                    crossterm::event::EnableMouseCapture
-                )?;
-                return Ok(vec![Event::Redraw]);
+                let (env, unset) = self.child_env_snapshot();
+                return Ok(vec![Event::RunExecute(expanded_cmd, env, unset)]);
             }
             ExecuteSilent(cmd) => {
-                let expanded_cmd = self.expand_cmd(cmd, true);
+                let expanded_cmd = self.expand_shell_cmd(cmd, true)?;
                 debug!("execute-silent: {expanded_cmd}");
                 let mut command = crate::shell_cmd(&expanded_cmd);
+                let (env, unset) = self.child_env_snapshot();
+                super::util::apply_child_env(&mut command, &env, &unset);
                 command.stdout(Stdio::null()).stderr(Stdio::null());
                 let _ = command.spawn();
             }
             First | Top => {
                 // Jump to first item (considering reserved items)
                 self.item_list.jump_to_first();
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             ForwardChar => {
                 self.input.move_cursor(1);
@@ -828,39 +1084,18 @@ impl App {
                 self.input.move_cursor_forward_word();
             }
             IfQueryEmpty(then, otherwise) => {
-                let inner = crate::binds::parse_action_chain(then)?;
-                if self.input.is_empty() {
-                    return Ok(inner.iter().map(|e| Event::Action(e.to_owned())).collect());
-                } else if let Some(o) = otherwise {
-                    return Ok(crate::binds::parse_action_chain(o)?
-                        .iter()
-                        .map(|e| Event::Action(e.to_owned()))
-                        .collect());
-                }
+                return self.dispatch_conditional(self.input.is_empty(), then, otherwise.as_deref());
             }
             IfQueryNotEmpty(then, otherwise) => {
-                let inner = crate::binds::parse_action_chain(then)?;
-                if !self.input.is_empty() {
-                    return Ok(inner.iter().map(|e| Event::Action(e.to_owned())).collect());
-                } else if let Some(o) = otherwise {
-                    return Ok(crate::binds::parse_action_chain(o)?
-                        .iter()
-                        .map(|e| Event::Action(e.to_owned()))
-                        .collect());
-                }
+                return self.dispatch_conditional(!self.input.is_empty(), then, otherwise.as_deref());
             }
             IfNonMatched(then, otherwise) => {
-                let inner = crate::binds::parse_action_chain(then)?;
-                if self.item_list.items.is_empty() {
-                    return Ok(inner.iter().map(|e| Event::Action(e.to_owned())).collect());
-                } else if let Some(o) = otherwise {
-                    return Ok(crate::binds::parse_action_chain(o)?
-                        .iter()
-                        .map(|e| Event::Action(e.to_owned()))
-                        .collect());
-                }
+                return self.dispatch_conditional(self.item_list.items.is_empty(), then, otherwise.as_deref());
             }
-            Ignore => (),
+            // `ignore` is a no-op. `suppress` is also a no-op on its own; its
+            // suppression effect is applied in `handle_action` when it appears in
+            // an action's follow-up chain.
+            Ignore | Suppress => (),
             KillLine => {
                 let cursor = self.input.cursor_pos as usize;
                 let deleted = self.input.split_off(cursor);
@@ -875,7 +1110,7 @@ impl App {
             Last => {
                 // Jump to last item
                 self.item_list.jump_to_last();
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             NextHistory => {
                 // Use cmd_history in interactive mode, query_history otherwise
@@ -922,7 +1157,7 @@ impl App {
                 } else {
                     self.item_list.scroll_by_rows(offset * n);
                 }
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             HalfPageUp(n) => {
                 let offset = i32::from(self.item_list.height) / 2;
@@ -931,7 +1166,7 @@ impl App {
                 } else {
                     self.item_list.scroll_by_rows(-offset * n);
                 }
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             PageDown(n) => {
                 let offset = i32::from(self.item_list.height);
@@ -940,7 +1175,7 @@ impl App {
                 } else {
                     self.item_list.scroll_by_rows(offset * n);
                 }
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             PageUp(n) => {
                 let offset = i32::from(self.item_list.height);
@@ -949,7 +1184,7 @@ impl App {
                 } else {
                     self.item_list.scroll_by_rows(-offset * n);
                 }
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             PreviewUp(n) => {
                 self.preview.scroll_up(u16::try_from(*n).unwrap_or(u16::MAX));
@@ -1015,19 +1250,20 @@ impl App {
                 return Ok(self.on_query_changed());
             }
             Redraw => return Ok(vec![Event::Clear]),
-            Reload(Some(s)) => {
+            Reload(cmd) => {
+                let expanded_cmd = match cmd {
+                    Some(cmd) => self.expand_shell_cmd(cmd, true)?,
+                    None => self.cmd.clone(),
+                };
+                let event = self.reload_event(expanded_cmd);
                 self.item_list.clear_selection();
-                return Ok(vec![Event::Reload(self.expand_cmd(s, true))]);
-            }
-            Reload(None) => {
-                self.item_list.clear_selection();
-                return Ok(vec![Event::Reload(self.cmd.clone())]);
+                return Ok(vec![event]);
             }
             RefreshCmd => {
                 // Refresh the command (reload in interactive mode)
                 if self.options.interactive {
-                    let expanded_cmd = self.expand_cmd(&self.cmd, true);
-                    return Ok(vec![Event::Reload(expanded_cmd)]);
+                    let expanded_cmd = self.expand_shell_cmd(&self.cmd, true)?;
+                    return Ok(vec![self.reload_event(expanded_cmd)]);
                 }
             }
             RefreshPreview => {
@@ -1061,15 +1297,26 @@ impl App {
             }
             SelectAll => {
                 self.item_list.select_all();
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             SelectRow(row) => {
                 self.item_list.select_row(*row);
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             Select => {
                 self.item_list.select();
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
+            }
+            SetCmd(cmd) => {
+                // Command counterpart of `SetPreviewCmd`: swap the command
+                // template (used by interactive mode and `refresh-cmd`) and
+                // immediately re-run it.
+                self.cmd.clone_from(cmd);
+                self.options.cmd = Some(cmd.clone());
+                let expanded_cmd = self.expand_shell_cmd(cmd, true)?;
+                let event = self.reload_event(expanded_cmd);
+                self.item_list.clear_selection();
+                return Ok(vec![event]);
             }
             SetHeader(opt_header) => {
                 opt_header.clone_into(&mut self.options.header);
@@ -1089,11 +1336,11 @@ impl App {
             }
             Toggle => {
                 self.item_list.toggle();
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             ToggleAll => {
                 self.item_list.toggle_all();
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             ToggleIn => {
                 self.item_list.toggle();
@@ -1101,7 +1348,7 @@ impl App {
                     TopToBottom => self.item_list.select_next(),
                     BottomToTop => self.item_list.select_previous(),
                 }
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             ToggleInteractive => {
                 self.options.interactive = !self.options.interactive;
@@ -1114,7 +1361,7 @@ impl App {
                     TopToBottom => self.item_list.select_previous(),
                     BottomToTop => self.item_list.select_next(),
                 }
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             TogglePreview => {
                 self.options.preview_window.hidden = !self.options.preview_window.hidden;
@@ -1128,6 +1375,22 @@ impl App {
             ToggleSort => {
                 self.options.no_sort = !self.options.no_sort;
                 self.restart_matcher(true);
+            }
+            Unbind(spec) => {
+                // Remove the bindings for one or more keys or action triggers.
+                for trigger in crate::binds::split_top_level(spec, ',') {
+                    match crate::binds::parse_key(trigger) {
+                        Ok(parsed) => {
+                            self.options.keymap.remove(&parsed);
+                        }
+                        Err(err) => match crate::binds::action_trigger_name(trigger) {
+                            Some(name) => {
+                                self.options.action_binds.remove(name);
+                            }
+                            None => debug!("Failed to unbind {trigger}: {err}"),
+                        },
+                    }
+                }
             }
             UnixLineDiscard => {
                 if !self.input.delete_to_beginning().is_empty() {
@@ -1144,7 +1407,7 @@ impl App {
                     TopToBottom => self.item_list.scroll_by(-i32::from(*n)),
                     BottomToTop => self.item_list.scroll_by(i32::from(*n)),
                 }
-                return Ok(Self::on_selection_changed());
+                return Ok(self.on_selection_changed());
             }
             Yank => {
                 // Insert from yank register at cursor position
@@ -1152,7 +1415,7 @@ impl App {
                 return Ok(self.on_query_changed());
             }
             Custom(cb) => {
-                return cb.call(self).map_err(|e| color_eyre::eyre::eyre!("{}", e));
+                return cb.call(self).map_err(|e| eyre::eyre!("{}", e));
             }
         }
         Ok(Vec::default())
@@ -1162,7 +1425,7 @@ impl App {
     pub fn results(&mut self) -> Vec<MatchedItem> {
         if self.options.filter.is_some() {
             // In filter mode, drain items to avoid cloning
-            self.item_list.items.drain(..).collect()
+            std::mem::take(&mut self.item_list.items)
         } else if self.options.multi && !self.item_list.selection.is_empty() {
             self.item_list.selection.clone().into_iter().collect()
         } else if let Some(sel) = self.item_list.selected() {
@@ -1170,6 +1433,18 @@ impl App {
         } else {
             vec![]
         }
+    }
+
+    /// Whether the current query is shorter than `--min-query-length`, meaning no
+    /// results should be produced yet.
+    ///
+    /// Always false when `--min-query-length` is unset, or under `--disabled`, where
+    /// the input is not used as a query.
+    #[must_use]
+    pub fn query_below_min_length(&self) -> bool {
+        self.options
+            .min_query_length
+            .is_some_and(|min| !self.options.disabled && self.input.value.chars().count() < min)
     }
 
     /// Restart the matcher to process items in the item pool.
@@ -1180,19 +1455,19 @@ impl App {
     pub fn restart_matcher(&mut self, force: bool) {
         use crate::tui::item_list::MergeStrategy;
         // Check if query meets minimum length requirement
-        if let Some(min_length) = self.options.min_query_length
-            && !self.options.disabled
-        {
-            let query_to_check = &self.input.value;
-
-            if query_to_check.chars().count() < min_length {
-                // Query is too short, clear items and don't run matcher
-                self.matcher_control.kill();
-                self.item_list.items.clear();
-                self.item_list.current = 0;
-                self.item_list.offset = 0;
-                return;
-            }
+        if self.query_below_min_length() {
+            // Query is too short, clear items and don't run matcher
+            self.matcher_control.kill();
+            self.item_list.matcher_generation.fetch_add(1, Ordering::AcqRel);
+            self.item_list
+                .processed_items
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            self.item_list.items.clear();
+            self.item_list.current = 0;
+            self.item_list.offset = 0;
+            return;
         }
 
         let matcher_stopped = self.matcher_control.stopped();
@@ -1221,8 +1496,16 @@ impl App {
                 self.item_pool.reset();
             }
 
+            let generation = if force {
+                self.item_list.matcher_generation.fetch_add(1, Ordering::AcqRel) + 1
+            } else {
+                self.item_list.matcher_generation.load(Ordering::Acquire)
+            };
+
             let merge_strategy = if force {
                 MergeStrategy::Replace
+            } else if no_sort && self.options.tac {
+                MergeStrategy::Prepend
             } else if no_sort {
                 MergeStrategy::Append
             } else {
@@ -1236,13 +1519,28 @@ impl App {
                 self.item_list.processed_items.clone(),
                 merge_strategy,
                 no_sort,
+                self.options.tac,
+                generation,
+                self.item_list.matcher_generation.clone(),
                 self.needs_render.clone(),
             );
+            // A new search is in flight; arm the `result`/`zero`/`one` events to
+            // fire once it completes and its results are rendered.
+            self.result_pending = true;
         }
     }
 
     fn yank(&mut self, contents: String) {
         self.yank_register = contents;
+    }
+
+    /// Expand a shell command, rejecting line breaks that CMD cannot safely quote.
+    pub(crate) fn expand_shell_cmd(&self, cmd: &str, quote_args: bool) -> Result<String> {
+        let expanded = self.expand_cmd(cmd, quote_args);
+        if cfg!(windows) && expanded.contains(['\r', '\n']) {
+            bail!("CMD command expansion cannot contain CR or LF");
+        }
+        Ok(expanded)
     }
 
     /// Expand placeholders in a command string with current app state.
@@ -1261,6 +1559,164 @@ impl App {
             &self.input.value,
             quote_args,
         )
+    }
+
+    fn reload_event(&mut self, cmd: String) -> Event {
+        self.pending_reload_env.push_back(self.child_env_snapshot());
+        Event::Reload(cmd)
+    }
+
+    /// Environment variables skim exports to its child processes (preview,
+    /// execute, execute-silent, reload).
+    ///
+    /// This mirrors the variables fzf exports to its child processes, under
+    /// both a `SKIM_` and an `FZF_` prefix. Item text is ANSI-stripped so it
+    /// matches what `{}` expands to. Like fzf, some variables are omitted when
+    /// they do not apply: `CURRENT_ITEM` when there is no current item,
+    /// `NTH`/`WITH_NTH` when unset, `WRAP` when wrapping is off, and the
+    /// `PREVIEW_*` group when no preview is configured.
+    ///
+    /// `LINES`/`COLUMNS` come from the last rendered area (see
+    /// [`Self::term_area`]). Values containing a NUL byte, or longer than
+    /// [`MAX_ENV_VALUE_BYTES`], are omitted because `exec(2)` cannot carry them
+    /// and a failure would break the child spawn.
+    #[must_use]
+    pub fn child_env(&self) -> Vec<(String, String)> {
+        // The list length, used to clamp `POS` the way fzf does.
+        let item_count = self.item_list.items.len();
+        let mut vars: Vec<(&str, String)> = vec![
+            ("QUERY", self.input.value.clone()),
+            ("POS", (self.item_list.current + 1).min(item_count).to_string()),
+            ("TOTAL_COUNT", self.item_pool.len().to_string()),
+            ("MATCH_COUNT", self.matcher_control.get_num_matched().to_string()),
+            ("SELECT_COUNT", self.item_list.selection.len().to_string()),
+            ("LINES", self.term_area.height.to_string()),
+            ("COLUMNS", self.term_area.width.to_string()),
+            // `Default` lays the list out bottom-up (fzf's "up").
+            (
+                "DIRECTION",
+                match self.options.layout {
+                    TuiLayout::Default => "up",
+                    TuiLayout::Reverse | TuiLayout::ReverseList => "down",
+                }
+                .to_string(),
+            ),
+            // skim only has enabled/disabled; fzf's "hidden" (`--no-input`) is
+            // parsed but not implemented, so the input is enabled in practice.
+            (
+                "INPUT_STATE",
+                if self.options.disabled { "disabled" } else { "enabled" }.to_string(),
+            ),
+            ("PROMPT", self.input.prompt.clone()),
+            ("POINTER", self.options.selector_icon.clone()),
+            ("ACTION", self.last_action.clone().unwrap_or_default()),
+            ("KEY", self.last_key.clone().unwrap_or_default()),
+        ];
+        if let Some(item) = self.item_list.selected() {
+            vars.push(("CURRENT_ITEM", strip_ansi(&item.output()).0));
+        }
+        // Join lazily and stop as soon as the value is too large to export:
+        // `--select-all` on a huge list must not strip every item first. The
+        // variable is omitted entirely rather than truncated.
+        let mut joined = String::new();
+        let mut too_large = false;
+        for (index, item) in self.item_list.selection.iter().enumerate() {
+            if index > 0 {
+                joined.push('\n');
+            }
+            joined.push_str(&strip_ansi(&item.output()).0);
+            if joined.len() > MAX_ENV_VALUE_BYTES {
+                too_large = true;
+                break;
+            }
+        }
+        if !too_large {
+            vars.push(("SELECTED_ITEMS", joined));
+        }
+        if !self.options.nth.is_empty() {
+            vars.push(("NTH", self.options.nth.join(",")));
+        }
+        if !self.options.with_nth.is_empty() {
+            vars.push(("WITH_NTH", self.options.with_nth.join(",")));
+        }
+        if self.options.wrap_items {
+            // skim only implements character wrapping.
+            vars.push(("WRAP", "char".to_string()));
+        }
+        if self.options.preview.is_some() || self.options.preview_fn.is_some() {
+            let preview_area = self.layout.preview_area;
+            vars.push(("PREVIEW_LINES", self.preview.rows.to_string()));
+            vars.push(("PREVIEW_COLUMNS", self.preview.cols.to_string()));
+            vars.push(("PREVIEW_TOP", preview_area.map_or(0, |a| a.y).to_string()));
+            vars.push(("PREVIEW_LEFT", preview_area.map_or(0, |a| a.x).to_string()));
+        }
+
+        let mut env = Vec::with_capacity(vars.len() * 2);
+        for (name, value) in &vars {
+            // `exec(2)` cannot carry a NUL byte, and one oversized value can
+            // exhaust the environment size limit and break every child command.
+            // Omit such values (like fzf does for FZF_CURRENT_ITEM) instead of
+            // making the child fail to spawn.
+            if value.contains('\0') || value.len() > MAX_ENV_VALUE_BYTES {
+                continue;
+            }
+            env.push((format!("SKIM_{name}"), value.clone()));
+            env.push((format!("FZF_{name}"), value.clone()));
+        }
+        env
+    }
+
+    /// The state variable names that [`Self::child_env`] omits from the current
+    /// snapshot, in both prefixes.
+    ///
+    /// A skipped pair does not unset an inherited variable, so spawn paths must
+    /// remove these names: otherwise a child of a skim started inside fzf would
+    /// still see the enclosing process's `FZF_CURRENT_ITEM` and friends.
+    #[must_use]
+    pub fn child_env_unset(&self) -> Vec<String> {
+        self.child_env_snapshot().1
+    }
+
+    /// Build exported values and omitted names from the same state snapshot.
+    pub(crate) fn child_env_snapshot(&self) -> ChildEnv {
+        let exported = self.child_env();
+        let unset = Self::child_env_names()
+            .into_iter()
+            .filter(|name| !exported.iter().any(|(set, _)| set == name))
+            .collect();
+        (exported, unset)
+    }
+
+    /// Every state variable name [`Self::child_env`] can export, in both prefixes.
+    #[must_use]
+    pub fn child_env_names() -> Vec<String> {
+        [
+            "QUERY",
+            "SELECTED_ITEMS",
+            "POS",
+            "TOTAL_COUNT",
+            "MATCH_COUNT",
+            "SELECT_COUNT",
+            "LINES",
+            "COLUMNS",
+            "DIRECTION",
+            "INPUT_STATE",
+            "PROMPT",
+            "POINTER",
+            "ACTION",
+            "KEY",
+            "CURRENT_ITEM",
+            "NTH",
+            "WITH_NTH",
+            "WRAP",
+            "PREVIEW_LINES",
+            "PREVIEW_COLUMNS",
+            "PREVIEW_TOP",
+            "PREVIEW_LEFT",
+        ]
+        .into_iter()
+        .flat_map(|name| [format!("SKIM_{name}"), format!("FZF_{name}")])
+        .collect()
     }
 
     /// Restart matcher with debouncing to avoid excessive restarts during rapid typing
@@ -1318,15 +1774,15 @@ impl App {
     }
 
     /// Handle mouse events
-    fn handle_mouse<B: Backend>(&mut self, mouse_event: MouseEvent, tui: &mut Tui<B>) -> Result<()>
-    where
-        B::Error: Send + Sync + 'static,
-    {
+    fn handle_mouse(&mut self, mouse_event: MouseEvent) -> Result<Vec<Event>> {
         let mouse_pos = ratatui::layout::Position {
             x: mouse_event.column,
             y: mouse_event.row,
         };
         trace!("Got mouse event {mouse_event:?}");
+
+        let old_current = self.item_list.current;
+        let mut double_click = false;
 
         match mouse_event.kind {
             MouseEventKind::ScrollUp => {
@@ -1335,15 +1791,10 @@ impl App {
                     && preview_area.contains(mouse_pos)
                 {
                     // Scroll preview up
-                    for evt in self.handle_action(&Action::PreviewUp(3))? {
-                        tui.event_tx.try_send(evt)?;
-                    }
-                    return Ok(());
+                    return self.handle_action(&Action::PreviewUp(3));
                 }
                 // Otherwise scroll item list up
-                for evt in self.handle_action(&Action::Up(1))? {
-                    tui.event_tx.try_send(evt)?;
-                }
+                return self.handle_action(&Action::Up(1));
             }
             MouseEventKind::ScrollDown => {
                 // Check if mouse is over preview area
@@ -1351,17 +1802,16 @@ impl App {
                     && preview_area.contains(mouse_pos)
                 {
                     // Scroll preview down
-                    for evt in self.handle_action(&Action::PreviewDown(3))? {
-                        tui.event_tx.try_send(evt)?;
-                    }
-                    return Ok(());
+                    return self.handle_action(&Action::PreviewDown(3));
                 }
                 // Otherwise scroll item list down
-                for evt in self.handle_action(&Action::Down(1))? {
-                    tui.event_tx.try_send(evt)?;
-                }
+                return self.handle_action(&Action::Down(1));
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                let now = std::time::Instant::now();
+                double_click = now.duration_since(self.last_left_click) <= DOUBLE_CLICK_INTERVAL;
+                self.last_left_click = now;
+
                 if let Some((inner, scrollbar_col)) = self.scrollbar_column()
                     && mouse_pos.x == scrollbar_col
                     && inner.contains(mouse_pos)
@@ -1395,8 +1845,18 @@ impl App {
                 // Ignore other mouse events for now
             }
         }
-        tui.event_tx.try_send(Event::Render)?;
-        Ok(())
+
+        self.needs_render();
+
+        let mut events = if self.item_list.current == old_current {
+            Vec::new()
+        } else {
+            self.on_selection_changed()
+        };
+        if double_click {
+            events.push(Event::Key(SkimEvent::DoubleClick.into()));
+        }
+        Ok(events)
     }
     fn toggle_spinner(&mut self) {
         self.show_spinner = !self.show_spinner;

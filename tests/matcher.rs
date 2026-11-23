@@ -1,3 +1,5 @@
+#![allow(missing_docs, clippy::pedantic)]
+
 #[allow(dead_code)]
 #[macro_use]
 mod common;
@@ -64,11 +66,9 @@ insta_test!(matcher_skim_v2, INPUT_ITEMS, &["-q", "stum", "--algo", "skim_v2"], 
 insta_test!(matcher_clangd, INPUT_ITEMS, &["-q", "stum", "--algo", "clangd"], {
     @snap;
 });
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 insta_test!(matcher_frizbee, INPUT_ITEMS, &["-q", "stum", "--algo", "frizbee", "--no-typos"], {
     @snap;
 });
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 insta_test!(matcher_frizbee_typos, INPUT_ITEMS, &["-q", "stum", "--algo", "frizbee", "--typos"], {
     @snap;
 });
@@ -76,6 +76,9 @@ insta_test!(matcher_fzy, INPUT_ITEMS, &["-q", "stum", "--algo", "fzy", "--no-typ
     @snap;
 });
 insta_test!(matcher_fzy_typos, INPUT_ITEMS, &["-q", "stum", "--algo", "fzy", "--typos"], {
+    @snap;
+});
+insta_test!(matcher_fzy_best_first_char, ["src/main.c", "Cargo.lock"], &["-q", "c", "--algo", "fzy", "--no-typos"], {
     @snap;
 });
 insta_test!(matcher_arinae, INPUT_ITEMS, &["-q", "stum", "--algo", "arinae", "--no-typos"], {

@@ -1,5 +1,4 @@
-use crate::field::FieldRange;
-use crate::field::get_string_by_field;
+use crate::field::{FieldRange, get_string_by_field};
 use crate::helper::item::strip_ansi;
 use crate::item::MatchedItem;
 use regex::Regex;
@@ -79,6 +78,44 @@ pub fn read_file_lines(filename: &str) -> std::result::Result<Vec<String>, std::
     BufReader::new(file).lines().collect()
 }
 
+// Escape for the child process's argv parser, then for CMD's metacharacter parser.
+// Shell-bound expansion must reject CR/LF separately; CMD cannot safely quote them.
+// This quotes a CMD /c argument, not batch-file source, where literal `%` must be doubled.
+#[cfg(any(windows, test))]
+fn quote_cmd_arg(s: &str) -> String {
+    let mut quoted = String::from("\"");
+    let mut slashes = 0;
+    for c in s.chars() {
+        if c == '"' {
+            quoted.extend(std::iter::repeat_n('\\', slashes + 1));
+        }
+        quoted.push(c);
+        slashes = if c == '\\' { slashes + 1 } else { 0 };
+    }
+    quoted.extend(std::iter::repeat_n('\\', slashes));
+    quoted.push('"');
+
+    let mut escaped = String::new();
+    for c in quoted.chars() {
+        if "&|<>()^%!\"".contains(c) {
+            escaped.push('^');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+fn quote_shell_arg(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        quote_cmd_arg(s)
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 /// Replace the fields in `pattern` with the items, expanding {...} patterns
 ///
 /// Replaces:
@@ -87,6 +124,13 @@ pub fn read_file_lines(filename: &str) -> std::result::Result<Vec<String>, std::
 /// - `{+}` -> all selected items (multi-select)
 /// - `{q}` -> current query
 /// - `{cq}` -> current command query
+///
+/// With `quote_args`, replacements are arguments for `sh` on Unix or CMD on Windows.
+/// Placeholders must not be enclosed in additional quotes. Commands that invoke
+/// another shell must also account for that shell's parsing rules.
+/// On Windows, writing the result as batch-file source requires doubling literal
+/// `%` characters. This extra step is not used for direct CMD invocation or `%*`
+/// forwarding; `CALL` adds another expansion pass and needs separate handling.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub fn printf<'a>(
@@ -97,17 +141,12 @@ pub fn printf<'a>(
     current: &Option<MatchedItem>,
     query: &str,
     command_query: &str,
-    mut quote_args: bool,
+    quote_args: bool,
 ) -> String {
-    // Windows uses different shell quoting conventions (double quotes, caret escaping)
-    // that are incompatible with the Unix-style single-quote escaping implemented here.
-    if cfg!(windows) {
-        quote_args = false;
-    }
     let escape_arg = |s: &str, quote: bool| {
         let mut res = s.replace('\0', "\\0").clone();
         if quote && quote_args {
-            res = format!("'{}'", res.replace('\'', "'\\''"));
+            res = quote_shell_arg(&res);
         }
         res
     };
@@ -171,12 +210,12 @@ pub fn printf<'a>(
                                 if expanded.is_empty() {
                                     expanded = current
                                         .as_ref()
-                                        .map(|i| escape_arg(&accessor(i), quote_args))
+                                        .map(|i| escape_arg(&accessor(i), quote_individually))
                                         .unwrap_or_default();
                                 }
 
                                 if quote_args && !quote_individually {
-                                    let _ = write!(replaced, "'{expanded}'");
+                                    replaced.push_str(&quote_shell_arg(&expanded));
                                 } else {
                                     replaced.push_str(&expanded);
                                 }
@@ -207,7 +246,7 @@ pub fn printf<'a>(
                                             .unwrap_or_default();
 
                                         if quote_args && !quote_individually {
-                                            let _ = write!(replaced, "'{expanded}'");
+                                            replaced.push_str(&quote_shell_arg(&expanded));
                                         } else {
                                             replaced.push_str(&expanded);
                                         }
@@ -250,137 +289,5 @@ pub fn printf<'a>(
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use crate::Rank;
-    use crate::item::{MatchedItem, RankBuilder};
-    use regex::Regex;
-    use std::sync::Arc;
-
-    fn make_item(s: &'static str) -> MatchedItem {
-        MatchedItem::new(Arc::new(s), Rank::default(), None, &RankBuilder::default())
-    }
-
-    #[test]
-    fn test_unescape_delimiter() {
-        assert_eq!(unescape_delimiter(r"\x00"), "\0");
-        assert_eq!(unescape_delimiter(r"\t"), "\t");
-        assert_eq!(unescape_delimiter(r"\n"), "\n");
-        assert_eq!(unescape_delimiter(r"\r"), "\r");
-        assert_eq!(unescape_delimiter(r"\\"), "\\");
-        assert_eq!(unescape_delimiter(r"\x09"), "\t");
-        assert_eq!(unescape_delimiter(r"\x0a"), "\n");
-        assert_eq!(unescape_delimiter(r"foo\x00bar"), "foo\0bar");
-        assert_eq!(unescape_delimiter(r"[\t\n ]+"), "[\t\n ]+");
-        // Invalid escape sequences should be kept as-is
-        assert_eq!(unescape_delimiter(r"\xGG"), r"\xGG");
-        assert_eq!(unescape_delimiter(r"\x0"), r"\x0");
-    }
-
-    #[test]
-    fn test_regex_null_byte_matching() {
-        use regex::Regex;
-
-        // Test that Regex can match null bytes
-        let delimiter = unescape_delimiter(r"\x00");
-        let re = Regex::new(&delimiter).unwrap();
-        let text = "a\x00b\x00c";
-
-        let matches: Vec<_> = re.find_iter(text).collect();
-        assert_eq!(matches.len(), 2, "Should find 2 null byte delimiters");
-        assert_eq!(matches[0].start(), 1);
-        assert_eq!(matches[0].end(), 2);
-        assert_eq!(matches[1].start(), 3);
-        assert_eq!(matches[1].end(), 4);
-    }
-
-    #[test]
-    fn test_printf() {
-        let pattern = "[1] {} [2] {..2} [3] {2..} [4] {+} [5] {q} [6] {cq} [7] {+:, } [8] {+n:','}";
-        let items = [
-            make_item("item 1"),
-            make_item("item 2"),
-            make_item("item 3"),
-            make_item("item 4"),
-        ];
-        let delimiter = Regex::new(" ").unwrap();
-        assert_eq!(
-            &printf(
-                pattern,
-                &delimiter,
-                "{}",
-                &items.iter(),
-                &Some(make_item("item 2")),
-                "query",
-                "cmd query",
-                true
-            ),
-            if cfg!(unix) {
-                "[1] 'item 2' [2] 'item 2' [3] '2' [4] 'item 1' 'item 2' 'item 3' 'item 4' [5] 'query' [6] 'cmd query' [7] 'item 1, item 2, item 3, item 4' [8] '0','0','0','0'"
-            } else {
-                "[1] item 2 [2] item 2 [3] 2 [4] item 1 item 2 item 3 item 4 [5] query [6] cmd query [7] item 1, item 2, item 3, item 4 [8] 0','0','0','0"
-            }
-        );
-    }
-    #[test]
-    fn test_printf_plus() {
-        assert_eq!(
-            printf(
-                "{+}",
-                &Regex::new(" ").unwrap(),
-                "{}",
-                &[make_item("1"), make_item("2")].iter(),
-                &Some(make_item("1")),
-                "q",
-                "cq",
-                true
-            ),
-            if cfg!(unix) { "'1' '2'" } else { "1 2" }
-        );
-        assert_eq!(
-            printf(
-                "{+}",
-                &Regex::new(" ").unwrap(),
-                "{}",
-                &[].iter(),
-                &Some(make_item("1")),
-                "q",
-                "cq",
-                true
-            ),
-            if cfg!(unix) { "'1'" } else { "1" }
-        );
-    }
-    #[test]
-    fn test_printf_norec() {
-        assert_eq!(
-            printf(
-                "{}",
-                &Regex::new(" ").unwrap(),
-                "{}",
-                &[].iter(),
-                &Some(make_item("{..2}")),
-                "q",
-                "cq",
-                true
-            ),
-            if cfg!(unix) { "'{..2}'" } else { "{..2}" }
-        );
-    }
-    #[test]
-    fn test_printf_replstr() {
-        assert_eq!(
-            printf(
-                "{} ##",
-                &Regex::new(" ").unwrap(),
-                "##",
-                &[make_item("1"), make_item("2")].iter(),
-                &Some(make_item("1")),
-                "q",
-                "cq",
-                true
-            ),
-            if cfg!(unix) { "{} '1'" } else { "{} 1" }
-        );
-    }
-}
+#[path = "util_tests.rs"]
+mod test;

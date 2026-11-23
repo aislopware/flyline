@@ -1,6 +1,9 @@
-use skim::{prelude::*, tui::statusline::InfoDisplay};
+//! Demonstrates basic item selection with inline status information.
 
-fn main() -> color_eyre::Result<()> {
+use skim::prelude::*;
+use skim::tui::statusline::InfoDisplay;
+
+fn main() -> eyre::Result<()> {
     let opts = SkimOptionsBuilder::default()
         .multi(true)
         .reverse(true)

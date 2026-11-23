@@ -1,8 +1,6 @@
 use ratatui::text::Line;
-use std::{
-    borrow::Cow,
-    fmt::{Debug, Display},
-};
+use std::borrow::Cow;
+use std::fmt::{Debug, Display};
 
 use crate::{AsAny, DisplayContext, ItemPreview, PreviewContext};
 
@@ -75,6 +73,23 @@ pub trait SkimItem: AsAny + Send + Sync + 'static {
     fn get_matching_ranges(&self) -> Option<&[(usize, usize)]> {
         None
     }
+
+    /// Byte ranges of `text()` that are hidden from display (via `--hide-nth`).
+    ///
+    /// Characters inside these ranges are removed from the rendered line and ignored
+    /// for match highlighting and horizontal scrolling, but stay part of `text()` so
+    /// they remain searchable. Ranges are expressed as (`start_byte`, `end_byte`) and
+    /// are expected to be sorted and non-overlapping. Returns `None` when nothing is
+    /// hidden.
+    fn hidden_ranges(&self) -> Option<&[(usize, usize)]> {
+        None
+    }
+
+    /// Returns true if the item should be disabled
+    /// Disabled items cannot be selected
+    fn disabled(&self) -> bool {
+        false
+    }
 }
 
 //------------------------------------------------------------------------------
@@ -94,5 +109,30 @@ impl Display for dyn SkimItem {
 impl Debug for dyn SkimItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("SkimItem {{ text: {} }}", self.text()))
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage, coverage(off))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn blanket_impl_default_methods() {
+        let item = "hello".to_string();
+        assert_eq!(item.text(), "hello");
+        // `output` defaults to `text`.
+        assert_eq!(item.output(), "hello");
+        assert!(item.get_matching_ranges().is_none());
+        assert!(!item.disabled());
+    }
+
+    #[test]
+    fn display_and_debug_for_trait_object() {
+        let item: Arc<dyn SkimItem> = Arc::new("world".to_string());
+        let as_dyn: &dyn SkimItem = &*item;
+        assert_eq!(format!("{as_dyn}"), "world");
+        assert!(format!("{as_dyn:?}").contains("world"));
     }
 }

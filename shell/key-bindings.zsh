@@ -57,7 +57,7 @@ __fsel() {
   setopt localoptions pipefail no_aliases 2> /dev/null
   REPORTTIME_=$REPORTTIME
   unset REPORTTIME
-  eval "$cmd" | SKIM_DEFAULT_OPTIONS="--reverse $SKIM_DEFAULT_OPTIONS $SKIM_CTRL_T_OPTS" $(__skimcmd) -m "$@" | while read item; do
+  eval "$cmd" | SKIM_DEFAULT_OPTIONS="--reverse $SKIM_DEFAULT_OPTIONS $SKIM_CTRL_T_OPTS" $(__skimcmd) --popup-name='skim: files' -m "$@" | while read item; do
     echo -n "${(q)item} "
   done
   local ret=$?
@@ -73,6 +73,7 @@ __skimcmd() {
   [ -n "$TMUX_PANE" ] && { [ "${SKIM_TMUX:-0}" != 0 ] || [ -n "$SKIM_TMUX_OPTS" ]; } &&
     echo "sk --tmux=${SKIM_TMUX_OPTS:-center,${SKIM_TMUX_HEIGHT:-40%}}" || echo "sk"
 }
+
 
 skim-file-widget() {
   LBUFFER="${LBUFFER}$(__fsel)"
@@ -100,7 +101,7 @@ skim-cd-widget() {
   setopt localoptions pipefail no_aliases 2> /dev/null
   REPORTTIME_=$REPORTTIME
   unset REPORTTIME
-  local dir="$(eval "$cmd" | SKIM_DEFAULT_OPTIONS="--reverse $SKIM_DEFAULT_OPTIONS $SKIM_ALT_C_OPTS" $(__skimcmd) --no-multi)"
+  local dir="$(eval "$cmd" | SKIM_DEFAULT_OPTIONS="--reverse $SKIM_DEFAULT_OPTIONS $SKIM_ALT_C_OPTS" $(__skimcmd) --popup-name='skim: directories' --no-multi)"
   if ! [ -z $REPORTTIME_ ]; then
       REPORTTIME=$REPORTTIME_
   fi
@@ -157,7 +158,7 @@ skim-history-widget() {
     n=3
   fi
   selected=( $(fc -rl $fc_opts 1 | awk -v c_idx="$c_idx" -v c_date="$c_date" -v c_reset="$c_reset" -v today="$today" "$awk_filter" | sed 's/\\n/\\n\t/g' |
-    SKIM_DEFAULT_OPTIONS="$SKIM_DEFAULT_OPTIONS -n$n..,.. --bind=ctrl-r:toggle-sort $SKIM_CTRL_R_OPTS --query=${(qqq)LBUFFER} --no-multi $ansi_opt --tabstop=20 --multiline" $(__skimcmd)) )
+    SKIM_DEFAULT_OPTIONS="$SKIM_DEFAULT_OPTIONS -n$n..,.. --bind=ctrl-r:toggle-sort $SKIM_CTRL_R_OPTS --query=${(qqq)LBUFFER} --no-multi $ansi_opt --tabstop=20 --multiline" $(__skimcmd) --popup-name='skim: command history') )
   local ret=$?
   if [ -n "$selected" ]; then
     num=$selected[1]
@@ -197,11 +198,14 @@ __skim_comprun() {
   if [[ "$(type _skim_comprun 2>&1)" =~ function ]]; then
     _skim_comprun "$@"
   elif [ -n "$TMUX_PANE" ] && { [ "${SKIM_TMUX:-0}" != 0 ] || [ -n "$SKIM_TMUX_OPTS" ]; }; then
+    # Name the popup after the command being completed, when known.
+    local name="$1" name_opt=()
     shift
+    [ -n "$name" ] && name_opt=(--popup-name="skim: $name")
     if [ -n "$SKIM_TMUX_OPTS" ]; then
-      sk --tmux=${(Q)${(Z+n+)SKIM_TMUX_OPTS}} "$@"
+      sk --tmux=${(Q)${(Z+n+)SKIM_TMUX_OPTS}} "${name_opt[@]}" "$@"
     else
-      sk --tmux=${SKIM_TMUX_OPTS:-center,${SKIM_TMUX_HEIGHT:-40%}} "$@"
+      sk --tmux=${SKIM_TMUX_OPTS:-center,${SKIM_TMUX_HEIGHT:-40%}} "${name_opt[@]}" "$@"
     fi
   else
     shift
@@ -267,12 +271,6 @@ _skim_dir_completion() {
     "" "/" ""
 }
 
-_skim_feed_fifo() (
-  command rm -f "$1"
-  mkfifo "$1"
-  cat <&0 > "$1" &
-)
-
 _skim_complete() {
   setopt localoptions ksh_arrays
   # Split arguments around --
@@ -296,20 +294,17 @@ _skim_complete() {
     rest=("$@")
   fi
 
-  local fifo lbuf cmd matches post
-  fifo="${TMPDIR:-/tmp}/skim-complete-fifo-$$"
+  local lbuf cmd matches post
   lbuf=${rest[0]}
   cmd=$(__skim_extract_command "$lbuf")
   post="${funcstack[1]}_post"
   type $post > /dev/null 2>&1 || post=cat
 
-  _skim_feed_fifo "$fifo"
-  matches=$(SKIM_DEFAULT_OPTIONS="--reverse $SKIM_DEFAULT_OPTIONS $SKIM_COMPLETION_OPTS $str_arg" __skim_comprun "$cmd" "${args[@]}" -q "${(Q)prefix}" < "$fifo" | $post | tr '\n' ' ')
+  matches=$(SKIM_DEFAULT_OPTIONS="--reverse $SKIM_DEFAULT_OPTIONS $SKIM_COMPLETION_OPTS $str_arg" __skim_comprun "$cmd" "${args[@]}" -q "${(Q)prefix}" | $post | tr '\n' ' ')
   if [ -n "$matches" ]; then
     LBUFFER="$lbuf$matches"
   fi
   zle reset-prompt
-  command rm -f "$fifo"
 }
 
 _skim_complete_telnet() {

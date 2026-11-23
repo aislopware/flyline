@@ -2,7 +2,7 @@
 //! Including the `DefaultSkimItem`
 use crate::field::{FieldRange, parse_matching_fields, parse_transform_fields};
 use crate::tui::util::merge_styles;
-use crate::{DisplayContext, SkimItem};
+use crate::{DisplayContext, Matches, SkimItem};
 use ansi_to_tui::IntoText;
 use ratatui::text::{Line, Span};
 use regex::Regex;
@@ -29,7 +29,7 @@ pub struct DefaultSkimItem {
 }
 
 /// Additional metadata for a `SkimItem`
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DefaultSkimItemMetadata {
     /// The text that will be output when user press `enter`
     /// `Some(..)` => the original input is transformed, could not output `text` directly
@@ -45,8 +45,17 @@ pub struct DefaultSkimItemMetadata {
     /// Will be empty if ansi is disabled.
     ansi_info: Option<Vec<(usize, usize)>>,
 
-    // The ranges on which to perform matching
+    /// The ranges on which to perform matching
     matching_ranges: Option<Vec<(usize, usize)>>,
+
+    /// Byte ranges (in the display/matching text) of fields hidden via `--hide-nth`.
+    /// Characters inside these ranges are removed from the rendered line and ignored
+    /// for match highlighting and horizontal scrolling, but remain part of the text
+    /// used for matching so they stay searchable.
+    hidden_ranges: Option<Vec<(usize, usize)>>,
+
+    /// Whether the item should be disabled or not
+    disabled: bool,
 }
 
 impl DefaultSkimItem {
@@ -159,6 +168,8 @@ impl DefaultSkimItem {
                     stripped_text: stripped_text.map(std::string::String::into_boxed_str),
                     ansi_info,
                     matching_ranges,
+                    hidden_ranges: None,
+                    disabled: false,
                 }))
             } else {
                 None
@@ -170,8 +181,39 @@ impl DefaultSkimItem {
         }
     }
 
+    /// Builder-style setter for the fields hidden from display (via `--hide-nth`).
+    ///
+    /// The fields are resolved against the item's display/matching text — which is
+    /// exactly what [`text()`](Self::text) returns (the ANSI-stripped text under
+    /// `--ansi`, otherwise the raw text) — so this must be called after construction.
+    /// The requested fields stay part of `text()` (and therefore searchable); they are
+    /// only removed from the rendered line and ignored for highlighting and hscroll.
+    ///
+    /// A no-op when `hidden_fields` is empty or resolves to no ranges.
+    #[must_use]
+    pub fn hidden_fields(mut self, hidden_fields: &[FieldRange], delimiter: &Regex) -> Self {
+        if hidden_fields.is_empty() {
+            return self;
+        }
+        // Resolve the ranges before touching `self.metadata`; the `text()` borrow must
+        // end before the mutable borrow below.
+        let ranges = {
+            let text = self.text();
+            normalize_ranges(&parse_matching_fields(delimiter, text.as_ref(), hidden_fields))
+        };
+        if !ranges.is_empty() {
+            self.metadata.get_or_insert_default().hidden_ranges = Some(ranges);
+        }
+        self
+    }
+
     fn contains_ansi_escape(s: &str) -> bool {
         memchr::memchr(b'\x1b', s.as_bytes()).is_some()
+    }
+
+    /// Mark the item as disabled
+    pub fn disable(&mut self) {
+        self.metadata.get_or_insert_default().disabled = true;
     }
 
     /// Getter for `stripped_text` stored in the metadata
@@ -215,6 +257,16 @@ impl DefaultSkimItem {
     pub fn matching_ranges(&self) -> Option<&[(usize, usize)]> {
         if let Some(meta) = &self.metadata {
             meta.matching_ranges.as_ref().map(|v| v.as_ref() as &[(usize, usize)])
+        } else {
+            None
+        }
+    }
+
+    /// Getter for `hidden_ranges` stored in metadata
+    #[must_use]
+    pub fn hidden_ranges(&self) -> Option<&[(usize, usize)]> {
+        if let Some(meta) = &self.metadata {
+            meta.hidden_ranges.as_ref().map(|v| v.as_ref() as &[(usize, usize)])
         } else {
             None
         }
@@ -264,6 +316,10 @@ impl SkimItem for DefaultSkimItem {
         self.matching_ranges()
     }
 
+    fn hidden_ranges(&self) -> Option<&[(usize, usize)]> {
+        self.hidden_ranges()
+    }
+
     // The display function handles ANSI stripping, field highlighting, and match
     // rendering in a single pass; splitting it would require duplicating context handling.
     #[allow(clippy::too_many_lines)]
@@ -280,9 +336,23 @@ impl SkimItem for DefaultSkimItem {
             // Extract all spans from the parsed text (should be a single line)
             let all_spans: Vec<Span> = parsed_text.lines.into_iter().flat_map(|line| line.spans).collect();
 
+            // When fields are hidden (--hide-nth), drop the hidden characters from the
+            // parsed spans while preserving their ANSI styling, and remap the match
+            // positions into the resulting visible coordinate space. The remaining
+            // highlighting logic then runs unchanged on visible-coordinate CharIndices.
+            let (all_spans, matches) = if let Some(hidden) = self.hidden_ranges() {
+                let stripped = self.text();
+                let (_, map) = project_visible_text(stripped.as_ref(), hidden);
+                let visible_spans = retain_visible_spans(all_spans, &map);
+                let indices = project_match_indices(stripped.as_ref(), &context.matches, &map);
+                (visible_spans, Matches::CharIndices(indices))
+            } else {
+                (all_spans, context.matches.clone())
+            };
+
             // Now apply highlighting based on matched positions
             // We need to map match positions from stripped text to original text
-            match context.matches {
+            match matches {
                 crate::Matches::CharIndices(ref indices) => {
                     // Indices are already in stripped text coordinates (same as parsed ANSI text)
                     // No need to remap since both matching and ANSI parsing strip the codes
@@ -437,10 +507,27 @@ impl SkimItem for DefaultSkimItem {
                 }
                 crate::Matches::None => Line::from(all_spans),
             }
+        } else if let Some(hidden) = self.hidden_ranges() {
+            // Non-ANSI hidden path: remove the hidden characters and remap the match
+            // highlight positions into the visible coordinate space.
+            let (visible, map) = project_visible_text(&self.text, hidden);
+            let indices = project_match_indices(&self.text, &context.matches, &map);
+            DisplayContext {
+                score: context.score,
+                matches: Matches::CharIndices(indices),
+                container_width: context.container_width,
+                base_style: context.base_style,
+                matched_style: context.matched_style,
+            }
+            .to_line(Cow::Owned(visible))
         } else {
             // No ANSI mapping needed, use text as-is
             context.to_line(Cow::Borrowed(&self.text))
         }
+    }
+
+    fn disabled(&self) -> bool {
+        self.metadata.as_ref().is_some_and(|x| x.disabled)
     }
 }
 
@@ -538,395 +625,110 @@ fn escape_ansi(raw: &str) -> String {
     unsafe { String::from_utf8_unchecked(raw.bytes().map(|b| if b == 27 { b'?' } else { b }).collect()) }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
+/// Sort and merge a list of byte ranges into a canonical, non-overlapping form.
+///
+/// Empty ranges are dropped. Overlapping or touching ranges are merged so callers
+/// can iterate the result assuming disjoint, ascending ranges.
+#[must_use]
+pub(crate) fn normalize_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted: Vec<(usize, usize)> = ranges.iter().copied().filter(|(s, e)| e > s).collect();
+    sorted.sort_unstable();
 
-    #[test]
-    fn test_strip_ansi() {
-        // Test basic ANSI color codes
-        // "\x1b[31mred\x1b[0m" has chars at positions: 0=ESC, 1=[, 2=3, 3=1, 4=m, 5=r, 6=e, 7=d, 8=ESC, 9=[, 10=0, 11=m
-        let (text, mapping) = strip_ansi("\x1b[31mred\x1b[0m");
-        assert_eq!(text, "red");
-        assert_eq!(mapping, vec![(5, 5), (6, 6), (7, 7)]);
-
-        let (text, mapping) = strip_ansi("\x1b[01;32mgreen\x1b[0m");
-        assert_eq!(text, "green");
-        assert_eq!(mapping, vec![(8, 8), (9, 9), (10, 10), (11, 11), (12, 12)]);
-
-        let (text, mapping) = strip_ansi("\x1b[01;34mblue\x1b[0m");
-        assert_eq!(text, "blue");
-        assert_eq!(mapping, vec![(8, 8), (9, 9), (10, 10), (11, 11)]);
-
-        // Test text without ANSI codes
-        let (text, mapping) = strip_ansi("plain text");
-        assert_eq!(text, "plain text");
-        assert_eq!(
-            mapping,
-            vec![
-                (0, 0),
-                (1, 1),
-                (2, 2),
-                (3, 3),
-                (4, 4),
-                (5, 5),
-                (6, 6),
-                (7, 7),
-                (8, 8),
-                (9, 9)
-            ]
-        );
-
-        // Test multiple ANSI sequences
-        let (text, mapping) = strip_ansi("\x1b[31mred\x1b[0m and \x1b[32mgreen\x1b[0m");
-        assert_eq!(text, "red and green");
-        assert_eq!(
-            mapping,
-            vec![
-                (5, 5),
-                (6, 6),
-                (7, 7),
-                (12, 12),
-                (13, 13),
-                (14, 14),
-                (15, 15),
-                (16, 16),
-                (22, 22),
-                (23, 23),
-                (24, 24),
-                (25, 25),
-                (26, 26)
-            ]
-        );
-
-        // Test ANSI codes in the middle of text
-        let (text, mapping) = strip_ansi("be\x1b[01;34mf\x1b[0more");
-        assert_eq!(text, "before");
-        assert_eq!(mapping, vec![(0, 0), (1, 1), (10, 10), (15, 15), (16, 16), (17, 17)]);
-
-        // Test real ls --color output
-        let (text, mapping) = strip_ansi("\x1b[01;32mbench.sh\x1b[0m");
-        assert_eq!(text, "bench.sh");
-        assert_eq!(
-            mapping,
-            vec![
-                (8, 8),
-                (9, 9),
-                (10, 10),
-                (11, 11),
-                (12, 12),
-                (13, 13),
-                (14, 14),
-                (15, 15)
-            ]
-        );
-
-        let (text, mapping) = strip_ansi("\x1b[01;34mbin\x1b[0m");
-        assert_eq!(text, "bin");
-        assert_eq!(mapping, vec![(8, 8), (9, 9), (10, 10)]);
-
-        // Test with multi-byte UTF-8 characters to verify byte vs char position difference
-        // "😀" is 4 bytes but 1 char - when followed by ANSI codes, byte and char positions diverge
-        let (text, mapping) = strip_ansi("😀\x1b[32mtext\x1b[0m");
-        assert_eq!(text, "😀text");
-        // Original: "😀\x1b[32mtext\x1b[0m"
-        // byte positions: 😀=0-3, \x1b=4, [=5, 3=6, 2=7, m=8, t=9, e=10, x=11, t=12, \x1b=13, [=14, 0=15, m=16
-        // char positions: 😀=0, \x1b=1, [=2, 3=3, 2=4, m=5, t=6, e=7, x=8, t=9, \x1b=10, [=11, 0=12, m=13
-        // After stripping: "😀text"
-        // stripped[0]='😀' -> (byte=0, char=0)
-        // stripped[1]='t' -> (byte=9, char=6) <- Here byte and char positions differ!
-        assert_eq!(mapping, vec![(0, 0), (9, 6), (10, 7), (11, 8), (12, 9)]);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
     }
-
-    #[test]
-    fn test_ansi_matching_and_display() {
-        use crate::{DisplayContext, Matches, SkimItem};
-        use ratatui::style::{Color, Style};
-        use regex::Regex;
-
-        // Create an item with ANSI codes
-        let input = "\x1b[32mgreen\x1b[0m text";
-        let delimiter = Regex::new(r"\s+").unwrap();
-        let item = DefaultSkimItem::new(
-            input,
-            true, // ansi_enabled
-            &[],
-            &[],
-            &delimiter,
-        );
-
-        // text() should return stripped text for matching
-        assert_eq!(item.text(), "green text");
-
-        // Verify we have ANSI info
-        assert!(item.ansi_info().is_some());
-
-        // Create a match context as if we matched "text" (positions 6-10 in stripped string)
-        let context = DisplayContext {
-            score: 100,
-            matches: Matches::CharRange(6, 10),
-            container_width: 80,
-            base_style: Style::default(),
-            matched_style: Style::default().fg(Color::Yellow),
-        };
-
-        // display() should map the match positions back to the original ANSI text
-        let line = item.display(context);
-
-        // The line should have the original ANSI codes intact
-        // We can't easily verify the exact ANSI codes in the output, but we can check
-        // that it's not empty and has multiple spans (original text + highlighted match)
-        assert!(!line.spans.is_empty());
-    }
-
-    #[test]
-    fn test_ansi_char_indices_mapping() {
-        use crate::{DisplayContext, Matches, SkimItem};
-        use ratatui::style::{Color, Style};
-        use regex::Regex;
-
-        // Create an item with ANSI codes: "😀\x1b[32mtext\x1b[0m"
-        let input = "😀\x1b[32mtext\x1b[0m";
-        let delimiter = Regex::new(r"\s+").unwrap();
-        let item = DefaultSkimItem::new(
-            input,
-            true, // ansi_enabled
-            &[],
-            &[],
-            &delimiter,
-        );
-
-        // text() should return "😀text"
-        assert_eq!(item.text(), "😀text");
-
-        // Match indices 1,2 in stripped text (the 't' and 'e')
-        let context = DisplayContext {
-            score: 100,
-            matches: Matches::CharIndices(vec![1, 2]),
-            container_width: 80,
-            base_style: Style::default(),
-            matched_style: Style::default().fg(Color::Yellow),
-        };
-
-        // display() should map these to positions 6,7 in original text
-        let line = item.display(context);
-        assert!(!line.spans.is_empty());
-    }
-
-    #[test]
-    fn test_text_returns_stripped() {
-        use crate::SkimItem;
-        use regex::Regex;
-
-        let delimiter = Regex::new(r"\s+").unwrap();
-
-        // Test with ANSI enabled
-        let item_ansi = DefaultSkimItem::new(
-            "\x1b[31mred\x1b[0m",
-            true, // ansi_enabled
-            &[],
-            &[],
-            &delimiter,
-        );
-        assert_eq!(
-            item_ansi.text(),
-            "red",
-            "text() should return stripped text when ANSI is enabled"
-        );
-
-        // Test with ANSI disabled
-        let item_no_ansi = DefaultSkimItem::new(
-            "\x1b[31mred\x1b[0m",
-            false, // ansi_enabled
-            &[],
-            &[],
-            &delimiter,
-        );
-        assert_eq!(
-            item_no_ansi.text(),
-            "?[31mred?[0m",
-            "text() should return text with ? when ANSI is disabled"
-        );
-    }
-
-    #[test]
-    fn test_highlighting_applied() {
-        use crate::{DisplayContext, Matches, SkimItem};
-        use ratatui::style::{Color, Style};
-        use regex::Regex;
-
-        let delimiter = Regex::new(r"\s+").unwrap();
-
-        // Create item with ANSI codes: "\x1b[32mgreen\x1b[0m"
-        let item = DefaultSkimItem::new(
-            "\x1b[32mgreen\x1b[0m",
-            true, // ansi_enabled
-            &[],
-            &[],
-            &delimiter,
-        );
-
-        // Create display context with yellow background highlight for character 0 (the 'g')
-        let context = DisplayContext {
-            score: 100,
-            matches: Matches::CharIndices(vec![0]),
-            container_width: 80,
-            base_style: Style::default(),
-            matched_style: Style::default().bg(Color::Yellow),
-        };
-
-        let line = item.display(context);
-
-        // The line should have spans with highlighting
-        // At least one span should have the yellow background
-        let has_highlight = line.spans.iter().any(|span| span.style.bg == Some(Color::Yellow));
-        assert!(has_highlight, "Highlighted character should have yellow background");
-
-        // The green foreground from ANSI should be preserved in at least one span
-        let has_green_fg = line.spans.iter().any(|span| span.style.fg == Some(Color::Green));
-        assert!(has_green_fg, "ANSI green foreground should be preserved");
-    }
-
-    #[test]
-    fn test_char_range_highlighting() {
-        use crate::{DisplayContext, Matches, SkimItem};
-        use ratatui::style::{Color, Style};
-        use regex::Regex;
-
-        let delimiter = Regex::new(r"\s+").unwrap();
-
-        // Create item with ANSI codes: "\x1b[32mgreen\x1b[0m"
-        let item = DefaultSkimItem::new(
-            "\x1b[32mgreen\x1b[0m",
-            true, // ansi_enabled
-            &[],
-            &[],
-            &delimiter,
-        );
-
-        // Create display context with yellow background highlight for characters 1-3 ('re')
-        let context = DisplayContext {
-            score: 100,
-            matches: Matches::CharRange(1, 3),
-            container_width: 80,
-            base_style: Style::default(),
-            matched_style: Style::default().bg(Color::Yellow),
-        };
-
-        let line = item.display(context);
-
-        // Should have multiple spans: before, highlighted, after
-        assert!(line.spans.len() >= 2, "Should have multiple spans for highlighting");
-
-        // At least one span should have the yellow background (the highlighted portion)
-        let has_highlight = line.spans.iter().any(|span| span.style.bg == Some(Color::Yellow));
-        assert!(has_highlight, "Highlighted characters should have yellow background");
-
-        // The green foreground from ANSI should be preserved
-        let has_green_fg = line.spans.iter().any(|span| span.style.fg == Some(Color::Green));
-        assert!(has_green_fg, "ANSI green foreground should be preserved");
-    }
-
-    #[test]
-    fn test_byte_range_highlighting() {
-        use crate::{DisplayContext, Matches, SkimItem};
-        use ratatui::style::{Color, Style};
-        use regex::Regex;
-
-        let delimiter = Regex::new(r"\s+").unwrap();
-
-        // Create item with ANSI codes: "\x1b[32mgreen\x1b[0m"
-        let item = DefaultSkimItem::new(
-            "\x1b[32mgreen\x1b[0m",
-            true, // ansi_enabled
-            &[],
-            &[],
-            &delimiter,
-        );
-
-        // Create display context with yellow background highlight for bytes 1-3 ('re' in stripped text)
-        let context = DisplayContext {
-            score: 100,
-            matches: Matches::ByteRange(1, 3),
-            container_width: 80,
-            base_style: Style::default(),
-            matched_style: Style::default().bg(Color::Yellow),
-        };
-
-        let line = item.display(context);
-
-        // Should have multiple spans for highlighting
-        assert!(!line.spans.is_empty(), "Should have spans");
-
-        // At least one span should have the yellow background (the highlighted portion)
-        let has_highlight = line.spans.iter().any(|span| span.style.bg == Some(Color::Yellow));
-        assert!(has_highlight, "Highlighted bytes should have yellow background");
-
-        // The green foreground from ANSI should be preserved
-        let has_green_fg = line.spans.iter().any(|span| span.style.fg == Some(Color::Green));
-        assert!(has_green_fg, "ANSI green foreground should be preserved");
-    }
-
-    #[test]
-    fn test_matching_with_ansi_basic() {
-        use crate::SkimItem;
-        use regex::Regex;
-
-        let delimiter = Regex::new(r"\s+").unwrap();
-
-        // Create item with ANSI codes: "\x1b[32mgreen_text\x1b[0m"
-        let item = DefaultSkimItem::new(
-            "\x1b[32mgreen_text\x1b[0m",
-            true, // ansi_enabled
-            &[],
-            &[], // no matching fields restriction
-            &delimiter,
-        );
-
-        // text() should return stripped text "green_text"
-        assert_eq!(item.text(), "green_text");
-
-        // With no matching_fields, get_matching_ranges should return None (match whole text)
-        assert!(item.get_matching_ranges().is_none());
-
-        // Verify the stripped_text and ansi_info are populated correctly
-        assert!(item.stripped_text().is_some());
-        assert!(item.ansi_info().is_some());
-        assert_eq!(item.stripped_text().unwrap(), "green_text");
-    }
-
-    #[test]
-    fn test_null_delimiter_with_matching_fields() {
-        use crate::SkimItem;
-        use crate::field::FieldRange;
-        use regex::Regex;
-
-        // Test with null byte delimiter and matching_fields
-        let delimiter = Regex::new("\x00").unwrap();
-        let text = "a\x00b\x00c";
-
-        // Create item with matching field 2
-        let item = DefaultSkimItem::new(
-            text,
-            false,                    // no ansi
-            &[],                      // no transform fields
-            &[FieldRange::Single(2)], // match field 2
-            &delimiter,
-        );
-
-        // text() should return text with null bytes stripped for display
-        assert_eq!(item.text(), "abc");
-
-        // get_matching_ranges should return the range for field 2 in the stripped text
-        let ranges = item.get_matching_ranges().expect("Should have matching ranges");
-        assert_eq!(ranges.len(), 1, "Should have one matching range");
-
-        // Field 2 is "b" which is at position 1 in the stripped text "abc"
-        assert_eq!(ranges[0], (1, 2), "Field 2 should be at position 1-2 in stripped text");
-
-        // Verify the substring matches what we expect
-        let stripped_text = item.text();
-        let field_text = &stripped_text[ranges[0].0..ranges[0].1];
-        assert_eq!(field_text, "b", "Field text should be 'b'");
-    }
+    merged
 }
+
+/// Remove the hidden byte ranges from `text`, returning the visible string and a
+/// map from each original char index to its `Some(visible char index)`, or `None`
+/// when that char falls inside a hidden range.
+///
+/// `hidden` must be normalized (see [`normalize_ranges`]): sorted, disjoint byte ranges.
+#[must_use]
+pub(crate) fn project_visible_text(text: &str, hidden: &[(usize, usize)]) -> (String, Vec<Option<usize>>) {
+    let mut visible = String::with_capacity(text.len());
+    let mut map = Vec::new();
+    let mut vis_idx = 0usize;
+    let mut hi = 0usize;
+
+    for (byte_pos, ch) in text.char_indices() {
+        while hi < hidden.len() && byte_pos >= hidden[hi].1 {
+            hi += 1;
+        }
+        let is_hidden = hi < hidden.len() && byte_pos >= hidden[hi].0 && byte_pos < hidden[hi].1;
+        if is_hidden {
+            map.push(None);
+        } else {
+            map.push(Some(vis_idx));
+            visible.push(ch);
+            vis_idx += 1;
+        }
+    }
+
+    (visible, map)
+}
+
+/// Drop hidden characters from already-parsed styled spans while preserving each
+/// span's style, keeping the ANSI colors of the surviving characters intact.
+///
+/// `map` is the per-char index map produced by [`project_visible_text`]; the spans
+/// are iterated in the same (stripped-text) char order the map is indexed by. Spans
+/// that become empty after filtering are dropped.
+#[must_use]
+pub(crate) fn retain_visible_spans(spans: Vec<Span<'_>>, map: &[Option<usize>]) -> Vec<Span<'static>> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut char_idx = 0usize;
+    for span in spans {
+        let mut content = String::new();
+        for ch in span.content.chars() {
+            if map.get(char_idx).copied().flatten().is_some() {
+                content.push(ch);
+            }
+            char_idx += 1;
+        }
+        if !content.is_empty() {
+            out.push(Span::styled(content, span.style));
+        }
+    }
+    out
+}
+
+/// Convert the matched character positions of `matches` (in full-text coordinates)
+/// into visible-text char indices, dropping any that fall inside hidden ranges.
+///
+/// `map` is the per-char index map produced by [`project_visible_text`]. The result
+/// is sorted ascending and deduplicated, ready to feed a `Matches::CharIndices`.
+#[must_use]
+pub(crate) fn project_match_indices(text: &str, matches: &Matches, map: &[Option<usize>]) -> Vec<usize> {
+    let full_indices: Vec<usize> = match matches {
+        Matches::CharIndices(indices) => indices.clone(),
+        Matches::CharRange(start, end) => (*start..*end).collect(),
+        Matches::ByteRange(start, end) => text
+            .char_indices()
+            .enumerate()
+            .filter(|(_, (byte_pos, _))| *byte_pos >= *start && *byte_pos < *end)
+            .map(|(char_idx, _)| char_idx)
+            .collect(),
+        Matches::None => Vec::new(),
+    };
+
+    let mut visible: Vec<usize> = full_indices
+        .into_iter()
+        .filter_map(|ci| map.get(ci).copied().flatten())
+        .collect();
+    visible.sort_unstable();
+    visible.dedup();
+    visible
+}
+
+#[cfg(test)]
+#[path = "item_tests.rs"]
+mod test;

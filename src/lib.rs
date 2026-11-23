@@ -19,13 +19,7 @@
 //!         ["awk", "bash", "csh", "dash", "fish", "ksh", "zsh"]
 //!     ).unwrap();
 //! ```
-
-#![warn(clippy::pedantic, missing_docs, clippy::incompatible_msrv)]
-#![allow(
-    clippy::default_trait_access,
-    clippy::struct_excessive_bools,
-    clippy::collapsible_match
-)]
+#![cfg_attr(coverage, feature(coverage_attribute))]
 
 #[macro_use]
 extern crate log;
@@ -40,15 +34,13 @@ use std::process::Command;
 use std::sync::Arc;
 
 use crate::fuzzy_matcher::MatchIndices;
-use ratatui::{
-    style::Style,
-    text::{Line, Span},
-};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 
 pub use crate::engine::fuzzy::FuzzyAlgorithm;
 pub use crate::item::RankCriteria;
 pub use crate::options::SkimOptions;
-pub use crate::output::SkimOutput;
+pub use crate::output::{BinOptions, SkimOutput};
 pub use crate::skim::*;
 pub use crate::skim_item::SkimItem;
 use crate::tui::Size;
@@ -80,10 +72,12 @@ pub mod manpage;
 #[cfg(feature = "cli")]
 pub mod shell;
 
+/// Skim's default command when no `--cmd` flag is passed and `$SKIM_DEFAULT_COMMAND` is unset
 #[cfg(unix)]
-const SKIM_DEFAULT_COMMAND: &str = "find .";
+pub const SKIM_DEFAULT_COMMAND: &str = "find .";
+/// Skim's default command when no `--cmd` flag is passed and `$SKIM_DEFAULT_COMMAND` is unset
 #[cfg(windows)]
-const SKIM_DEFAULT_COMMAND: &str = "dir /s /b /A:-D";
+pub const SKIM_DEFAULT_COMMAND: &str = "dir /s /b /A:-D";
 
 #[cfg(unix)]
 fn shell_cmd(cmd: &str) -> Command {
@@ -244,9 +238,9 @@ pub struct PreviewContext<'a> {
     pub current_index: usize,
     /// Text of the current selection
     pub current_selection: &'a str,
-    /// selected item indices (may or may not include current item)
+    /// Selected item indices (may or may not include current item)
     pub selected_indices: &'a [usize],
-    /// selected item texts (may or may not include current item)
+    /// Selected item texts (may or may not include current item)
     pub selections: &'a [&'a str],
 }
 
@@ -268,7 +262,7 @@ pub struct PreviewPosition {
 
 /// Defines how an item should be previewed
 pub enum ItemPreview {
-    /// execute the command and print the command's output
+    /// Execute the command and print the command's output
     Command(String),
     /// Display the prepared text(lines)
     Text(String),
@@ -419,3 +413,7 @@ pub trait Selector {
 pub type SkimItemSender = kanal::Sender<Vec<Arc<dyn SkimItem>>>;
 /// Receiver for streaming items to skim
 pub type SkimItemReceiver = kanal::Receiver<Vec<Arc<dyn SkimItem>>>;
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;
