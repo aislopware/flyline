@@ -850,6 +850,14 @@ impl Cursor {
             col: OneBased::from_zero_based(0),
         }
     }
+
+    /// Moves the cursor to zero-based column `col` and zero-based line `line`.
+    pub const fn goto(col: u16, line: u16) -> Self {
+        Self::Position {
+            col: OneBased::from_zero_based(col),
+            line: OneBased::from_zero_based(line),
+        }
+    }
 }
 
 impl Display for Cursor {
@@ -1989,10 +1997,10 @@ impl Display for SetKeyboardFlagsMode {
 ///     "\x1b[c",
 /// );
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Device {
     /// A device-attributes response.
-    DeviceAttributes(()),
+    DeviceAttributes(String),
 
     /// [DECSTR] - soft terminal reset.
     ///
@@ -2026,7 +2034,7 @@ pub enum Device {
 impl Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DeviceAttributes(_) => unimplemented!(),
+            Self::DeviceAttributes(raw) => write!(f, "{raw}c"),
             Self::SoftReset => write!(f, "!p"),
             Self::RequestPrimaryDeviceAttributes => write!(f, "c"),
             Self::RequestSecondaryDeviceAttributes => write!(f, ">c"),
@@ -2135,6 +2143,15 @@ pub enum Window {
     /// Request the text-area size in pixels.
     ReportTextAreaSizePixels,
 
+    /// Report the text-area size in pixels.
+    ReportTextAreaSizePixelsResponse {
+        /// The reported text area width in pixels.
+        width: Option<i64>,
+
+        /// The reported text area height in pixels.
+        height: Option<i64>,
+    },
+
     /// Request the window size in pixels.
     ReportWindowSizePixels,
 
@@ -2241,6 +2258,9 @@ impl Display for Window {
             Window::ReportWindowPosition => write!(f, "13t"),
             Window::ReportTextAreaPosition => write!(f, "13;2t"),
             Window::ReportTextAreaSizePixels => write!(f, "14t"),
+            Window::ReportTextAreaSizePixelsResponse { width, height } => {
+                write!(f, "4;{};{}t", NumstrOrEmpty(*height), NumstrOrEmpty(*width))
+            }
             Window::ReportWindowSizePixels => write!(f, "14;2t"),
             Window::ReportScreenSizePixels => write!(f, "15t"),
             Window::ReportCellSizePixels => write!(f, "16t"),

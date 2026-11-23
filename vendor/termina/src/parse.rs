@@ -295,6 +295,7 @@ fn parse_csi(buffer: &[u8]) -> Result<Option<Event>> {
             modifiers: Modifiers::SHIFT,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
+            base_layout_code: None,
         })),
         b'M' => return parse_csi_normal_mouse(buffer),
         b'<' => return parse_csi_sgr_mouse(buffer),
@@ -308,17 +309,40 @@ fn parse_csi(buffer: &[u8]) -> Result<Option<Event>> {
         b'P' => Some(Event::Key(KeyCode::Function(1).into())),
         b'Q' => Some(Event::Key(KeyCode::Function(2).into())),
         b'S' => Some(Event::Key(KeyCode::Function(4).into())),
-        b'?' => match buffer[buffer.len() - 1] {
-            b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
-            b'c' => return parse_csi_primary_device_attributes(buffer),
-            b'n' => return parse_csi_theme_mode(buffer),
-            b'y' => return parse_csi_mode(buffer),
-            _ => None,
-        },
-        b'>' => match buffer[buffer.len() - 2..buffer.len()] {
-            [b' ', b'q'] => return parse_csi_cursor_shape_query_response(buffer),
-            _ => None,
-        },
+        b'?' => {
+            let last_byte = buffer[buffer.len() - 1];
+            match last_byte {
+                b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
+                b'c' => return parse_csi_device_attributes(buffer),
+                b'n' => return parse_csi_theme_mode(buffer),
+                b'y' => return parse_csi_mode(buffer),
+                _ if (64..=126).contains(&last_byte) => bail!(),
+                _ => None,
+            }
+        }
+        b'>' => {
+            let last_byte = buffer[buffer.len() - 1];
+            if buffer.ends_with(b" q") {
+                return parse_csi_cursor_shape_query_response(buffer);
+            } else if last_byte == b'c' {
+                return parse_csi_device_attributes(buffer);
+            } else if (64..=126).contains(&last_byte) {
+                bail!();
+            } else {
+                None
+            }
+        }
+        b'=' => {
+            let last_byte = buffer[buffer.len() - 1];
+            if last_byte == b'c' {
+                return parse_csi_device_attributes(buffer);
+            } else if (64..=126).contains(&last_byte) {
+                bail!();
+            } else {
+                None
+            }
+        }
+        b'c' => return parse_csi_device_attributes(buffer),
         b'0'..=b'9' => {
             // Numbered escape code.
             if buffer.len() == 3 {
@@ -334,10 +358,12 @@ fn parse_csi(buffer: &[u8]) -> Result<Option<Event>> {
                         return parse_csi_bracketed_paste(buffer);
                     }
                     match last_byte {
+                        b'c' => return parse_csi_device_attributes(buffer),
                         b'M' => return parse_csi_rxvt_mouse(buffer),
                         b'~' => return parse_csi_special_key_code(buffer),
                         b'u' => return parse_csi_u_encoded_key_code(buffer),
                         b'R' => return parse_csi_cursor_position(buffer),
+                        b't' => return parse_csi_window_response(buffer),
                         _ => return parse_csi_modifier_key_code(buffer),
                     }
                 }
@@ -361,7 +387,28 @@ fn parse_osc(buffer: &[u8]) -> Result<Option<Event>> {
     };
     let s = str::from_utf8(&buffer[2..buffer.len()])?;
     let mut split = s.split(';');
-    let index = next_parsed::<u8>(&mut split)?;
+    let index_str = split.next().ok_or(MalformedSequenceError)?;
+
+    if index_str == "52" {
+        let target_str = split.next().unwrap_or("");
+        let selection = osc::Selection::parse(target_str);
+        let payload = split.next().unwrap_or("");
+
+        if payload == "?" {
+            return Ok(Some(Event::Osc(osc::Osc::QuerySelection(selection))));
+        } else if payload.is_empty() {
+            return Ok(Some(Event::Osc(osc::Osc::ClearSelection(selection))));
+        } else if let Ok(decoded_bytes) = crate::base64::decode(payload.as_bytes()) {
+            if let Ok(text) = String::from_utf8(decoded_bytes) {
+                return Ok(Some(Event::Paste(text)));
+            }
+        }
+        return Ok(None);
+    }
+
+    let index = index_str
+        .parse::<u8>()
+        .map_err(|_| MalformedSequenceError)?;
     let Some(color_number) = osc::DynamicColorNumber::from_index(index) else {
         bail!()
     };
@@ -497,15 +544,24 @@ fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> Result<Option<Event>> {
     }
 
     // When the "report alternate keys" flag is enabled in the Kitty Keyboard Protocol
-    // and the terminal sends a keyboard event containing shift, the sequence will
-    // contain an additional codepoint separated by a ':' character which contains
-    // the shifted character according to the keyboard layout.
-    if modifiers.contains(Modifiers::SHIFT) {
-        if let Some(shifted_c) = codepoints
+    // the key code may be followed by two ':'-separated alternates:
+    //
+    //     unicode-key-code:shifted-key:base-layout-key
+    //
+    // The shifted key is the shifted character according to the keyboard layout and
+    // may be empty when only the base layout key is sent (`1089::99`). The base
+    // layout key is the key at the same position in the standard PC-101 layout.
+    let mut alternate_char = || {
+        codepoints
             .next()
             .and_then(|codepoint| codepoint.parse::<u32>().ok())
             .and_then(char::from_u32)
-        {
+    };
+    let shifted_c = alternate_char();
+    let base_layout_code = alternate_char().map(KeyCode::Char);
+
+    if modifiers.contains(Modifiers::SHIFT) {
+        if let Some(shifted_c) = shifted_c {
             code = KeyCode::Char(shifted_c);
             modifiers.set(Modifiers::SHIFT, false);
         }
@@ -516,6 +572,7 @@ fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> Result<Option<Event>> {
         modifiers,
         kind,
         state: state_from_keycode | state_from_modifiers,
+        base_layout_code,
     });
 
     Ok(Some(event))
@@ -612,6 +669,7 @@ fn parse_csi_modifier_key_code(buffer: &[u8]) -> Result<Option<Event>> {
         modifiers,
         kind,
         state: KeyEventState::NONE,
+        base_layout_code: None,
     });
 
     Ok(Some(event))
@@ -658,6 +716,7 @@ fn parse_csi_special_key_code(buffer: &[u8]) -> Result<Option<Event>> {
         modifiers,
         kind,
         state,
+        base_layout_code: None,
     });
 
     Ok(Some(event))
@@ -943,6 +1002,37 @@ fn parse_csi_cursor_position(buffer: &[u8]) -> Result<Option<Event>> {
     ))))
 }
 
+fn parse_csi_window_response(buffer: &[u8]) -> Result<Option<Event>> {
+    assert!(buffer.starts_with(b"\x1B["));
+    assert!(buffer.ends_with(b"t"));
+
+    let s = str::from_utf8(&buffer[2..buffer.len() - 1])?;
+    let mut split = s.split(';');
+
+    let ps = match next_parsed::<u16>(&mut split) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    match ps {
+        4 => {
+            let height = next_parsed::<i64>(&mut split).ok();
+            let width = next_parsed::<i64>(&mut split).ok();
+            Ok(Some(Event::Csi(Csi::Window(Box::new(
+                csi::Window::ReportTextAreaSizePixelsResponse { width, height },
+            )))))
+        }
+        6 => {
+            let height = next_parsed::<i64>(&mut split).ok();
+            let width = next_parsed::<i64>(&mut split).ok();
+            Ok(Some(Event::Csi(Csi::Window(Box::new(
+                csi::Window::ReportCellSizePixelsResponse { width, height },
+            )))))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn parse_csi_cursor_shape_query_response(buffer: &[u8]) -> Result<Option<Event>> {
     assert!(buffer.starts_with(b"\x1B[>")); // CSI >
     assert!(buffer.ends_with(b" q"));
@@ -1010,17 +1100,15 @@ fn parse_csi_keyboard_enhancement_flags(buffer: &[u8]) -> Result<Option<Event>> 
     )))))
 }
 
-fn parse_csi_primary_device_attributes(buffer: &[u8]) -> Result<Option<Event>> {
-    // CSI 64 ; attr1 ; attr2 ; ... ; attrn ; c
-    assert!(buffer.starts_with(b"\x1B[?"));
+fn parse_csi_device_attributes(buffer: &[u8]) -> Result<Option<Event>> {
+    // Device attributes response (DA1, DA2, DA3): CSI ... c
+    assert!(buffer.starts_with(b"\x1B["));
     assert!(buffer.ends_with(b"c"));
 
-    // This is a stub for parsing the primary device attributes. This response is not
-    // exposed in the crossterm API so we don't need to parse the individual attributes yet.
-    // See <https://vt100.net/docs/vt510-rm/DA1.html>
+    let raw = str::from_utf8(&buffer[2..buffer.len() - 1])?.to_string();
 
     Ok(Some(Event::Csi(Csi::Device(
-        csi::Device::DeviceAttributes(()),
+        csi::Device::DeviceAttributes(raw),
     ))))
 }
 
@@ -1064,9 +1152,11 @@ fn parse_csi_mode(buffer: &[u8]) -> Result<Option<Event>> {
     let mut split = s.split(';');
 
     let mode = match next_parsed::<u16>(&mut split)? {
+        1006 => csi::DecPrivateMode::Code(csi::DecPrivateModeCode::SGRMouse),
+        1016 => csi::DecPrivateMode::Code(csi::DecPrivateModeCode::SGRPixelsMouse),
         2026 => csi::DecPrivateMode::Code(csi::DecPrivateModeCode::SynchronizedOutput),
         2027 => csi::DecPrivateMode::Code(csi::DecPrivateModeCode::GraphemeClustering),
-        _ => bail!(),
+        num => csi::DecPrivateMode::Unspecified(num),
     };
 
     let setting = match next_parsed::<u8>(&mut split)? {
@@ -1300,6 +1390,20 @@ mod test {
     }
 
     #[test]
+    fn parse_osc_52_response() {
+        assert_eq!(
+            parse_event(b"\x1b]52;c;Y29waWVkIHRleHQ=\x1b\\", false)
+                .unwrap()
+                .unwrap(),
+            Event::Paste("copied text".to_string())
+        );
+        assert_eq!(
+            parse_event(b"\x1b]52;c;?\x07", false).unwrap().unwrap(),
+            Event::Osc(osc::Osc::QuerySelection(osc::Selection::CLIPBOARD))
+        );
+    }
+
+    #[test]
     fn parse_cursor_shape_query() {
         // CSI > SP q with no parameters is a query.
         let event = parse_event(b"\x1b[> q", false).unwrap().unwrap();
@@ -1345,6 +1449,30 @@ mod test {
     }
 
     #[test]
+    fn parse_sgr_pixels_mouse_mode_reset() {
+        let event = parse_event(b"\x1b[?1016;2$y", false).unwrap().unwrap();
+        assert_eq!(
+            event,
+            Event::Csi(Csi::Mode(csi::Mode::ReportDecPrivateMode {
+                mode: csi::DecPrivateMode::Code(csi::DecPrivateModeCode::SGRPixelsMouse),
+                setting: csi::DecModeSetting::Reset,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_unspecified_mode_report() {
+        let event = parse_event(b"\x1b[?9999;1$y", false).unwrap().unwrap();
+        assert_eq!(
+            event,
+            Event::Csi(Csi::Mode(csi::Mode::ReportDecPrivateMode {
+                mode: csi::DecPrivateMode::Unspecified(9999),
+                setting: csi::DecModeSetting::Set,
+            }))
+        );
+    }
+
+    #[test]
     fn parse_synchronized_output_mode_set() {
         let event = parse_event(b"\x1b[?2026;1$y", false).unwrap().unwrap();
         assert_eq!(
@@ -1377,5 +1505,109 @@ mod test {
         assert_eq!(event, Some(Event::Paste("Hello, world!".to_string())));
         let event = parse_event(b"\x1b[200~\x1b[201~", false).unwrap();
         assert_eq!(event, Some(Event::Paste("".to_string())));
+    }
+
+    #[test]
+    fn parse_csi_window_responses() {
+        let event_4 = parse_event(b"\x1b[4;768;1024t", false).unwrap().unwrap();
+        assert_eq!(
+            event_4,
+            Event::Csi(Csi::Window(Box::new(
+                csi::Window::ReportTextAreaSizePixelsResponse {
+                    width: Some(1024),
+                    height: Some(768),
+                }
+            )))
+        );
+
+        let event_6 = parse_event(b"\x1b[6;20;10t", false).unwrap().unwrap();
+        assert_eq!(
+            event_6,
+            Event::Csi(Csi::Window(Box::new(
+                csi::Window::ReportCellSizePixelsResponse {
+                    width: Some(10),
+                    height: Some(20),
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_secondary_device_attributes() {
+        let event = parse_event(b"\x1b[>1;10;0c", false).unwrap().unwrap();
+        assert_eq!(
+            event,
+            Event::Csi(Csi::Device(csi::Device::DeviceAttributes(
+                ">1;10;0".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn parser_does_not_deadlock_on_da2_response() {
+        let mut parser = Parser::default();
+        // Simulate Ghostty DA2 response followed by keypress 'a'
+        parser.parse(b"\x1b[>1;10;0c", true);
+        let da2_event = parser.pop();
+        assert_eq!(
+            da2_event,
+            Some(Event::Csi(Csi::Device(csi::Device::DeviceAttributes(
+                ">1;10;0".to_string()
+            ))))
+        );
+
+        parser.parse(b"a", true);
+        let key_event = parser.pop();
+        assert_eq!(
+            key_event,
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers::NONE,
+            )))
+        );
+    }
+
+    #[test]
+    fn parser_does_not_deadlock_on_unhandled_csi() {
+        let mut parser = Parser::default();
+        // Unknown CSI sequence ending in a final byte 'z'
+        parser.parse(b"\x1b[>1;10;0z", true);
+        assert_eq!(parser.pop(), None);
+
+        // Next keypress 'b' should be parsed fine
+        parser.parse(b"b", true);
+        let key_event = parser.pop();
+        assert_eq!(
+            key_event,
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                Modifiers::NONE,
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_csi_u_base_layout_key() {
+        let key = |buffer: &[u8]| match parse_event(buffer, false).unwrap().unwrap() {
+            Event::Key(key) => key,
+            other => panic!("expected a key event, got {other:?}"),
+        };
+
+        // ctrl+с on a Cyrillic layout: no shifted key, base layout key `c`.
+        let event = key(b"\x1B[1089::99;5u");
+        assert_eq!(event.code, KeyCode::Char('с'));
+        assert_eq!(event.modifiers, Modifiers::CONTROL);
+        assert_eq!(event.base_layout_code, Some(KeyCode::Char('c')));
+
+        // shift+с: the shifted key still replaces the code.
+        let event = key(b"\x1B[1089:1057:99;2u");
+        assert_eq!(event.code, KeyCode::Char('С'));
+        assert_eq!(event.modifiers, Modifiers::NONE);
+        assert_eq!(event.base_layout_code, Some(KeyCode::Char('c')));
+
+        // No alternates reported.
+        let event = key(b"\x1B[99;5u");
+        assert_eq!(event.code, KeyCode::Char('c'));
+        assert_eq!(event.base_layout_code, None);
     }
 }

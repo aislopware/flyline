@@ -149,6 +149,19 @@ impl UnixTerminal {
             has_panic_hook: false,
         })
     }
+
+    /// Constructs a UnixTerminal reusing an existing [`EventReader`].
+    pub fn with_reader(reader: EventReader) -> io::Result<Self> {
+        let (_read, write) = open_pty()?;
+        let original_termios = termios::tcgetattr(&write)?;
+
+        Ok(Self {
+            reader,
+            write: BufWriter::with_capacity(BUF_SIZE, write),
+            original_termios,
+            has_panic_hook: false,
+        })
+    }
 }
 
 impl Terminal for UnixTerminal {
@@ -157,7 +170,7 @@ impl Terminal for UnixTerminal {
         termios.make_raw();
         termios::tcsetattr(
             self.write.get_ref(),
-            termios::OptionalActions::Flush,
+            termios::OptionalActions::Now, // <--- PRESERVES UNREAD STDIN
             &termios,
         )?;
 
