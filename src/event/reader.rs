@@ -88,10 +88,12 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct EventReader {
     shared: Arc<Mutex<Shared>>,
+    waker: PlatformWaker,
 }
 
 impl EventReader {
     pub(crate) fn new(source: PlatformEventSource) -> Self {
+        let waker = source.waker();
         let shared = Shared {
             events: VecDeque::with_capacity(32),
             source,
@@ -99,13 +101,20 @@ impl EventReader {
         };
         Self {
             shared: Arc::new(Mutex::new(shared)),
+            waker,
         }
     }
 
-    /// Returns a platform-specific waker that can unblock [`poll`](Self::poll) calls.
+    /// Returns a platform-specific waker that can unblock [`poll`](Self::poll) and
+    /// [`read`](Self::read) calls.
+    ///
+    /// The waker is cheap to clone and can be freely moved to another thread. Calling its
+    /// `wake` method does not require the calling thread to hold the [`EventReader`]'s internal
+    /// lock, so it can be called while a [`read`](Self::read) or [`poll`](Self::poll) call is
+    /// blocked on another thread or clone of this reader. A woken [`read`](Self::read) call
+    /// returns `Err` with [`io::ErrorKind::Interrupted`].
     pub fn waker(&self) -> PlatformWaker {
-        let reader = self.shared.lock();
-        reader.source.waker()
+        self.waker.clone()
     }
 
     /// Polls for availability of an event matching `filter`.
@@ -135,6 +144,9 @@ impl EventReader {
     /// Events rejected by `filter` are retained for later reads. For keyboard shortcuts, filter on
     /// `Event::Key(key) if key.kind == KeyEventKind::Press` unless the application intentionally
     /// handles release or repeat events.
+    ///
+    /// Returns `Err` with [`io::ErrorKind::Interrupted`] if [`Self::waker`]'s `wake` is called
+    /// while this call is blocked.
     pub fn read<F>(&self, filter: F) -> io::Result<Event>
     where
         F: FnMut(&Event) -> bool,
@@ -205,7 +217,14 @@ impl Shared {
                     skipped_events.push_back(event);
                 }
             }
-            let _ = self.poll(None, &mut filter)?;
+            // With `timeout: None`, `poll` only returns `Ok(false)` when a waker interrupted it
+            // (its internal timeout can never elapse), so this unambiguously means "woken up."
+            if !self.poll(None, &mut filter)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "read operation was woken up",
+                ));
+            }
         }
     }
 }

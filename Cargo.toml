@@ -1,6 +1,6 @@
 [package]
 name = "termina"
-version = "0.3.3"
+version = "0.4.0"
 authors = ["Michael Davis <mcarsondavis@gmail.com>"]
 description = "A cross-platform VT manipulation library"
 readme = "README.md"
@@ -35,6 +35,9 @@ features = [
   "event",
 ]
 
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
 [target.'cfg(windows)'.dependencies.windows-sys]
 # TODO: this could probably be loosened.
 version = ">=0.60"
@@ -54,3 +57,7 @@ features = [
 [[example]]
 name = "event-read"
 required-features = ["windows-legacy"]
+
+[[bench]]
+name = "parse"
+harness = false
