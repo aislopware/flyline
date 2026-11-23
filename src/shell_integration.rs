@@ -20,6 +20,11 @@ pub enum EscapeCodes {
         path: String,
     },
 
+    // OSC 2
+    WindowTitle {
+        title: String,
+    },
+
     // OSC 133 (FinalTerm)
     PromptStart {
         rel_pos: RelativePosition,
@@ -120,6 +125,11 @@ impl std::fmt::Display for EscapeCodes {
             }
             EscapeCodes::KittyCurrentDirectory { host, path } => {
                 write!(f, "\x1b]7;kitty-shell-cwd://{}{}\x1b\\", host, path)
+            }
+            // OSC 2
+            EscapeCodes::WindowTitle { title } => {
+                let title: String = title.chars().filter(|c| !c.is_control()).collect();
+                write!(f, "\x1b]2;{}\x1b\\", title)
             }
             // OSC 133
             // We want to enable click_events=1 so that we get a mouse event instead
