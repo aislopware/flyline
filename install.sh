@@ -127,8 +127,7 @@ detect_os() {
     case "$os" in
         Linux) echo "linux" ;;
         Darwin) echo "darwin" ;;
-        FreeBSD) echo "freebsd" ;;
-        *) err "Unsupported OS: $os" ;;
+        *) err "Unsupported OS: $os. Prebuilt libraries exist for Linux, macOS and Android (Termux)." ;;
     esac
 }
 
@@ -137,11 +136,7 @@ detect_arch() {
     case "$arch" in
         x86_64 | amd64) echo "x86_64" ;;
         aarch64 | arm64) echo "aarch64" ;;
-        armv7* | armhf) echo "armv7" ;;
-        i386 | i486 | i586 | i686) echo "i686" ;;
-        riscv64) echo "riscv64gc" ;;
-        ppc64le | powerpc64le) echo "powerpc64le" ;;
-        *) err "Unsupported architecture: $arch" ;;
+        *) err "Unsupported architecture: $arch. Prebuilt libraries exist for x86_64 and aarch64; build from source for others." ;;
     esac
 }
 
@@ -261,7 +256,10 @@ main() {
     fi
 
     if [ "$OS" = "darwin" ]; then
-        TARGET="${ARCH}-apple-darwin"
+        if [ "$ARCH" != "aarch64" ]; then
+            err "Intel Macs have no prebuilt library; build from source with: cargo build --release --lib"
+        fi
+        TARGET="aarch64-apple-darwin"
         LIB_NAME="libflyline.dylib"
 
         # Flyline can run on the 3.2.57 version of Bash.
@@ -279,45 +277,19 @@ main() {
                 err "Then re-run the installer using Homebrew Bash."
             fi
         fi
-    elif [ "$OS" = "freebsd" ]; then
-        if [ "$ARCH" != "x86_64" ]; then
-            err "Unsupported FreeBSD architecture: $ARCH. Only x86_64 is supported."
-        fi
-        TARGET="x86_64-unknown-freebsd"
-        LIB_NAME="libflyline.so"
     elif [ "$OS" = "android" ]; then
         case "$ARCH" in
             aarch64)
                 TARGET="aarch64-linux-android"
                 ;;
-            x86_64)
-                TARGET="x86_64-linux-android"
-                ;;
-            armv7)
-                TARGET="armv7-linux-androideabi"
-                ;;
-            i686)
-                TARGET="i686-linux-android"
-                ;;
             *)
-                err "Unsupported Android architecture: $ARCH"
+                err "Unsupported Android architecture: $ARCH. Only aarch64 (arm64) is supported."
                 ;;
         esac
         LIB_NAME="libflyline.so"
     else
         LIBC="$(detect_libc)"
-        case "$ARCH" in
-            armv7)
-                if [ "$LIBC" = "gnu" ]; then
-                    TARGET="armv7-unknown-linux-gnueabihf"
-                else
-                    err "Unsupported libc ($LIBC) for armv7. Only gnu (gnueabihf) is supported."
-                fi
-                ;;
-            *)
-                TARGET="${ARCH}-unknown-linux-${LIBC}"
-                ;;
-        esac
+        TARGET="${ARCH}-unknown-linux-${LIBC}"
         LIB_NAME="libflyline.so"
     fi
 
