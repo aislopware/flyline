@@ -1,9 +1,6 @@
 use libc::{c_char, c_int};
 use std::sync::Mutex;
 
-#[cfg(feature = "pre_bash_4_4")]
-use ctor::ctor;
-
 use crate::shell::bash::{funcs as bash_funcs, symbols as bash_symbols};
 use crate::{LongLived, SigchldGuard, app, cli, logging, settings};
 
@@ -228,16 +225,7 @@ pub static mut flyline_struct: bash_symbols::BashBuiltin = bash_symbols::BashBui
     handle: std::ptr::null(),
 };
 
-// On pre-bash-4.4 builds, register a shared-library constructor so that flyline
-// is initialised as soon as the library is loaded via `enable -f`.
-// On newer versions of bash `flyline_builtin_load` is called automatically by bash during enable.
-#[cfg(feature = "pre_bash_4_4")]
-#[ctor(unsafe)]
-fn flyline_builtin_load_ctor() {
-    let _ = flyline_load_common();
-}
-
-#[cfg(not(feature = "pre_bash_4_4"))]
+// Bash >= 4.4 calls `flyline_builtin_load` itself during `enable -f`.
 #[unsafe(no_mangle)]
 pub extern "C" fn flyline_builtin_load(_arg: *const c_char) -> c_int {
     flyline_load_common()
@@ -425,9 +413,7 @@ fn flyline_load_common() -> c_int {
     SUCCESS
 }
 
-// Its easier to just not unload on older bash versions
-// Maybe I could use a fini_array function to unload, but I doubt its worth the effort.
-#[cfg(not(feature = "pre_bash_4_4"))]
+// Bash >= 4.4 calls `flyline_builtin_unload` during `enable -d`.
 #[unsafe(no_mangle)]
 pub extern "C" fn flyline_builtin_unload() {
     log::info!("flyline_builtin_unload called, unloading flyline");

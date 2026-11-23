@@ -61,9 +61,6 @@ anyhow.workspace = true
 chrono = "0.4"
 clap.workspace = true
 clap_complete.workspace = true
-# Only the pre-4.4 build needs a load-time constructor (newer bash calls
-# flyline_builtin_load itself).
-ctor = { version = "1.0", optional = true }
 dirs = "7.0"
 # Only `parse` is used; the default features pull in chrono, time and serde.
 duration-str = { version = "0.21", default-features = false }
@@ -97,9 +94,6 @@ tui-scrollbar.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 uuid = { version = "1.29", features = ["v7"] }
-
-[features]
-pre_bash_4_4 = ["dep:ctor"]
 
 [dev-dependencies]
 rusty-fork = "0.3.1"

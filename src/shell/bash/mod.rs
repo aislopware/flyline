@@ -59,11 +59,8 @@ impl ShellBackend for BashBackend {
         let _guard = symbols::BASH_LOCK.lock();
 
         let decoded = unsafe {
-            #[cfg(not(feature = "pre_bash_4_4"))]
             let decoded_prompt_cstr =
                 symbols::decode_prompt_string(c_prompt.as_ptr(), _is_prompt as i32);
-            #[cfg(feature = "pre_bash_4_4")]
-            let decoded_prompt_cstr = symbols::decode_prompt_string(c_prompt.as_ptr());
             if decoded_prompt_cstr.is_null() {
                 log::warn!("decode_prompt_string returned null");
                 return None;

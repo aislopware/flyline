@@ -79,4 +79,3 @@ jobs:
         run: |
           rustc --version | grep -E '^rustc 1[.]91[.]0 '
           cargo check --workspace --locked --all-targets
-          cargo check --workspace --locked --all-targets --features pre_bash_4_4

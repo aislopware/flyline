@@ -512,20 +512,14 @@ pub fn evaluate_shell_string(script: &str) -> Result<()> {
         let allocated_ptr = bash_symbols::locked_xmalloc_cstr(&script_cstr);
         let from_file_cstr = std::ffi::CString::new("flyline")?;
 
-        #[cfg(not(feature = "pre_bash_4_4"))]
         let flags = bash_symbols::SEVAL_NOHIST
             | bash_symbols::SEVAL_NOOPTIMIZE
             | bash_symbols::SEVAL_NOTIFY;
-        #[cfg(feature = "pre_bash_4_4")]
-        let flags = bash_symbols::SEVAL_NOHIST | bash_symbols::SEVAL_NOTIFY;
 
         // Save parser state (Bash's save_parser_state(NULL) uses xmalloc to allocate exact sizeof(sh_parser_state_t))
         let ps_ptr = bash_symbols::save_parser_state(std::ptr::null_mut());
 
-        #[cfg(not(feature = "pre_bash_4_4"))]
         bash_symbols::evalstring(allocated_ptr, from_file_cstr.as_ptr(), flags);
-        #[cfg(feature = "pre_bash_4_4")]
-        bash_symbols::parse_and_execute(allocated_ptr, from_file_cstr.as_ptr(), flags);
 
         // Restore parser state so expand_aliases and parser_state are preserved
         if !ps_ptr.is_null() {
@@ -607,15 +601,9 @@ pub fn run_programmable_completions(
         // similar to set_completion_defaults
         bash_symbols::rl_filename_completion_desired = 0;
         bash_symbols::rl_filename_quoting_desired = 1;
-        #[cfg(not(feature = "pre_bash_4_4"))]
-        {
-            bash_symbols::rl_completion_suppress_append = 0;
-        }
+        bash_symbols::rl_completion_suppress_append = 0;
         bash_symbols::rl_completion_append_character = ' ' as c_int;
-        #[cfg(not(feature = "pre_bash_4_4"))]
-        {
-            bash_symbols::rl_sort_completion_matches = 1;
-        }
+        bash_symbols::rl_sort_completion_matches = 1;
 
         let foundcs: std::ffi::c_int = 0;
 
@@ -635,7 +623,6 @@ pub fn run_programmable_completions(
             // Copying logic from bashline.c:attempt_shell_completion
             // This is to pickup the filename desire from calls like `complete -o filenames`
             // This probably isn't necessary since I am reading the values from foundcs directly but it doesn't hurt to be safe
-            #[cfg(not(feature = "pre_bash_4_4"))]
             bash_symbols::pcomp_set_readline_variables(foundcs, 1);
         }
 
@@ -665,14 +652,11 @@ pub fn print_copt_flags(flag: c_int) {
         CompspecOption::Default,
         CompspecOption::Filenames,
         CompspecOption::Dirnames,
-        #[cfg(not(feature = "pre_bash_4_4"))]
         CompspecOption::NoQuote,
         CompspecOption::NoSpace,
         CompspecOption::BashDefault,
         CompspecOption::PlusDirs,
-        #[cfg(not(feature = "pre_bash_4_4"))]
         CompspecOption::NoSort,
-        #[cfg(not(feature = "pre_bash_4_4"))]
         CompspecOption::FullQuote,
     ];
     for option in options {
@@ -1106,28 +1090,10 @@ pub fn unset_env_var(name: &str) -> Result<()> {
 }
 
 pub fn is_autocd_enabled() -> bool {
-    #[cfg(feature = "pre_bash_4_4")]
-    {
-        false
-    }
-    #[cfg(not(feature = "pre_bash_4_4"))]
-    {
-        let _guard = super::symbols::BASH_LOCK.lock();
-        unsafe { bash_symbols::autocd != 0 }
-    }
-}
-
-#[cfg(feature = "pre_bash_4_4")]
-pub fn has_pending_traps() -> bool {
     let _guard = super::symbols::BASH_LOCK.lock();
-    unsafe {
-        let ptr = std::ptr::addr_of!(bash_symbols::pending_traps) as *const libc::c_int;
-        let slice = std::slice::from_raw_parts(ptr, 64);
-        slice.iter().any(|&count| count > 0)
-    }
+    unsafe { bash_symbols::autocd != 0 }
 }
 
-#[cfg(not(feature = "pre_bash_4_4"))]
 pub fn has_pending_traps() -> bool {
     let _guard = super::symbols::BASH_LOCK.lock();
     unsafe { bash_symbols::first_pending_trap() > 0 }

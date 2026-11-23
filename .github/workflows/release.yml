@@ -48,8 +48,6 @@ jobs:
           - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           - { target: aarch64-unknown-linux-gnu,  os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
-          # Linux pre_bash_4_4
-          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "--features pre_bash_4_4", suffix: "_pre_bash_4_4" }
           # Android (via cross)
           - { target: aarch64-linux-android,      os: ubuntu-latest, build_tool: cross, lib: libflyline.so,    feature_flags: "",                        suffix: "" }
           # macOS (native cargo)
@@ -138,7 +136,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [install-test-alpine, install-test-ubuntu, install-test-arch, install-test-termux, install-test-bash-3-2-57]
+        target: [install-test-alpine, install-test-ubuntu, install-test-arch, install-test-termux]
     steps:
       - uses: actions/checkout@v7
       - name: Set up Docker Buildx
