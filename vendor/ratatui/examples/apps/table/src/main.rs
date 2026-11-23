@@ -12,8 +12,8 @@ use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{self, Color, Modifier, Style, Stylize};
 use ratatui::text::Text;
 use ratatui::widgets::{
-    Block, BorderType, Cell, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Table, TableState,
+    Block, BorderType, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table, TableHighlightSpacing, TableState,
 };
 use ratatui::{DefaultTerminal, Frame};
 use style::palette::tailwind;
@@ -173,8 +173,8 @@ impl App {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('j') | KeyCode::Down => self.next_row(),
                     KeyCode::Char('k') | KeyCode::Up => self.previous_row(),
-                    KeyCode::Char('l') | KeyCode::Right if shift_pressed => self.next_color(),
-                    KeyCode::Char('h') | KeyCode::Left if shift_pressed => {
+                    KeyCode::Char('L') | KeyCode::Right if shift_pressed => self.next_color(),
+                    KeyCode::Char('H') | KeyCode::Left if shift_pressed => {
                         self.previous_color();
                     }
                     KeyCode::Char('l') | KeyCode::Right => self.next_column(),
@@ -260,7 +260,7 @@ impl App {
             "".into(),
         ]))
         .bg(self.colors.buffer_bg)
-        .highlight_spacing(HighlightSpacing::Always);
+        .highlight_spacing(TableHighlightSpacing::Always);
         frame.render_stateful_widget(t, area, &mut self.state);
     }
 

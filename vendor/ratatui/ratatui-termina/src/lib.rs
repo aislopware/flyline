@@ -26,7 +26,7 @@
 use std::fmt::{self, Write as FmtWrite};
 use std::io::{self, Write};
 
-use ratatui_core::backend::{Backend, ClearType, WindowSize};
+use ratatui_core::backend::{Backend, ClearType, ScrollByRegion, WindowSize};
 use ratatui_core::buffer::{Cell, CellWidth};
 use ratatui_core::layout::{Position, Size};
 use ratatui_core::style::{Color, Modifier, Style};
@@ -199,26 +199,25 @@ where
         #[cfg(feature = "underline-color")]
         let mut underline_color = Color::Reset;
         let mut modifier = Modifier::empty();
-        let mut last_pos: Option<Position> = None;
-        let mut skip_until_x = 0;
-        let mut skip_y = 0;
-
+        // Position and advance of the last cell written, used to skip redundant cursor moves.
+        let mut last: Option<(Position, u16)> = None;
         for (x, y, cell) in content {
-            if y == skip_y && x < skip_until_x {
-                continue;
-            }
-            let width = cell.cell_width();
-            skip_until_x = x + width;
-            skip_y = y;
-
-            if !matches!(last_pos, Some(p) if x == p.x + 1 && y == p.y) {
+            // Move the cursor unless it already sits at (x, y), i.e. this cell directly follows
+            // the previous one on the same row, accounting for the width of what was printed.
+            if !matches!(last, Some((p, w)) if p.x.checked_add(w) == Some(x) && y == p.y) {
                 let command = Csi::Cursor(cursor_position(Position { x, y })?);
                 write!(string, "{command}").unwrap();
             }
-            last_pos = Some(Position {
-                x: x + width.saturating_sub(1),
-                y,
-            });
+            let width = cell.cell_width();
+            // An empty cell is erased and stepped over, which advances one column.
+            let advance = if cell.symbol_opt().is_some_and(|s| !s.is_empty()) {
+                width
+            } else {
+                1
+            };
+            // A VS16 cluster's terminal cursor advance is not reliably predictable.
+            let uncertain_width = width > 1 && cell.symbol().chars().any(|c| c == '\u{FE0F}');
+            last = (!uncertain_width).then_some((Position { x, y }, advance));
 
             let mut attributes = SgrAttributes::default();
             if cell.fg != fg {
@@ -259,7 +258,7 @@ where
             }
         }
 
-        if last_pos.is_none() {
+        if string.is_empty() {
             return Ok(());
         }
 
@@ -303,6 +302,11 @@ where
                 x: x + width.saturating_sub(1),
                 y,
             });
+            // A VS16 cluster's terminal cursor advance is not reliably predictable, so the
+            // next cell moves the cursor explicitly.
+            if width > 1 && cell.symbol().contains('\u{FE0F}') {
+                last_pos = None;
+            }
 
             let mut attributes = SgrAttributes::default();
             if cell.fg != fg {
@@ -343,7 +347,7 @@ where
             }
         }
 
-        if last_pos.is_none() {
+        if string.is_empty() {
             return Ok(());
         }
 
@@ -434,6 +438,19 @@ where
         Write::flush(self)
     }
 
+    fn save_cursor_position(&mut self) -> io::Result<bool> {
+        let command = Csi::Cursor(Cursor::SaveCursor);
+        write!(self.terminal, "{command}")?;
+        self.terminal.flush()?;
+        Ok(true)
+    }
+
+    fn restore_cursor_position(&mut self) -> io::Result<()> {
+        let command = Csi::Cursor(Cursor::RestoreCursor);
+        write!(self.terminal, "{command}")?;
+        self.terminal.flush()
+    }
+
     fn clear(&mut self) -> io::Result<()> {
         self.clear_region(ClearType::All)
     }
@@ -480,8 +497,12 @@ where
     fn flush(&mut self) -> io::Result<()> {
         Write::flush(self)
     }
+}
 
-    #[cfg(feature = "scrolling-regions")]
+impl<T> ScrollByRegion for TerminaBackend<T>
+where
+    T: Terminal,
+{
     fn scroll_region_up(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
         let margins = Csi::Cursor(set_top_and_bottom_margins(region)?);
         let scroll = Csi::Edit(Edit::ScrollUp(amount.into()));
@@ -490,7 +511,6 @@ where
         Write::flush(self)
     }
 
-    #[cfg(feature = "scrolling-regions")]
     fn scroll_region_down(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
         let margins = Csi::Cursor(set_top_and_bottom_margins(region)?);
         let scroll = Csi::Edit(Edit::ScrollDown(amount.into()));
@@ -513,7 +533,6 @@ fn one_based(n: u16) -> io::Result<OneBased> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "position exceeds u16::MAX - 1"))
 }
 
-#[cfg(feature = "scrolling-regions")]
 fn set_top_and_bottom_margins(region: std::ops::Range<u16>) -> io::Result<Cursor> {
     Ok(Cursor::SetTopAndBottomMargins {
         top: one_based(region.start)?,
@@ -523,7 +542,6 @@ fn set_top_and_bottom_margins(region: std::ops::Range<u16>) -> io::Result<Cursor
     })
 }
 
-#[cfg(feature = "scrolling-regions")]
 const fn reset_top_and_bottom_margins() -> Cursor {
     Cursor::SetTopAndBottomMargins {
         top: OneBased::from_zero_based(0),
@@ -631,7 +649,9 @@ impl IntoTermina<SgrModifiers> for ModifierDiff {
         if removed.contains(Modifier::ITALIC) {
             modifiers |= SgrModifiers::NO_ITALIC;
         }
-        if removed.contains(Modifier::UNDERLINED) {
+        if (removed & Modifier::ALL_UNDERLINES) != Modifier::empty()
+            && (added & Modifier::ALL_UNDERLINES) == Modifier::empty()
+        {
             modifiers |= SgrModifiers::UNDERLINE_NONE;
         }
         if removed.contains(Modifier::SLOW_BLINK) || removed.contains(Modifier::RAPID_BLINK) {
@@ -658,6 +678,18 @@ impl IntoTermina<SgrModifiers> for ModifierDiff {
         }
         if added.contains(Modifier::UNDERLINED) {
             modifiers |= SgrModifiers::UNDERLINE_SINGLE;
+        }
+        if added.contains(Modifier::UNDER_CURLED) {
+            modifiers |= SgrModifiers::UNDERLINE_CURLY;
+        }
+        if added.contains(Modifier::DOUBLE_UNDERLINED) {
+            modifiers |= SgrModifiers::UNDERLINE_DOUBLE;
+        }
+        if added.contains(Modifier::UNDER_DOTTED) {
+            modifiers |= SgrModifiers::UNDERLINE_DOTTED;
+        }
+        if added.contains(Modifier::UNDER_DASHED) {
+            modifiers |= SgrModifiers::UNDERLINE_DASHED;
         }
         if added.contains(Modifier::SLOW_BLINK) {
             modifiers |= SgrModifiers::BLINK_SLOW;
@@ -693,7 +725,11 @@ impl FromTermina<Underline> for Modifier {
     fn from_termina(value: Underline) -> Self {
         match value {
             Underline::None => Self::empty(),
-            _ => Self::UNDERLINED,
+            Underline::Single => Self::UNDERLINED,
+            Underline::Double => Self::DOUBLE_UNDERLINED,
+            Underline::Curly => Self::UNDER_CURLED,
+            Underline::Dotted => Self::UNDER_DOTTED,
+            Underline::Dashed => Self::UNDER_DASHED,
         }
     }
 }
@@ -723,9 +759,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
     use std::time::Duration;
 
-    use ratatui_core::buffer::Cell;
+    use ratatui_core::buffer::{Cell, CellDiffOption};
     use termina::EventReader;
     use termina::escape::csi::Csi;
 
@@ -829,6 +866,17 @@ mod tests {
             backend.terminal.output(),
             format!("{hide_cursor}{show_cursor}")
         );
+    }
+
+    #[test]
+    fn saves_and_restores_cursor_position() {
+        let mut backend = backend();
+        assert!(backend.save_cursor_position().unwrap());
+        backend.restore_cursor_position().unwrap();
+
+        let save = Csi::Cursor(Cursor::SaveCursor);
+        let restore = Csi::Cursor(Cursor::RestoreCursor);
+        assert_eq!(backend.terminal.output(), format!("{save}{restore}"));
     }
 
     #[test]
@@ -939,6 +987,82 @@ mod tests {
     }
 
     #[test]
+    fn draws_cursor_move_after_wide_symbol() {
+        // A double-width glyph advances the terminal cursor by two columns, so writing the
+        // very next cell requires an explicit cursor move. See issue #2651.
+        let mut backend = backend();
+        let wide = Cell::new("\u{2764}\u{FE0F}"); // ❤️ (VS16 emoji presentation)
+        let next = Cell::new("a");
+        let content = [(0, 0, &wide), (1, 0, &next)];
+
+        backend.draw(content.into_iter()).unwrap();
+
+        let output = backend.terminal.output();
+        let cursor = Csi::Cursor(cursor_position(Position::new(1, 0)).unwrap());
+        assert!(
+            output.contains(&cursor.to_string()),
+            "expected a cursor move to (1, 0) after a wide glyph, got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn skips_cursor_move_for_contiguous_cells() {
+        let mut backend = backend();
+        let a = Cell::new("a");
+        let b = Cell::new("b");
+        let content = [(0, 0, &a), (1, 0, &b)];
+
+        backend.draw(content.into_iter()).unwrap();
+
+        let output = backend.terminal.output();
+        let cursor = Csi::Cursor(cursor_position(Position::new(1, 0)).unwrap());
+        assert!(!output.contains(&cursor.to_string()));
+    }
+
+    #[test]
+    fn skips_cursor_move_after_wide_symbol_when_contiguous() {
+        let mut backend = backend();
+        let wide = Cell::new("\u{1F600}"); // 😀
+        let next = Cell::new("a");
+        let content = [(0, 0, &wide), (2, 0, &next)];
+
+        backend.draw(content.into_iter()).unwrap();
+
+        let output = backend.terminal.output();
+        let cursor = Csi::Cursor(cursor_position(Position::new(2, 0)).unwrap());
+        assert!(!output.contains(&cursor.to_string()));
+    }
+
+    #[test]
+    fn moves_cursor_after_uncertain_width_symbol() {
+        let mut backend = backend();
+        let wide = Cell::new("\u{2764}\u{FE0F}"); // ❤️
+        let next = Cell::new("a");
+        let content = [(0, 0, &wide), (2, 0, &next)];
+
+        backend.draw(content.into_iter()).unwrap();
+
+        let output = backend.terminal.output();
+        let cursor = Csi::Cursor(cursor_position(Position::new(2, 0)).unwrap());
+        assert!(output.contains(&cursor.to_string()));
+    }
+
+    #[test]
+    fn moves_cursor_when_previous_width_overflows() {
+        let mut backend = backend();
+        let mut forced = Cell::new("a");
+        forced.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MAX));
+        let next = Cell::new("b");
+        let content = [(1, 0, &forced), (0, 0, &next)];
+
+        backend.draw(content.into_iter()).unwrap();
+
+        let output = backend.terminal.output();
+        let cursor = Csi::Cursor(cursor_position(Position::new(0, 0)).unwrap());
+        assert!(output.contains(&cursor.to_string()));
+    }
+
+    #[test]
     fn converts_ratatui_colors_to_termina_colors() {
         assert_eq!(Color::Reset.into_termina(), ColorSpec::Reset);
         assert_eq!(Color::Red.into_termina(), ColorSpec::RED);
@@ -977,6 +1101,59 @@ mod tests {
     }
 
     #[test]
+    fn converts_underline_modifier_diffs_to_sgr_modifiers() {
+        let modifiers = ModifierDiff {
+            from: Modifier::BOLD,
+            to: Modifier::UNDERLINED | Modifier::ITALIC,
+        }
+        .into_termina();
+        assert_eq!(
+            modifiers,
+            SgrModifiers::INTENSITY_NORMAL | SgrModifiers::ITALIC | SgrModifiers::UNDERLINE_SINGLE
+        );
+
+        let modifiers = ModifierDiff {
+            from: Modifier::BOLD,
+            to: Modifier::UNDER_CURLED | Modifier::ITALIC,
+        }
+        .into_termina();
+        assert_eq!(
+            modifiers,
+            SgrModifiers::INTENSITY_NORMAL | SgrModifiers::ITALIC | SgrModifiers::UNDERLINE_CURLY
+        );
+
+        let modifiers = ModifierDiff {
+            from: Modifier::BOLD,
+            to: Modifier::DOUBLE_UNDERLINED | Modifier::ITALIC,
+        }
+        .into_termina();
+        assert_eq!(
+            modifiers,
+            SgrModifiers::INTENSITY_NORMAL | SgrModifiers::ITALIC | SgrModifiers::UNDERLINE_DOUBLE
+        );
+
+        let modifiers = ModifierDiff {
+            from: Modifier::BOLD,
+            to: Modifier::UNDER_DOTTED | Modifier::ITALIC,
+        }
+        .into_termina();
+        assert_eq!(
+            modifiers,
+            SgrModifiers::INTENSITY_NORMAL | SgrModifiers::ITALIC | SgrModifiers::UNDERLINE_DOTTED
+        );
+
+        let modifiers = ModifierDiff {
+            from: Modifier::BOLD,
+            to: Modifier::UNDER_DASHED | Modifier::ITALIC,
+        }
+        .into_termina();
+        assert_eq!(
+            modifiers,
+            SgrModifiers::INTENSITY_NORMAL | SgrModifiers::ITALIC | SgrModifiers::UNDERLINE_DASHED
+        );
+    }
+
+    #[test]
     fn converts_termina_modifiers_to_ratatui_modifiers() {
         assert_eq!(Modifier::from_termina(Intensity::Normal), Modifier::empty());
         assert_eq!(Modifier::from_termina(Intensity::Bold), Modifier::BOLD);
@@ -985,11 +1162,26 @@ mod tests {
             Modifier::from_termina(Underline::Single),
             Modifier::UNDERLINED
         );
+        assert_eq!(
+            Modifier::from_termina(Underline::Curly),
+            Modifier::UNDER_CURLED
+        );
+        assert_eq!(
+            Modifier::from_termina(Underline::Double),
+            Modifier::DOUBLE_UNDERLINED
+        );
+        assert_eq!(
+            Modifier::from_termina(Underline::Dotted),
+            Modifier::UNDER_DOTTED
+        );
+        assert_eq!(
+            Modifier::from_termina(Underline::Dashed),
+            Modifier::UNDER_DASHED
+        );
         assert_eq!(Modifier::from_termina(Blink::None), Modifier::empty());
         assert_eq!(Modifier::from_termina(Blink::Rapid), Modifier::RAPID_BLINK);
     }
 
-    #[cfg(feature = "scrolling-regions")]
     #[test]
     fn scrolls_regions() {
         let mut backend = backend();
@@ -1013,7 +1205,6 @@ mod tests {
         assert_eq!(backend.terminal.output(), expected);
     }
 
-    #[cfg(feature = "scrolling-regions")]
     #[test]
     fn rejects_zero_ended_scroll_regions() {
         let mut backend = backend();

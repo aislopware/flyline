@@ -25,7 +25,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::macros::line;
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Gauge, List, ListItem};
+use ratatui::widgets::{Block, Gauge, List, ListItem, Widget};
 use ratatui::{DefaultTerminal, Frame, TerminalOptions, Viewport};
 
 const INITIAL_HEIGHT: u16 = 6;
@@ -123,10 +123,21 @@ impl App {
         terminal.set_viewport_height(self.height)
     }
 
-    fn insert_line(&mut self, _terminal: &mut DefaultTerminal) -> io::Result<()> {
+    fn insert_line(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         self.insert_count += 1;
         let message = format!("Inserted line #{}", self.insert_count);
         self.messages.push(message);
+
+        let now = self.start_time.elapsed();
+        terminal.insert_before(1, |buf| {
+            let inserted_line = format!(
+                "📝 Inserted line #{} at {:02}:{:02}",
+                self.insert_count,
+                now.as_secs() / 60,
+                now.as_secs() % 60
+            );
+            inserted_line.green().bold().render(buf.area, buf);
+        })?;
         Ok(())
     }
 
@@ -181,11 +192,11 @@ impl App {
         frame.render_widget(message_list, messages_area);
 
         // Bottom info with dynamic gauge showing height percentage
-        let height_percentage = (f64::from(self.height) / 20.0).min(1.0);
+        let height_percentage = (f64::from(self.height) / f64::from(MAX_HEIGHT)).min(1.0);
         let gauge = Gauge::default()
             .gauge_style(Color::Blue)
             .ratio(height_percentage)
-            .label(format!("Height: {}/20", self.height));
+            .label(format!("Height: {}/{MAX_HEIGHT}", self.height));
         frame.render_widget(gauge, bottom_area);
     }
 }

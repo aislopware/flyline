@@ -1,8 +1,5 @@
-use alloc::string::String;
-
 use crate::buffer::Buffer;
 use crate::layout::Rect;
-use crate::style::Style;
 
 /// A `Widget` is a type that can be drawn on a [`Buffer`] in a given [`Rect`].
 ///
@@ -32,8 +29,11 @@ use crate::style::Style;
 /// you want the widget to be mutable. The mutable widget pattern is used infrequently in apps, but
 /// can be quite useful.
 ///
-/// A blanket implementation of `Widget` for `&W` where `W` implements `WidgetRef` is provided.
-/// Widget is also implemented for `&str` and `String` types.
+/// Widget is implemented for `&str`, `String`, and `&String`.
+///
+/// `Cow<B>`, `&Cow<B>`, `&Box<W>`, `&Rc<W>`, and `&Arc<W>` render the value they wrap, so they
+/// implement `Widget` whenever the wrapped type does when rendered by reference. For example,
+/// `Cow<str>`, `&Box<str>`, `&Rc<str>`, and `&Arc<Paragraph>` can all be rendered directly.
 ///
 /// # Examples
 ///
@@ -75,28 +75,6 @@ pub trait Widget {
         Self: Sized;
 }
 
-/// Renders a string slice as a widget.
-///
-/// This implementation allows a string slice (`&str`) to act as a widget, meaning it can be drawn
-/// onto a [`Buffer`] in a specified [`Rect`]. The slice represents a static string which can be
-/// rendered by reference, thereby avoiding the need for string cloning or ownership transfer when
-/// drawing the text to the screen.
-impl Widget for &str {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        buf.set_stringn(area.x, area.y, self, area.width as usize, Style::new());
-    }
-}
-
-/// Renders a `String` object as a widget.
-///
-/// This implementation enables an owned `String` to be treated as a widget, which can be rendered
-/// on a [`Buffer`] within the bounds of a given [`Rect`].
-impl Widget for String {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        buf.set_stringn(area.x, area.y, self, area.width as usize, Style::new());
-    }
-}
-
 impl<W: Widget> Widget for Option<W> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if let Some(widget) = self {
@@ -110,8 +88,6 @@ mod tests {
     use rstest::{fixture, rstest};
 
     use super::*;
-    use crate::buffer::Buffer;
-    use crate::layout::Rect;
     use crate::text::Line;
 
     #[fixture]
@@ -119,9 +95,12 @@ mod tests {
         Buffer::empty(Rect::new(0, 0, 20, 1))
     }
 
+    /// A widget that only renders by reference, so these tests don't depend on the impls for
+    /// text types.
+    #[derive(Clone)]
     struct Greeting;
 
-    impl Widget for Greeting {
+    impl Widget for &Greeting {
         fn render(self, area: Rect, buf: &mut Buffer) {
             Line::from("Hello").render(area, buf);
         }
@@ -129,46 +108,19 @@ mod tests {
 
     #[rstest]
     fn render(mut buf: Buffer) {
-        let widget = Greeting;
-        widget.render(buf.area, &mut buf);
+        (&Greeting).render(buf.area, &mut buf);
         assert_eq!(buf, Buffer::with_lines(["Hello               "]));
     }
 
     #[rstest]
-    fn render_str(mut buf: Buffer) {
-        "hello world".render(buf.area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
+    fn render_option_some(mut buf: Buffer) {
+        Some(&Greeting).render(buf.area, &mut buf);
+        assert_eq!(buf, Buffer::with_lines(["Hello               "]));
     }
 
     #[rstest]
-    fn render_str_truncate(mut buf: Buffer) {
-        let area = Rect::new(buf.area.x, buf.area.y, 11, buf.area.height);
-        "hello world, just hello".render(area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
-    }
-
-    #[rstest]
-    fn render_option_str(mut buf: Buffer) {
-        Some("hello world").render(buf.area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
-    }
-
-    #[rstest]
-    fn render_string(mut buf: Buffer) {
-        String::from("hello world").render(buf.area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
-    }
-
-    #[rstest]
-    fn render_string_truncate(mut buf: Buffer) {
-        let area = Rect::new(buf.area.x, buf.area.y, 11, buf.area.height);
-        String::from("hello world, just hello").render(area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
-    }
-
-    #[rstest]
-    fn render_option_string(mut buf: Buffer) {
-        Some(String::from("hello world")).render(buf.area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
+    fn render_option_none(mut buf: Buffer) {
+        None::<&Greeting>.render(buf.area, &mut buf);
+        assert_eq!(buf, Buffer::with_lines(["                    "]));
     }
 }

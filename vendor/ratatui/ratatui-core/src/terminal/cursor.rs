@@ -1,6 +1,6 @@
 use crate::backend::Backend;
 use crate::layout::Position;
-use crate::terminal::{Terminal, Viewport};
+use crate::terminal::{CursorVisibility, Terminal, Viewport};
 
 impl<B: Backend> Terminal<B> {
     /// Hides the cursor.
@@ -13,9 +13,9 @@ impl<B: Backend> Terminal<B> {
     /// [`Terminal::draw`]: crate::terminal::Terminal::draw
     /// [`Terminal::try_draw`]: crate::terminal::Terminal::try_draw
     pub fn hide_cursor(&mut self) -> Result<(), B::Error> {
-        if self.hidden_cursor != Some(true) {
+        if self.cursor_visibility != CursorVisibility::Hidden {
             self.backend.hide_cursor()?;
-            self.hidden_cursor = Some(true);
+            self.cursor_visibility = CursorVisibility::Hidden;
         }
         Ok(())
     }
@@ -26,13 +26,18 @@ impl<B: Backend> Terminal<B> {
     /// [`Frame::set_cursor_position`]. A later successful [`Terminal::draw`] /
     /// [`Terminal::try_draw`] call may overwrite this change.
     ///
+    /// Ratatui only sends a show sequence when it doesn't already know the cursor is visible. If
+    /// something else hides the cursor without going through Ratatui (for example a child process
+    /// run while the app is suspended, or a direct write to stdout), call this method so the
+    /// cursor is visible again before the next draw.
+    ///
     /// [`Frame::set_cursor_position`]: crate::terminal::Frame::set_cursor_position
     /// [`Terminal::draw`]: crate::terminal::Terminal::draw
     /// [`Terminal::try_draw`]: crate::terminal::Terminal::try_draw
     pub fn show_cursor(&mut self) -> Result<(), B::Error> {
-        if self.hidden_cursor != Some(false) {
+        if self.cursor_visibility != CursorVisibility::Visible {
             self.backend.show_cursor()?;
-            self.hidden_cursor = Some(false);
+            self.cursor_visibility = CursorVisibility::Visible;
         }
         Ok(())
     }
@@ -41,14 +46,20 @@ impl<B: Backend> Terminal<B> {
     ///
     /// This queries the backend for the current cursor position and returns it as an `(x, y)`
     /// tuple.
-    #[deprecated = "use `get_cursor_position()` instead which returns `Result<Position>`"]
+    #[deprecated(
+        since = "0.28.0",
+        note = "use `get_cursor_position()` instead which returns `Result<Position>`"
+    )]
     pub fn get_cursor(&mut self) -> Result<(u16, u16), B::Error> {
         let Position { x, y } = self.get_cursor_position()?;
         Ok((x, y))
     }
 
     /// Sets the cursor position.
-    #[deprecated = "use `set_cursor_position((x, y))` instead which takes `impl Into<Position>`"]
+    #[deprecated(
+        since = "0.28.0",
+        note = "use `set_cursor_position((x, y))` instead which takes `impl Into<Position>`"
+    )]
     pub fn set_cursor(&mut self, x: u16, y: u16) -> Result<(), B::Error> {
         self.set_cursor_position(Position { x, y })
     }
@@ -112,7 +123,7 @@ impl<B: Backend> Terminal<B> {
 mod tests {
     use crate::backend::{Backend, TestBackend};
     use crate::layout::Position;
-    use crate::terminal::Terminal;
+    use crate::terminal::{CursorVisibility, Terminal};
 
     #[test]
     fn hide_cursor_updates_terminal_state() {
@@ -121,7 +132,7 @@ mod tests {
 
         terminal.hide_cursor().unwrap();
 
-        assert_eq!(terminal.hidden_cursor, Some(true));
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Hidden);
         assert!(!terminal.backend().cursor_visible());
     }
 
@@ -133,7 +144,7 @@ mod tests {
         terminal.hide_cursor().unwrap();
         terminal.show_cursor().unwrap();
 
-        assert_eq!(terminal.hidden_cursor, Some(false));
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Visible);
         assert!(terminal.backend().cursor_visible());
     }
 
