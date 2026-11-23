@@ -7,7 +7,6 @@ description = """
 """
 documentation = "https://docs.rs/ratatui-core"
 readme = "README.md"
-authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
@@ -42,7 +41,8 @@ std = [
 ]
 
 ## enables layout cache; uses thread_local when std is available,
-## critical-section::Mutex otherwise (for no_std/embedded targets).
+## critical-section::Mutex otherwise (for no_std/embedded targets, which must link a
+## critical-section implementation).
 layout-cache = ["dep:critical-section"]
 
 ## enables conversions to / from colors, modifiers, and styles in the ['anstyle'] crate
@@ -57,10 +57,6 @@ portable-atomic = ["kasuari/portable-atomic"]
 ## enables the backend code that sets the underline color. Underline color is only supported by
 ## the Crossterm backend, and is not supported on Windows 7.
 underline-color = []
-
-## Use terminal scrolling regions to make some operations less prone to
-## flickering. (i.e. Terminal::insert_before).
-scrolling-regions = []
 
 ## enables serialization and deserialization of style and color types using the [`serde`] crate.
 ## This is useful if you want to save themes to a file.

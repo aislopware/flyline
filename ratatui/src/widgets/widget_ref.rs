@@ -1,9 +1,6 @@
-use alloc::string::String;
-
 use super::Widget;
 use crate::buffer::Buffer;
 use crate::layout::Rect;
-use crate::style::Style;
 
 /// A `WidgetRef` is a trait that allows rendering a widget by reference.
 ///
@@ -18,7 +15,12 @@ use crate::style::Style;
 /// is currently marked as unstable as we are still evaluating the API and may make changes in the
 /// future. See <https://github.com/ratatui/ratatui/issues/1287> for more information.
 ///
-/// A blanket implementation of `Widget` for `&W` where `W` implements `WidgetRef` is provided.
+/// A blanket implementation of `WidgetRef` for `&W` where `&W` implements `Widget` is provided, so
+/// any widget that renders by reference also implements `WidgetRef` through a reference.
+///
+/// `Cow<B>`, `Box<W>`, `Rc<W>`, and `Arc<W>` implement `WidgetRef` whenever the wrapped type
+/// implements `Widget` when rendered by reference, so `Box<str>` or `Rc<Paragraph>` can be rendered
+/// with `render_ref`.
 ///
 /// A blanket implementation of `WidgetRef` for `Option<W>` where `W` implements `WidgetRef` is
 /// provided. This is a convenience approach to make it easier to attach child widgets to parent
@@ -102,37 +104,13 @@ where
     }
 }
 
-/// Provides the ability to render a string slice by reference.
-///
-/// This trait implementation ensures that a string slice, which is an immutable view over a
-/// `String`, can be drawn on demand without requiring ownership of the string itself. It utilizes
-/// the default text style when rendering onto the provided [`Buffer`] at the position defined by
-/// [`Rect`].
-impl WidgetRef for &str {
-    fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        buf.set_stringn(area.x, area.y, self, area.width as usize, Style::new());
-    }
-}
-
-/// Provides the ability to render a `String` by reference.
-///
-/// This trait allows for a `String` to be rendered onto the [`Buffer`], similarly using the default
-/// style settings. It ensures that an owned `String` can be rendered efficiently by reference,
-/// without the need to give up ownership of the underlying text.
-impl WidgetRef for String {
-    fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        buf.set_stringn(area.x, area.y, self, area.width as usize, Style::new());
-    }
-}
-
-/// A blanket implementation of `WidgetExt` for `Option<W>` where `W` implements `WidgetRef`.
+/// A blanket implementation of `WidgetRef` for `Option<W>` where `W` implements `WidgetRef`.
 ///
 /// This is a convenience implementation that makes it easy to attach child widgets to parent
 /// widgets. It allows you to render an optional widget by reference.
 ///
 /// The internal widgets use this pattern to render the optional `Block` widgets that are included
 /// on most widgets.
-/// Blanket implementation of `WidgetExt` for `Option<W>` where `W` implements `WidgetRef`.
 ///
 /// # Examples
 ///
@@ -180,8 +158,6 @@ mod tests {
     use rstest::{fixture, rstest};
 
     use super::*;
-    use crate::buffer::Buffer;
-    use crate::layout::Rect;
     use crate::text::Line;
 
     #[fixture]
@@ -215,14 +191,14 @@ mod tests {
     }
 
     #[rstest]
-    fn render_ref_box(mut buf: Buffer) {
+    fn render_ref_box_dyn(mut buf: Buffer) {
         let widget: Box<dyn WidgetRef> = Box::new(&Greeting);
         widget.render_ref(buf.area, &mut buf);
         assert_eq!(buf, Buffer::with_lines(["Hello               "]));
     }
 
     #[rstest]
-    fn render_ref_box_vec(mut buf: Buffer) {
+    fn render_ref_box_dyn_vec(mut buf: Buffer) {
         let widgets: Vec<Box<dyn WidgetRef>> = vec![Box::new(&Greeting), Box::new(&Farewell)];
         for widget in widgets {
             widget.render_ref(buf.area, &mut buf);
@@ -242,29 +218,5 @@ mod tests {
         let widget: Option<&Greeting> = None;
         widget.render_ref(buf.area, &mut buf);
         assert_eq!(buf, Buffer::with_lines(["                    "]));
-    }
-
-    #[rstest]
-    fn render_ref_str(mut buf: Buffer) {
-        "hello world".render_ref(buf.area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
-    }
-
-    #[rstest]
-    fn render_ref_option_str(mut buf: Buffer) {
-        Some("hello world").render_ref(buf.area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
-    }
-
-    #[rstest]
-    fn render_ref_string(mut buf: Buffer) {
-        String::from("hello world").render_ref(buf.area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
-    }
-
-    #[rstest]
-    fn render_ref_option_string(mut buf: Buffer) {
-        Some(String::from("hello world")).render_ref(buf.area, &mut buf);
-        assert_eq!(buf, Buffer::with_lines(["hello world         "]));
     }
 }

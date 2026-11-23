@@ -48,6 +48,7 @@ mod cursor;
 mod frame;
 mod init;
 mod inline;
+mod insert;
 mod render;
 mod resize;
 mod viewport;
@@ -251,9 +252,9 @@ use crate::layout::{Position, Rect};
 /// computed viewport origin upward so the viewport stays fully visible.
 ///
 /// While running in inline mode, [`Terminal::insert_before`] can be used to print output above the
-/// viewport without disturbing the UI's logical position. When Ratatui is built with the
-/// `scrolling-regions` feature, `insert_before` can do this without clearing and redrawing the
-/// viewport.
+/// viewport without disturbing the UI's logical position. `insert_before` requires a backend that
+/// implements [`ScrollByRegion`], and uses terminal scrolling regions so the viewport is not
+/// cleared and redrawn.
 ///
 /// ```rust,no_run
 /// # #![allow(unexpected_cfgs)]
@@ -379,9 +380,8 @@ use crate::layout::{Position, Rect};
 /// visible. On resize, Ratatui recomputes the inline origin while trying to keep the cursor at the
 /// same relative row inside the viewport.
 ///
-/// When Ratatui is built with the `scrolling-regions` feature, [`Terminal::insert_before`] uses
-/// terminal scrolling regions to insert content above an inline viewport without clearing and
-/// redrawing it.
+/// [`Terminal::insert_before`] uses terminal scrolling regions (via [`ScrollByRegion`]) to insert
+/// content above an inline viewport without clearing and redrawing it.
 ///
 /// [Crossterm]: https://crates.io/crates/crossterm
 /// [Termion]: https://crates.io/crates/termion
@@ -389,6 +389,7 @@ use crate::layout::{Position, Rect};
 /// [`backend`]: crate::backend
 /// [`Backend`]: crate::backend::Backend
 /// [`Backend::flush`]: crate::backend::Backend::flush
+/// [`ScrollByRegion`]: crate::backend::ScrollByRegion
 /// [`Buffer`]: crate::buffer::Buffer
 /// [`ratatui::DefaultTerminal`]: https://docs.rs/ratatui/latest/ratatui/type.DefaultTerminal.html
 /// [`ratatui::init`]: https://docs.rs/ratatui/latest/ratatui/fn.init.html
@@ -414,10 +415,16 @@ where
     ///
     /// This toggles between 0 and 1 and is updated by [`Terminal::swap_buffers`].
     current: usize,
-    /// Whether Ratatui believes it has hidden the cursor.
+    /// Whether Ratatui believes the cursor is visible.
     ///
-    /// This is tracked so [`Drop`] can attempt to restore cursor visibility.
-    hidden_cursor: bool,
+    /// This is tracked so [`Terminal::apply_buffer_with_cursor`] can avoid redundantly re-showing
+    /// an already-visible cursor (which some terminals treat as a hint to re-arm the cursor
+    /// blink), and so [`Drop`] can attempt to restore cursor visibility.
+    ///
+    /// Starts at [`CursorVisibility::Unknown`] because before the first draw Ratatui does not know
+    /// the terminal's cursor visibility. It is invalidated back to `Unknown` when the backend is
+    /// mutated directly via [`Terminal::backend_mut`].
+    cursor_visibility: CursorVisibility,
     /// The configured [`Viewport`] mode.
     ///
     /// This determines how the initial viewport area is computed during construction, whether
@@ -475,8 +482,9 @@ where
     B: Backend,
 {
     fn drop(&mut self) {
-        // Attempt to restore the cursor state
-        if self.hidden_cursor {
+        // Attempt to restore the cursor unless it's known to be visible. `Unknown` counts as
+        // possibly hidden, e.g. after a frame hid the cursor and `backend_mut()` was then called.
+        if self.cursor_visibility != CursorVisibility::Visible {
             #[allow(unused_variables)]
             if let Err(err) = self.show_cursor() {
                 #[cfg(feature = "std")]
@@ -484,4 +492,23 @@ where
             }
         }
     }
+}
+
+/// The visibility state Ratatui tracks for the terminal cursor.
+///
+/// This is an internal implementation detail used by [`Terminal`] to decide when it needs to
+/// re-emit a `Show` (cursor visible) escape sequence, rather than a user-facing configuration.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
+pub(crate) enum CursorVisibility {
+    /// Ratatui does not know the cursor's current visibility.
+    ///
+    /// This is the initial state before the first draw, and it is restored when the backend is
+    /// mutated directly via [`Terminal::backend_mut`]. When a cursor position is requested while
+    /// in this state, a `Show` is emitted to be safe.
+    #[default]
+    Unknown,
+    /// The cursor was last hidden by Ratatui.
+    Hidden,
+    /// The cursor is visible; a `Show` was emitted and the backend flush succeeded.
+    Visible,
 }
