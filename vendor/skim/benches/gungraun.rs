@@ -48,14 +48,14 @@ fn frizbee_typos() -> u64 {
 #[library_benchmark]
 fn arinae() -> u64 {
     bench_matcher(
-        ArinaeMatcher::new(CaseMatching::Smart, false, false),
+        ArinaeMatcher::new(CaseMatching::Smart, false),
         black_box(load_lines()),
     )
 }
 #[library_benchmark]
 fn arinae_typos() -> u64 {
     bench_matcher(
-        ArinaeMatcher::new(CaseMatching::Smart, true, false),
+        ArinaeMatcher::new(CaseMatching::Smart, true),
         black_box(load_lines()),
     )
 }

@@ -140,7 +140,7 @@ impl FuzzyEngineBuilder {
                 Box::new(matcher)
             }
             FuzzyAlgorithm::Arinae => {
-                let matcher = ArinaeMatcher::new(self.case, !matches!(self.typos, Typos::Disabled), self.last_match);
+                let matcher = ArinaeMatcher::with_last_match(self.case, !matches!(self.typos, Typos::Disabled), self.last_match);
                 debug!("Initialized Arinae algorithm");
                 Box::new(matcher)
             }

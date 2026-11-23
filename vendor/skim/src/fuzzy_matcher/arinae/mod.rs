@@ -84,9 +84,18 @@ pub struct ArinaeMatcher {
 }
 
 impl ArinaeMatcher {
-    /// Create a new `ArinaeMatcher` with the given settings.
+    /// Create a new `ArinaeMatcher` with the given case-sensitivity and typo-tolerance settings.
+    ///
+    /// `use_last_match` defaults to `false`. Use [`ArinaeMatcher::with_last_match`] if you need
+    /// to control that parameter.
     #[must_use]
-    pub fn new(case: CaseMatching, allow_typos: bool, use_last_match: bool) -> Self {
+    pub fn new(case: CaseMatching, allow_typos: bool) -> Self {
+        Self::with_last_match(case, allow_typos, false)
+    }
+
+    /// Create a new `ArinaeMatcher` with full control over all three settings.
+    #[must_use]
+    pub fn with_last_match(case: CaseMatching, allow_typos: bool, use_last_match: bool) -> Self {
         Self {
             case,
             allow_typos,

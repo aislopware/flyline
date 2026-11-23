@@ -24,9 +24,43 @@ required-features = ["cli"]
 
 [features]
 # Default is destined to the CLI, not to library usage.
-default = ["cli", "frizbee"]
-# Everyting needed to use skim as a cli (argument parsing, shell integrations...). This should not be needed for most libraries.
-cli = ["dep:clap", "dep:clap_complete", "dep:shlex", "dep:env_logger", "dep:clap_mangen"]
+default = ["cli", "frizbee", "tui"]
+# Everything needed to use skim as a CLI (argument parsing, shell integrations...). This should not be needed for most libraries.
+cli = ["dep:clap", "dep:clap_complete", "dep:shlex", "dep:env_logger", "dep:clap_mangen", "dep:clap_complete_nushell", "dep:roff", "tui"]
+# Full TUI + runtime dependencies (ratatui, crossterm, tokio, …). Required for interactive use.
+# When disabled (e.g. with --no-default-features), only the matching-algorithm modules are compiled.
+tui = [
+    "dep:ansi-to-tui",
+    "dep:assert_enum_variants",
+    "dep:color-eyre",
+    "dep:crossterm",
+    "dep:derive_builder",
+    "dep:derive_more",
+    "dep:futures",
+    "dep:indexmap",
+    "dep:interprocess",
+    "dep:kanal",
+    "dep:mimalloc",
+    "dep:nix",
+    "dep:portable-pty",
+    "dep:ratatui",
+    "dep:regex",
+    "dep:ron",
+    "dep:serde",
+    "dep:shell-quote",
+    "dep:tempfile",
+    "dep:thiserror",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:tui-term",
+    "dep:unicode-display-width",
+    "dep:unicode-normalization",
+    "dep:which",
+]
+# Compile only the fuzzy-matching algorithms (e.g. ArinaeMatcher).
+# No TUI, no allocator override, no heavy runtime deps.
+# Use with --no-default-features: `cargo add skim --no-default-features --features algos_only`
+algos_only = []
 # Include frizbee as a matching algorithm
 frizbee = ["dep:frizbee"]
 # Enable gungraun (Valgrind-based) benchmarks
@@ -48,44 +82,44 @@ debug = true
 strip = false
 
 [dependencies]
-ansi-to-tui = "8.0.1"
-assert_enum_variants = "0.1.2"
+ansi-to-tui = { version = "8.0.1", optional = true }
+assert_enum_variants = { version = "0.1.2", optional = true }
 clap = { version = "4.6.1" , optional = true, features = ["cargo", "derive", "unstable-markdown"] }
 clap_complete = { version = "4.6.0", optional = true }
-clap_complete_nushell = "4.6.0"
+clap_complete_nushell = { version = "4.6.0", optional = true }
 clap_mangen = { version = "0.3.0", optional = true }
-color-eyre = "0.6.5"
+color-eyre = { version = "0.6.5", optional = true }
 # Crossterm's version is selected by ratatui
-crossterm = { version = ">=0.0.0", features = ["event-stream", "use-dev-tty", "libc"] }
-derive_builder = "0.20.2"
-derive_more = { version = "2.1.1", features = ["debug", "eq"] }
+crossterm = { version = ">=0.0.0", optional = true, features = ["event-stream", "use-dev-tty", "libc"] }
+derive_builder = { version = "0.20.2", optional = true }
+derive_more = { version = "2.1.1", optional = true, features = ["debug", "eq"] }
 env_logger = { version = "0.11.10", optional = true, features = ["humantime"] }
-futures = "0.3.32"
+futures = { version = "0.3.32", optional = true }
 gungraun = { version = "0.18.1", optional = true }
-indexmap = "2.13.1"
-interprocess = { version = "2.4.2", features = ["tokio"] }
-kanal = "0.1.1"
+indexmap = { version = "2.13.1", optional = true }
+interprocess = { version = "2.4.2", optional = true, features = ["tokio"] }
+kanal = { version = "0.1.1", optional = true }
 log = "0.4.29"
 memchr = "2.8.0"
-mimalloc = { version = "0.1.48", features = ["v3"] }
-nix = { version = "0.31.2", features = ["fs", "poll"] }
-portable-pty = "0.9.0"
-ratatui = "0.30.0"
-regex = "1.12.3"
-roff = "1.1.1"
-ron = "0.12.1"
-serde = { version = "1.0.228", features = ["derive"] }
-shell-quote = "0.7.2"
+mimalloc = { version = "0.1.48", optional = true, features = ["v3"] }
+nix = { version = "0.31.2", optional = true, features = ["fs", "poll"] }
+portable-pty = { version = "0.9.0", optional = true }
+ratatui = { version = "0.30.0", optional = true }
+regex = { version = "1.12.3", optional = true }
+roff = { version = "1.1.1", optional = true }
+ron = { version = "0.12.1", optional = true }
+serde = { version = "1.0.228", optional = true, features = ["derive"] }
+shell-quote = { version = "0.7.2", optional = true }
 shlex = { version = "1.3.0", optional = true }
-tempfile = "3.27.0"
-thiserror = "2.0.18"
+tempfile = { version = "3.27.0", optional = true }
+thiserror = { version = "2.0.18", optional = true }
 thread_local = "1.1.9"
-tokio = { version = "1.52.1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "tokio-macros"] }
-tokio-util = "0.7.18"
-tui-term = "0.3.4"
-unicode-display-width = "0.3.0"
-unicode-normalization = "0.1.25"
-which = "8.0.2"
+tokio = { version = "1.52.1", optional = true, features = ["macros", "net", "rt-multi-thread", "sync", "time", "tokio-macros"] }
+tokio-util = { version = "0.7.18", optional = true }
+tui-term = { version = "0.3.4", optional = true }
+unicode-display-width = { version = "0.3.0", optional = true }
+unicode-normalization = { version = "0.1.25", optional = true }
+which = { version = "8.0.2", optional = true }
 
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 frizbee = { version = "=0.9.0", optional = true }

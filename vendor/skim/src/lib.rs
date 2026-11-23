@@ -27,52 +27,81 @@
     clippy::collapsible_match
 )]
 
-#[macro_use]
+#[cfg_attr(feature = "tui", macro_use)]
 extern crate log;
 
+#[cfg(feature = "tui")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::any::Any;
+#[cfg(feature = "tui")]
 use std::borrow::Cow;
+#[cfg(feature = "tui")]
 use std::fmt::Display;
+#[cfg(feature = "tui")]
 use std::process::Command;
+#[cfg(feature = "tui")]
 use std::sync::Arc;
 
 use crate::fuzzy_matcher::MatchIndices;
+#[cfg(feature = "tui")]
 use ratatui::{
     style::Style,
     text::{Line, Span},
 };
 
+#[cfg(feature = "tui")]
 pub use crate::engine::fuzzy::FuzzyAlgorithm;
+#[cfg(feature = "tui")]
 pub use crate::item::RankCriteria;
+#[cfg(feature = "tui")]
 pub use crate::options::SkimOptions;
+#[cfg(feature = "tui")]
 pub use crate::output::SkimOutput;
+#[cfg(feature = "tui")]
 pub use crate::skim::*;
+#[cfg(feature = "tui")]
 pub use crate::skim_item::SkimItem;
+#[cfg(feature = "tui")]
 use crate::tui::Size;
+#[cfg(feature = "tui")]
 pub use util::printf;
 
+#[cfg(feature = "tui")]
 pub mod binds;
+#[cfg(feature = "tui")]
 mod engine;
+#[cfg(feature = "tui")]
 pub mod field;
 pub mod fuzzy_matcher;
+#[cfg(feature = "tui")]
 pub mod helper;
+#[cfg(feature = "tui")]
 pub mod item;
+#[cfg(feature = "tui")]
 pub mod matcher;
+#[cfg(feature = "tui")]
 pub mod options;
+#[cfg(feature = "tui")]
 mod output;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "tui"))]
 pub mod popup;
+#[cfg(feature = "tui")]
 pub mod prelude;
+#[cfg(feature = "tui")]
 pub mod reader;
+#[cfg(feature = "tui")]
 mod skim;
+#[cfg(feature = "tui")]
 mod skim_item;
 pub mod spinlock;
+#[cfg(feature = "tui")]
 pub mod theme;
 pub mod thread_pool;
+#[cfg(feature = "tui")]
 pub mod tui;
+#[cfg(feature = "tui")]
 mod util;
 
 #[cfg(feature = "cli")]
@@ -80,18 +109,18 @@ pub mod manpage;
 #[cfg(feature = "cli")]
 pub mod shell;
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "tui"))]
 const SKIM_DEFAULT_COMMAND: &str = "find .";
-#[cfg(windows)]
+#[cfg(all(windows, feature = "tui"))]
 const SKIM_DEFAULT_COMMAND: &str = "dir /s /b /A:-D";
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "tui"))]
 fn shell_cmd(cmd: &str) -> Command {
     let mut c = Command::new("sh");
     c.arg("-c").arg(cmd);
     c
 }
-#[cfg(windows)]
+#[cfg(all(windows, feature = "tui"))]
 fn shell_cmd(cmd: &str) -> Command {
     use std::os::windows::process::CommandExt as _;
     // `cmd.exe` does not parse its command line using MSVC rules, so the default
@@ -126,6 +155,8 @@ impl<T: Any> AsAny for T {
 // Display Context
 #[derive(Default, Debug, Clone)]
 /// Represents how a query matches an item
+///
+/// Available without the `tui` feature — contains no heavy dependencies.
 pub enum Matches {
     /// No matches
     #[default]
@@ -138,6 +169,7 @@ pub enum Matches {
     ByteRange(usize, usize),
 }
 
+#[cfg(feature = "tui")]
 #[derive(Default, Clone)]
 /// Context information for displaying an item
 pub struct DisplayContext {
@@ -153,6 +185,7 @@ pub struct DisplayContext {
     pub matched_style: Style,
 }
 
+#[cfg(feature = "tui")]
 impl DisplayContext {
     /// Converts the context and text into a styled `Line` with highlighted matches
     ///
@@ -253,6 +286,7 @@ pub struct PreviewContext<'a> {
 //------------------------------------------------------------------------------
 // Preview
 
+#[cfg(feature = "tui")]
 /// Position and scroll information for preview display
 #[derive(Default, Copy, Clone, Debug)]
 pub struct PreviewPosition {
@@ -266,6 +300,7 @@ pub struct PreviewPosition {
     pub v_offset: Size,
 }
 
+#[cfg(feature = "tui")]
 /// Defines how an item should be previewed
 pub enum ItemPreview {
     /// execute the command and print the command's output
@@ -383,12 +418,14 @@ impl MatchResult {
     }
 }
 
+#[cfg(feature = "tui")]
 /// A matching engine that can match queries against items
 pub trait MatchEngine: Sync + Send + Display {
     /// Matches an item against the query, returning a result if matched
     fn match_item(&self, item: &dyn SkimItem) -> Option<MatchResult>;
 }
 
+#[cfg(feature = "tui")]
 /// Factory for creating match engines
 pub trait MatchEngineFactory {
     /// Creates a match engine with explicit case sensitivity
@@ -399,6 +436,7 @@ pub trait MatchEngineFactory {
     }
 }
 
+#[cfg(feature = "tui")]
 impl MatchEngineFactory for Box<dyn MatchEngineFactory> {
     fn create_engine_with_case(&self, query: &str, case: CaseMatching) -> Box<dyn MatchEngine> {
         (**self).create_engine_with_case(query, case)
@@ -408,14 +446,17 @@ impl MatchEngineFactory for Box<dyn MatchEngineFactory> {
 //------------------------------------------------------------------------------
 // Preselection
 
+#[cfg(feature = "tui")]
 /// A selector that determines whether an item should be "pre-selected" in multi-selection mode
 pub trait Selector {
     /// Returns true if the item at the given index should be pre-selected
     fn should_select(&self, index: usize, item: &dyn SkimItem) -> bool;
 }
 
+#[cfg(feature = "tui")]
 //------------------------------------------------------------------------------
 /// Sender for streaming items to skim
 pub type SkimItemSender = kanal::Sender<Vec<Arc<dyn SkimItem>>>;
+#[cfg(feature = "tui")]
 /// Receiver for streaming items to skim
 pub type SkimItemReceiver = kanal::Receiver<Vec<Arc<dyn SkimItem>>>;
