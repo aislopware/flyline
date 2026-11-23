@@ -126,6 +126,10 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 - **Supported platforms**: Linux (x86_64 and aarch64; glibc 2.34+ or musl), macOS on Apple silicon (11+) and Android aarch64 (Termux), with bash 4.4 or newer. Builds for Intel macOS, 32-bit, FreeBSD, RISC-V, PowerPC and bash older than 4.4 are no longer published; build from source if you need one.
 - **Emoji rendering**: Text after an emoji with a variation selector (such as ❤️) is no longer dropped when the line is redrawn.
 - **Up-to-date foundations**: Built with Rust 1.100 on the latest ratatui, termina and skim, with dependencies refreshed and audited.
+
+## v2.0.1 (2026-11-23)
+- **Zero-size terminals**: A terminal that reports a 0x0 size (such as a freshly spawned pty) no longer makes flyline exit the shell; it assumes 80x24.
+- **History path on macOS**: The help and guide now give the JSONL history path on macOS, `~/Library/Application Support/flyline/history.jsonl`.
 "#;
 
 pub(crate) fn pretty_changelog() -> String {
