@@ -1,0 +1,7 @@
+# One toolchain for CI, Docker, release builds and every machine. A drifting
+# `stable` means local clippy and CI clippy disagree, and a release can fail on
+# a lint nobody saw locally. Bump this deliberately, with the code-quality gate
+# run on the new version. The MSRV is `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
