@@ -1,22 +1,14 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-
 version: 2
-
 updates:
-  # Rust (Cargo)
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 5
     commit-message:
-      prefix: "cargo"
+      prefix: "chore(deps)"
     labels:
       - "dependencies"
-      - "ci"
     groups:
       cargo-minor-and-patch:
         patterns:
@@ -24,18 +16,22 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # termina still requires parking_lot ^0.12, so 0.13 would link two copies
+      # of the lock crates and raise the MSRV to 1.95; see the parking_lot line
+      # in Cargo.toml.
+      - dependency-name: "parking_lot"
+        versions: [">=0.13"]
 
-  # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 5
     commit-message:
-      prefix: "gha"
+      prefix: "ci"
     labels:
       - "dependencies"
-      - "ci"
     groups:
       gha-minor-and-patch:
         patterns:
@@ -44,21 +40,18 @@ updates:
           - "minor"
           - "patch"
 
-  # Docker
   - package-ecosystem: "docker"
-    directory: "docker/"
+    directory: "/docker"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 1
+    open-pull-requests-limit: 5
     commit-message:
-      prefix: "docker"
+      prefix: "chore(deps)"
     labels:
       - "dependencies"
-      - "ci"
-    groups:
-      docker-minor-and-patch:
-        patterns:
-          - "*"
-        update-types:
-          - "minor"
-          - "patch"
+    ignore:
+      # Every Ubuntu tag is chosen on purpose and explained in its Dockerfile:
+      # 16.04 is the glibc 2.23 floor the release library targets, 22.04 is
+      # the older-LTS install test, and the bash-version images need a GCC
+      # that still compiles bash 3.2/4.4. Bump them by hand.
+      - dependency-name: "ubuntu"
