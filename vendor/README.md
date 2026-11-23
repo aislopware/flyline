@@ -6,8 +6,8 @@ update them itself.
 
 | Directory | Upstream | Base commit | flyline's changes |
 |---|---|---|---|
-| `ratatui/` | [ratatui/ratatui](https://github.com/ratatui/ratatui) `main` | `e665c36cb1` (241 commits behind; see below) | Inline viewport: resizable, no cursor-position query, absolute positions for mouse events, synchronized output, autowrap off, erase-instead-of-space for reflow, wide-character cursor tracking, no redraw sequences when nothing changed (HalFrgrd/ratatui `inline_viewport_improvments`, 30 commits) |
-| `termina/` | [helix-editor/termina](https://github.com/helix-editor/termina) `master` | `7be7389f` (v0.4.0) | SGR mouse reports, text pixel size and OSC 52 responses, a long-lived event reader that keeps unread stdin, Ghostty DA2 deadlock fix, raw device attributes, kitty base-layout key (HalFrgrd/termina, 13 commits; two are upstream PRs #31 and #32) |
+| `ratatui/` | [ratatui/ratatui](https://github.com/ratatui/ratatui) `main` | `5a28bec1` | An inline viewport positioned relative to its top row: cursor tracked in memory and never queried, resizable height, `viewport_top` for mapping mouse rows, synchronized output, autowrap off while drawing, erase instead of spaces, cells hidden behind wide glyphs skipped, no redundant cursor show/hide (HalFrgrd/ratatui `inline_viewport_improvments`, merged with upstream; see below) |
+| `termina/` | [helix-editor/termina](https://github.com/helix-editor/termina) `master` | `7be7389f` (v0.4.0) | Raw device-attribute responses and no parser deadlock on DA2/DA3 or unhandled CSI (upstream PR #32), OSC 52 replies as `Paste`, the kitty base-layout key, `PlatformTerminal::with_reader` (upstream PR #31), an event buffer that keeps arrival order, and `TCSANOW` so typed-ahead input survives entering raw mode |
 | `skim/` | [skim-rs/skim](https://github.com/skim-rs/skim) `master` | `2160abbd` (5.9.0) | A `tui` feature, so `default-features = false, features = ["algos_only"]` builds only the matchers, without the TUI and runtime stack (HalFrgrd/skim, 1 commit) |
 
 Each directory is a `git subtree --squash`. It holds upstream's tree at the
@@ -33,15 +33,22 @@ git subtree pull --prefix vendor/ratatui https://github.com/ratatui/ratatui.git 
 2. Run `cargo update -w`, then the checks in AGENTS.md and the Docker bash integration tests.
 3. Update the base commit in the table above.
 
-## ratatui is behind upstream
+## How ratatui differs from upstream
 
-Upstream has since rewritten the same inline-viewport code: `set_viewport_height`
-(#1964), horizontal-shrink fixes (#2670, #2731), cursor fixes (#2694, #2752,
-#2807), and scrolling regions split into their own trait (#2121, breaking). A
-`git subtree pull` conflicts in 19 files (43 hunks), mostly in
-`ratatui-core/src/terminal/`. Merge it on its own branch, adopting upstream's
-inline resizing where it covers flyline's needs. Then test resizing, wide
-characters, mouse positions and the bash integration suite before it ships.
+Upstream positions an inline viewport in absolute screen coordinates and asks
+the terminal for the cursor position. flyline's fork tracks the cursor relative
+to the viewport's top row and never queries it, which avoids racing bash for
+the terminal's replies. Where upstream rewrote the same code, the fork's
+behaviour stays:
+
+- `set_viewport_height`, inline resize and inline `clear` keep the fork's
+  versions. Upstream's `Terminal::with_cursor_position` and `insert_before`
+  are not included, since both need absolute coordinates.
+- `backend_mut()` does not reset the tracked cursor visibility. flyline calls it
+  every frame, and re-showing the cursor each frame restarts its blink.
+
+When pulling upstream again, expect conflicts in `ratatui-core/src/terminal/`
+and in the backends' `draw` functions, and resolve them the same way.
 
 ## Change a fork
 
