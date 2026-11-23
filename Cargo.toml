@@ -4,6 +4,12 @@ members = [
     "crates/flycontent",
 ]
 
+[workspace.package]
+edition = "2024"
+# MSRV, set by the dependency tree (skim needs 1.91). CI checks it in the msrv
+# job of code-quality.yml; everything else builds with rust-toolchain.toml.
+rust-version = "1.91"
+
 [workspace.dependencies]
 flybuffer = { path = "crates/flybuffer" }
 flycontent = { path = "crates/flycontent" }
@@ -39,7 +45,9 @@ multiple_crate_versions = { level = "allow", priority = 1 }
 [package]
 name = "flyline"
 version = "1.11.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true
