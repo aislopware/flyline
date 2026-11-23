@@ -675,7 +675,7 @@ impl HistoryManager {
 
     /// Refreshes history entries incrementally from the active backend.
     ///
-    /// When using `HistoryBackend::Flyline`, queries ~/.local/share/flyline/history.jsonl.
+    /// When using `HistoryBackend::Flyline`, queries the JSONL file (see `default_jsonl_path`).
     pub fn refresh_jsonl_backend(&mut self) {
         let path = self.ensure_jsonl_repopulated_if_needed();
         let prev_offset = self.last_jsonl_read_offset.clone();

@@ -206,14 +206,16 @@ impl Terminal for UnixTerminal {
                 size.cols = cols;
             }
         }
-        if size.cols == 0 || size.rows == 0 {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "cannot read non-zero cols/rows from ioctl or COLUMNS/LINES environment variables",
-            ))
-        } else {
-            Ok(size)
+        // Some ptys (a freshly spawned one whose size was never set, for example) report 0x0
+        // with no LINES/COLUMNS either. Assume the classic 80x24 rather than failing: a line
+        // editor that cannot start leaves the shell with no way to read a command.
+        if size.cols == 0 {
+            size.cols = 80;
         }
+        if size.rows == 0 {
+            size.rows = 24;
+        }
+        Ok(size)
     }
 
     fn event_reader(&self) -> EventReader {
