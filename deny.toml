@@ -1,0 +1,50 @@
+# `cargo deny check` runs in .github/workflows/supply-chain.yml. Every target
+# triple is in the graph, so Linux-, Android- and macOS-only crates are all
+# checked.
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # chrono is unmaintained (no fix exists). flyline's prompt `\D{format}`
+    # strings and `flyline` time formatting are chrono strftime by contract,
+    # and flycomp (build script) uses it too, so swapping to jiff or time is
+    # its own change. Not a vulnerability.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration tracked separately" },
+]
+
+[licenses]
+# Exactly the licences the dependency tree needs; cargo-deny warns when one
+# stops being used. Crates offering a choice (MIT OR Apache-2.0, …) are
+# satisfied by one of these, so their other options need no entry.
+allow = [
+    "Apache-2.0",
+    "BSL-1.0",     # ryu
+    "MIT",
+    "MPL-2.0",     # termina, option-ext (dirs)
+    "Unicode-3.0", # unicode-ident
+    "Zlib",        # foldhash
+]
+
+[licenses.private]
+# flyline and flycontent are `publish = false`; their licence is in
+# LICENSE-MIT / LICENSE-GPLv3 and the README, not a crates.io field.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies (flybuffer, flycontent) carry no version.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The patched ratatui/termina and the skim/ansi-to-tui/flycomp forks have no
+# crates.io release carrying flyline's changes. Nothing else may come from git.
+allow-git = [
+    "https://github.com/HalFrgrd/ansi-to-tui.git",
+    "https://github.com/HalFrgrd/flycomp.git",
+    "https://github.com/HalFrgrd/ratatui.git",
+    "https://github.com/HalFrgrd/skim",
+    "https://github.com/HalFrgrd/termina.git",
+]
