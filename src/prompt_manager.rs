@@ -258,11 +258,11 @@ struct PromptStringBuilder<'a> {
     /// Used during `expand_prompt_string` to recognise which spans contain
     /// time placeholders and convert them into [`PromptSegment::DynamicTime`].
     time_map: HashMap<String, String>,
-    /// Pre-processed animations.  Used by [`expand_span_to_segments`] to
+    /// Pre-processed animations.  Used by [`PromptStringBuilder::expand_span_to_segments`] to
     /// recognise animation-name placeholders and produce
     /// [`PromptSegment::Animation`] segments in the same pass.
     animations: Vec<ProcessedAnimation>,
-    /// Raw prompt widget definitions.  Used by [`expand_span_to_segments`] to
+    /// Raw prompt widget definitions.  Used by [`PromptStringBuilder::expand_span_to_segments`] to
     /// recognise widget-name placeholders and produce the appropriate
     /// `PromptSegment::Widget*` segments.  Each occurrence of a widget name in
     /// the prompt text produces a fully independent segment (and, for custom
@@ -405,12 +405,12 @@ impl<'a> PromptStringBuilder<'a> {
     /// [`PromptSegment`]s.
     ///
     /// The pipeline is:
-    /// 1. [`extract_time_codes`] — replace bash time escape sequences with
+    /// 1. [`PromptStringBuilder::extract_time_codes`] — replace bash time escape sequences with
     ///    unique placeholders, recording the mapping in `self.time_map`.
     /// 2. [`expand_prompt_through_bash`] — run the modified string through
     ///    bash's `decode_prompt_string` and parse ANSI colour codes into
     ///    `Line<'static>` values.
-    /// 3. [`expand_span_to_segments`] — split each decoded span at
+    /// 3. [`PromptStringBuilder::expand_span_to_segments`] — split each decoded span at
     ///    time-placeholder boundaries, producing `Static` or `DynamicTime`
     ///    segments.
     ///
@@ -977,7 +977,7 @@ fn split_into_spans(path: &str, style: ratatui::style::Style, result: &mut Vec<S
 /// This is the common conversion used whenever a custom widget command
 /// completes successfully: the raw stdout string is passed through
 /// [`expand_prompt_through_bash`] and each resulting span is wrapped in a
-/// [`TaggedSpan`] with [`Tag::Ps1Prompt`].
+/// [`TaggedSpan`] with [`Tag::Prompt`].
 fn stdout_to_tagged_spans(stdout: String) -> Vec<TaggedSpan<'static>> {
     stdout_to_tagged_spans_with_tag(stdout, Tag::Prompt)
 }
@@ -1254,7 +1254,7 @@ fn spawn_widget_child(command: &[String]) -> Result<std::process::Child, WidgetF
 }
 
 /// Read remaining output from a child that has already exited (after
-/// [`try_wait`] returned `Some(status)`) and build the final [`WidgetCustomState`].
+/// `try_wait` returned `Some(status)`) and build the final [`WidgetCustomState`].
 ///
 /// The exit `status` must come from the `try_wait` call so that we do not call
 /// `wait` a second time (which would fail because the zombie has already been

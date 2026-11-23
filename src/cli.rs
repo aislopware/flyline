@@ -1,3 +1,11 @@
+// The doc comments in this module are clap's `--help` text, which README.md mirrors, so they
+// use placeholders like <KEY> and bare URLs rather than rustdoc markup.
+#![allow(
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags
+)]
+
 #[cfg(not(test))]
 macro_rules! return_usage_error {
     ($($arg:tt)*) => {{

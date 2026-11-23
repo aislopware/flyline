@@ -35,11 +35,11 @@ cargo fmt
 # Run Code Quality CI checks locally
 cargo fmt -- --check
 cargo clippy --workspace --all-features -- -D warnings
-cargo doc --workspace --no-deps --document-private-items
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 ```
 
 > [!TIP]
-> Avoid running the full `cargo test` suite locally. The integration tests (`tests/docker_integration_tests.rs`) spawn Docker containers testing multiple versions of Bash, which is extremely slow. Prefer running `cargo test --lib` or testing specific packages. Before pushing, verify code quality with `cargo fmt -- --check`, `cargo clippy --workspace --all-features -- -D warnings`, and `cargo doc --workspace --no-deps --document-private-items`.
+> Avoid running the full `cargo test` suite locally. The integration tests (`tests/docker_integration_tests.rs`) spawn Docker containers testing multiple versions of Bash, which is extremely slow. Prefer running `cargo test --lib` or testing specific packages. Before pushing, verify code quality with `cargo fmt -- --check`, `cargo clippy --workspace --all-features -- -D warnings`, and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`.
 
 ## Guidelines
 1. **Safety & Stability**: `flyline` runs inside the active shell process. Avoid unwinding panics across the C FFI boundary; wrap entry points in `catch_unwind_safe` to prevent shell crashes. Never create an `App` instance in library unit tests, as `App` depends on global FFI symbols (like `history_list` or `current_readline_prompt`) that are only resolved dynamically when loaded inside Bash, causing linker failures in library test targets.
