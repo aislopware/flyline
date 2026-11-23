@@ -234,7 +234,7 @@ bitflags::bitflags! {
     ///
     /// Terminals vary in which modifiers they report. Treat these flags as the state Termina
     /// observed, not as proof that every unlisted physical modifier was inactive.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Modifiers: u8 {
         /// No modifier keys were active.
         const NONE = 0;
