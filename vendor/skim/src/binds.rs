@@ -3,16 +3,126 @@
 //! This module provides utilities for parsing and managing keyboard shortcuts
 //! and their associated actions in skim.
 
-use std::{
-    collections::HashMap,
-    ops::{Deref, DerefMut},
-};
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 
-use color_eyre::Result;
-use color_eyre::eyre::eyre;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use eyre::{Result, eyre};
 
-use crate::tui::event::{self, Action};
+use crate::tui::actions::{self, Action};
+
+/// Synthetic events that skim fires internally and that can be bound to actions
+/// via the keymap, exactly like a real key press.
+///
+/// The keymap is keyed by crossterm's [`KeyEvent`], which cannot express
+/// "the query changed" or "reading finished" directly. Each variant is
+/// therefore represented *transparently* as a reserved function-key code in the
+/// high-`F` range (`F(248)`–`F(255)`) that no real terminal ever emits.
+/// Giving these reserved codes named variants keeps them in one place instead
+/// of scattering magic function-key literals across the codebase, and lets
+/// [`parse_key`] accept every friendly event name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SkimEvent {
+    /// Fired once, when skim has started up and entered its event loop.
+    Start,
+    /// Fired when the reader finishes producing items (once per read; a
+    /// `reload` starts a new read and fires it again).
+    Load,
+    /// Fired whenever the query changes.
+    Change,
+    /// Fired when filtering for the current query completes and the result
+    /// list is ready.
+    Result,
+    /// Fired when the focused item changes (cursor movement or a result update).
+    Focus,
+    /// Fired when a completed search yields no matches.
+    Zero,
+    /// Fired when a completed search yields exactly one match.
+    One,
+    /// Fired after two left mouse-button presses no more than 500 ms apart.
+    DoubleClick,
+}
+
+impl SkimEvent {
+    /// The reserved [`KeyCode`] used to route this event through the keymap.
+    #[must_use]
+    pub const fn key_code(self) -> KeyCode {
+        match self {
+            SkimEvent::Change => KeyCode::F(255),
+            SkimEvent::Start => KeyCode::F(254),
+            SkimEvent::Load => KeyCode::F(253),
+            SkimEvent::Result => KeyCode::F(252),
+            SkimEvent::Focus => KeyCode::F(251),
+            SkimEvent::Zero => KeyCode::F(250),
+            SkimEvent::One => KeyCode::F(249),
+            SkimEvent::DoubleClick => KeyCode::F(248),
+        }
+    }
+
+    /// The reserved [`KeyEvent`] used to route this event through the keymap.
+    #[must_use]
+    pub const fn key_event(self) -> KeyEvent {
+        KeyEvent::new(self.key_code(), KeyModifiers::NONE)
+    }
+
+    /// Parses an event name (`start`, `load`, `change`) into a [`SkimEvent`].
+    ///
+    /// Returns `None` if the name is not a recognised event.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "start" => Some(SkimEvent::Start),
+            "load" => Some(SkimEvent::Load),
+            "change" => Some(SkimEvent::Change),
+            "result" => Some(SkimEvent::Result),
+            "focus" => Some(SkimEvent::Focus),
+            "zero" => Some(SkimEvent::Zero),
+            "one" => Some(SkimEvent::One),
+            "double-click" => Some(SkimEvent::DoubleClick),
+            _ => None,
+        }
+    }
+
+    /// The event's name, as accepted by [`Self::from_name`].
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            SkimEvent::Start => "start",
+            SkimEvent::Load => "load",
+            SkimEvent::Change => "change",
+            SkimEvent::Result => "result",
+            SkimEvent::Focus => "focus",
+            SkimEvent::Zero => "zero",
+            SkimEvent::One => "one",
+            SkimEvent::DoubleClick => "double-click",
+        }
+    }
+
+    /// Reverse of [`Self::key_code`]: the event carried by a reserved key code.
+    ///
+    /// Returns `None` for real keys, so callers can tell a key press from a
+    /// synthetic event routed through the keymap.
+    #[must_use]
+    pub const fn from_key_code(code: KeyCode) -> Option<Self> {
+        match code {
+            KeyCode::F(255) => Some(SkimEvent::Change),
+            KeyCode::F(254) => Some(SkimEvent::Start),
+            KeyCode::F(253) => Some(SkimEvent::Load),
+            KeyCode::F(252) => Some(SkimEvent::Result),
+            KeyCode::F(251) => Some(SkimEvent::Focus),
+            KeyCode::F(250) => Some(SkimEvent::Zero),
+            KeyCode::F(249) => Some(SkimEvent::One),
+            KeyCode::F(248) => Some(SkimEvent::DoubleClick),
+            _ => None,
+        }
+    }
+}
+
+impl From<SkimEvent> for KeyEvent {
+    fn from(event: SkimEvent) -> Self {
+        event.key_event()
+    }
+}
 
 /// A map of key events to their associated actions
 #[derive(Clone, Debug)]
@@ -33,7 +143,7 @@ impl DerefMut for KeyMap {
 
 impl From<&str> for KeyMap {
     fn from(value: &str) -> Self {
-        parse_keymaps(value.split(','))
+        parse_keymaps(split_top_level(value, ',').into_iter())
     }
 }
 
@@ -44,6 +154,11 @@ impl Default for KeyMap {
 }
 
 impl KeyMap {
+    /// Adds keymaps from a comma-separated string.
+    pub(crate) fn add_keymaps_str(&mut self, source: &str) {
+        self.add_keymaps(split_top_level(source, ',').into_iter());
+    }
+
     /// Adds keymaps from the source, parsing them using `parse_keymap`
     pub fn add_keymaps<'a, T>(&mut self, source: T)
     where
@@ -88,6 +203,7 @@ pub fn get_default_key_map() -> KeyMap {
     ret.insert(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), vec![Action::BackwardChar]);
     ret.insert(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), vec![Action::ForwardChar]);
     ret.insert(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), vec![Action::BackwardDeleteChar]);
+    ret.insert(SkimEvent::DoubleClick.key_event(), vec![Action::Accept(None)]);
 
 
     ret.insert(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), vec![Action::BackwardWord]);
@@ -133,14 +249,20 @@ pub fn get_default_key_map() -> KeyMap {
     KeyMap(ret)
 }
 
-/// Parses a key str into a crossterm `KeyEvent`
+/// Parses a key str into a crossterm `KeyEvent`.
+///
+/// In addition to keyboard names, accepts all names recognized by
+/// [`SkimEvent::from_name`], including `change`, `start`, and `double-click`.
 ///
 /// # Errors
 /// Returns an error if the key string is empty, contains an unknown modifier,
-/// or does not correspond to a recognised key name.
+/// does not correspond to a recognised key name, or its shifted form needs multiple characters.
 pub fn parse_key(key: &str) -> Result<KeyEvent> {
     if key.is_empty() {
         return Err(eyre!("Cannot parse empty key"));
+    }
+    if let Some(event) = SkimEvent::from_name(key) {
+        return Ok(event.key_event());
     }
     let parts = key.split('-').collect::<Vec<&str>>();
     let mut mods = KeyModifiers::NONE;
@@ -159,16 +281,26 @@ pub fn parse_key(key: &str) -> Result<KeyEvent> {
     let key = parts.last().unwrap_or(&"").to_string();
 
     let keycode: KeyCode;
-    if key.len() == 1 {
-        let char = key.chars().next().unwrap_or_default();
+    if key.chars().count() == 1 {
+        let mut char = key.chars().next().unwrap_or_default();
+        if mods.contains(KeyModifiers::SHIFT) && !char.is_ascii() {
+            let mut uppercase = char.to_uppercase();
+            char = uppercase.next().unwrap_or(char);
+            if uppercase.next().is_some() {
+                return Err(eyre!("Shifted key {key} needs multiple characters"));
+            }
+        }
         if char.is_uppercase() {
             mods |= KeyModifiers::SHIFT;
             keycode = KeyCode::Char(char.to_ascii_lowercase());
         } else {
             keycode = KeyCode::Char(char);
         }
-    } else if let Some(f) = key.strip_prefix('f') {
-        let f_index = f.parse::<u8>()?;
+    } else if let Some(f) = key.strip_prefix('f')
+        && let Ok(f_index) = f.parse::<u8>()
+    {
+        // A function key like `f10`. If the suffix isn't numeric (e.g. `focus`,
+        // `first`), fall through to the named-key / event matching below.
         keycode = KeyCode::F(f_index);
     } else {
         keycode = match key.as_str() {
@@ -185,15 +317,85 @@ pub fn parse_key(key: &str) -> Result<KeyEvent> {
             "home" => KeyCode::Home,
             "end" => KeyCode::End,
             "pgup" => KeyCode::PageUp,
-            "pgdown" => KeyCode::PageDown,
-            "change" => KeyCode::F(255),
-            s => return Err(eyre!("Unknown key {}", s)),
+            "pgdown" | "pgdn" => KeyCode::PageDown,
+            "del" | "delete" => KeyCode::Delete,
+            s => match SkimEvent::from_name(s) {
+                Some(event) => event.key_code(),
+                None => return Err(eyre!("Unknown key {}", s)),
+            },
         }
     }
 
     debug!("parsed key {keycode:?} and mods {mods:?}");
 
     Ok(KeyEvent::new(keycode, mods))
+}
+
+/// Formats a key event as an fzf-style name (`ctrl-a`, `alt-b`, `shift-tab`,
+/// `up`, `f1`, `space`).
+///
+/// Synthetic `SkimEvent`s are named after the event (see
+/// [`SkimEvent::from_key_code`]). This is the value exported as
+/// `SKIM_KEY`/`FZF_KEY` to child processes.
+#[must_use]
+pub fn key_name(key: &KeyEvent) -> String {
+    if let Some(event) = SkimEvent::from_key_code(key.code) {
+        return event.name().to_string();
+    }
+
+    // Crossterm can report back-tab with every modifier set; that is still shift-tab.
+    if key.code == KeyCode::BackTab && key.modifiers == KeyModifiers::all() {
+        return "shift-tab".to_string();
+    }
+
+    let mut name = String::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        name.push_str("ctrl-");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        name.push_str("alt-");
+    }
+    // `BackTab` already means shift-tab, so don't double it up.
+    if key.modifiers.contains(KeyModifiers::SHIFT) && !matches!(key.code, KeyCode::Char(_) | KeyCode::BackTab) {
+        name.push_str("shift-");
+    }
+
+    let body = match key.code {
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(c) => {
+            // `parse_key` folds a shift into an upper-case letter, so reproduce
+            // that; a shift on a non-letter keeps the explicit prefix.
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                if c.is_ascii_alphabetic() {
+                    c.to_ascii_uppercase().to_string()
+                } else {
+                    name.push_str("shift-");
+                    c.to_string()
+                }
+            } else {
+                c.to_string()
+            }
+        }
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "shift-tab".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "page-up".to_string(),
+        KeyCode::PageDown => "page-down".to_string(),
+        KeyCode::Insert => "insert".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::F(n) => format!("f{n}"),
+        other => format!("{other:?}").to_lowercase(),
+    };
+    name.push_str(&body);
+    name
 }
 
 /// Parse an iterator of keymaps into a `KeyMap`
@@ -206,13 +408,90 @@ where
     res
 }
 
+pub(crate) fn split_top_level(value: &str, separator: char) -> Vec<&str> {
+    let mut depth = 0_u32;
+    let mut start = 0;
+    let mut parts = Vec::new();
+
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if ch == separator && depth == 0 => {
+                parts.push(&value[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// Parses follow-up action bindings from raw `--bind` specs.
+///
+/// Any action can be bound as if it were an event: when the "key" of a bind is
+/// not a real key but is a known action name, the bound chain becomes a
+/// *follow-up* that runs right after that action. For example `reload:first`
+/// queues `first` immediately after a `reload`. The returned map is keyed by the
+/// action's canonical name (see [`Action::name`](crate::tui::actions::Action::name)),
+/// so it can be looked up directly from the action that just ran.
+///
+/// Keys take precedence: if the "key" resolves to a real key it is left to the
+/// key map, so a name shared by a key and an action (e.g. `up`) always binds the
+/// key. To target the action in that case, prefix it with `act-` (`act-up`).
+#[must_use]
+pub fn parse_action_binds<'a, T>(maps: T) -> HashMap<String, Vec<Action>>
+where
+    T: Iterator<Item = &'a str>,
+{
+    let mut res = HashMap::new();
+    for map in maps {
+        let Some((key, chain)) = map.split_once(':') else {
+            continue;
+        };
+        // Keys win: anything that parses as a real key is not an action trigger.
+        if parse_key(key).is_ok() {
+            continue;
+        }
+        let Some(name) = action_trigger_name(key) else {
+            debug!("Ignoring bind `{map}`: `{key}` is neither a key nor an action");
+            continue;
+        };
+        match parse_action_chain(chain) {
+            Ok(actions) => {
+                res.insert(name.to_string(), actions);
+            }
+            Err(err) => debug!("Ignoring bind `{map}`: invalid action chain `{chain}`: {err}"),
+        }
+    }
+    res
+}
+
+/// Resolves a bind trigger to the canonical name of the action it targets
+/// (see [`Action::name`](crate::tui::actions::Action::name)). `act-<name>`
+/// explicitly targets the action `<name>`, even when `<name>` is also a key;
+/// without the prefix, a bare action name works too. Returns `None` if the
+/// name is not a known action.
+///
+/// This performs pure name resolution: callers that want "keys win" semantics
+/// (e.g. [`parse_action_binds`]) must check [`parse_key`] first.
+pub(crate) fn action_trigger_name(trigger: &str) -> Option<&'static str> {
+    let action_name = trigger.strip_prefix("act-").unwrap_or(trigger);
+    // Some actions require an argument when executed, but their canonical
+    // name is still valid as a trigger. `()` supplies the parser's empty
+    // placeholder solely for name validation.
+    let action = actions::parse_action(action_name).or_else(|| actions::parse_action(&format!("{action_name}()")))?;
+    Some(action.name())
+}
+
 /// Parses an action chain, separated by '+'s into the corresponding actions
 ///
 /// # Errors
 /// Returns an error if the action chain is empty or contains only unknown actions.
 pub fn parse_action_chain(action_chain: &str) -> Result<Vec<Action>> {
     let mut actions: Vec<Action> = vec![];
-    let mut split = action_chain.split('+');
+    let mut split = split_top_level(action_chain, '+').into_iter();
 
     while let Some(mut s) = split.next().map(String::from) {
         if (s.starts_with("if-") || s.ends_with('{'))
@@ -220,7 +499,7 @@ pub fn parse_action_chain(action_chain: &str) -> Result<Vec<Action>> {
         {
             s += &(String::from("+") + otherwise);
         }
-        if let Some(act) = event::parse_action(&s) {
+        if let Some(act) = actions::parse_action(&s) {
             actions.push(act);
         }
     }
@@ -249,135 +528,5 @@ pub fn parse_keymap(key_action: &str) -> Result<(&str, Vec<Action>)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use event::Action::*;
-    #[test]
-    fn test_parse_action_chain() {
-        let parsed = parse_action_chain(
-            "execute-silent:1 {}+execute-silent:2 {+}+execute-silent:3 {+n}+reload+if-query-empty:reload+up",
-        );
-        assert!(parsed.is_ok());
-        let res = parsed.unwrap();
-        assert_eq!(
-            res,
-            vec![
-                ExecuteSilent("1 {}".into()),
-                ExecuteSilent("2 {+}".into()),
-                ExecuteSilent("3 {+n}".into()),
-                Reload(None),
-                IfQueryEmpty("reload".into(), Some("up".into())),
-            ]
-        );
-    }
-    #[test]
-    fn test_parse_key() {
-        assert_eq!(
-            parse_key("a").unwrap(),
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())
-        );
-
-        assert_eq!(
-            parse_key("A").unwrap(),
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT)
-        );
-
-        assert_eq!(
-            parse_key("alt-a").unwrap(),
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)
-        );
-
-        assert_eq!(
-            parse_key("alt-A").unwrap(),
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT | KeyModifiers::SHIFT)
-        );
-        assert_eq!(
-            parse_key("alt-shift-a").unwrap(),
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT | KeyModifiers::SHIFT)
-        );
-
-        assert_eq!(
-            parse_key("ctrl-a").unwrap(),
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)
-        );
-
-        assert_eq!(
-            parse_key("ctrl-A").unwrap(),
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-        );
-        assert_eq!(
-            parse_key("ctrl-shift-a").unwrap(),
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-        );
-
-        assert_eq!(
-            parse_key("f10").unwrap(),
-            KeyEvent::new(KeyCode::F(10), KeyModifiers::empty())
-        );
-
-        assert_eq!(
-            parse_key("space").unwrap(),
-            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("enter").unwrap(),
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("bspace").unwrap(),
-            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("bs").unwrap(),
-            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("up").unwrap(),
-            KeyEvent::new(KeyCode::Up, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("down").unwrap(),
-            KeyEvent::new(KeyCode::Down, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("left").unwrap(),
-            KeyEvent::new(KeyCode::Left, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("right").unwrap(),
-            KeyEvent::new(KeyCode::Right, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("tab").unwrap(),
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("btab").unwrap(),
-            KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("esc").unwrap(),
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("home").unwrap(),
-            KeyEvent::new(KeyCode::Home, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("end").unwrap(),
-            KeyEvent::new(KeyCode::End, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("pgup").unwrap(),
-            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("pgdown").unwrap(),
-            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty())
-        );
-        assert_eq!(
-            parse_key("change").unwrap(),
-            KeyEvent::new(KeyCode::F(255), KeyModifiers::empty())
-        );
-    }
-}
+#[path = "binds_tests.rs"]
+mod tests;

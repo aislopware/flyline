@@ -1,21 +1,26 @@
 use ansi_to_tui::IntoText;
-use color_eyre::eyre::{Result, eyre};
+use eyre::{Result, eyre};
 use portable_pty::{PtyPair, PtySize, native_pty_system};
-use ratatui::{
-    layout::Alignment,
-    prelude::Backend,
-    style::Stylize,
-    text::{Line, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Widget},
-};
-use tui_term::vt100;
-use tui_term::widget::PseudoTerminal;
+use ratatui::layout::Alignment;
+use ratatui::prelude::Backend;
+use ratatui::style::Stylize;
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+#[cfg(feature = "image")]
+use ratatui_image::picker::Picker;
+#[cfg(feature = "image")]
+use ratatui_image::protocol::Protocol as ImageProtocol;
 
-use std::sync::mpsc;
-use std::sync::{Arc, RwLock};
+use std::env;
+use std::io::{self, Cursor, Read, Write};
+use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
-use std::{env, io::Read};
+use std::time::{Duration, Instant};
 
+use super::preview_terminal::PreviewTerminal;
+use super::statusline::spinner_char;
 use super::util::{find_csi_end, find_osc_end, handle_csi_query, handle_osc_query};
 use super::widget::{SkimRender, SkimWidget};
 use super::{BorderType, Direction, Event, Tui};
@@ -25,15 +30,170 @@ use crate::{SkimItem, SkimOptions};
 
 // PreviewCallback for ratatui - returns Vec<String> instead of AnsiString
 pub type PreviewCallbackFn = dyn Fn(Vec<Arc<dyn SkimItem>>) -> Vec<String> + Send + Sync + 'static;
+type StreamingCallbackFn = dyn Fn(Option<Arc<dyn SkimItem>>, Vec<Arc<dyn SkimItem>>, Box<dyn Write + Send>) -> Result<()>
+    + Send
+    + Sync
+    + 'static;
+
+struct PreviewWriter(mpsc::SyncSender<Vec<u8>>);
+
+impl Write for PreviewWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let len = bytes.len().min(8192);
+        if len > 0 {
+            self.0
+                .send(bytes[..len].to_vec())
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        }
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PreviewReader {
+    receiver: mpsc::Receiver<Vec<u8>>,
+    pending: Cursor<Vec<u8>>,
+    cancelled: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl Read for PreviewReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        while !self.cancelled.load(Ordering::Acquire) {
+            let len = self.pending.read(bytes)?;
+            if len > 0 {
+                return Ok(len);
+            }
+            match self.receiver.recv_timeout(Duration::from_millis(16)) {
+                Ok(chunk) => self.pending = Cursor::new(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(0)
+    }
+}
+
+fn callback_reader(
+    callback: Arc<StreamingCallbackFn>,
+    items: Vec<Arc<dyn SkimItem>>,
+    current: Option<Arc<dyn SkimItem>>,
+    cancelled: Arc<AtomicBool>,
+) -> PreviewReader {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let error = Arc::new(Mutex::new(None));
+    let callback_error = error.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = callback(current, items, Box::new(PreviewWriter(sender.clone()))) {
+            *callback_error.lock().unwrap() = Some(format!("Preview failed: {error:#}"));
+        }
+        // Keep the channel open until the callback result is available.
+        drop(sender);
+    });
+    PreviewReader {
+        receiver,
+        pending: Cursor::new(Vec::new()),
+        cancelled,
+        error,
+    }
+}
 const PREVIEW_MAX_BYTES: usize = 1024 * 1024;
 const VT_SCROLLBACK: usize = 100_000;
+type PlainChild = Arc<Mutex<Option<Child>>>;
 
-/// Preview content can be either parsed text or a terminal screen
+fn read_bounded(mut reader: impl Read) -> Vec<u8> {
+    read_bounded_with_updates(&mut reader, |_| {})
+}
+
+fn read_bounded_with_updates(reader: impl Read, update: impl FnMut(&[u8])) -> Vec<u8> {
+    read_bounded_with_interval(reader, Duration::from_millis(16), update)
+}
+
+fn read_bounded_with_interval(mut reader: impl Read, interval: Duration, mut update: impl FnMut(&[u8])) -> Vec<u8> {
+    let mut output = Vec::with_capacity(PREVIEW_MAX_BYTES);
+    let mut buffer = [0; 8192];
+    let mut last_update = None;
+    let mut published_len = 0;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let retained = PREVIEW_MAX_BYTES.saturating_sub(output.len()).min(read);
+                output.extend_from_slice(&buffer[..retained]);
+
+                let update_due = last_update.is_none_or(|last: Instant| last.elapsed() >= interval);
+                if retained > 0 && (update_due || output.len() == PREVIEW_MAX_BYTES) {
+                    update(&output);
+                    published_len = output.len();
+                    last_update = Some(Instant::now());
+                }
+            }
+        }
+    }
+    if output.len() != published_len {
+        update(&output);
+    }
+    output
+}
+
+fn update_plain_content(content: &RwLock<PreviewContent>, cancelled: &AtomicBool, output: &[u8]) {
+    let Ok(text) = output.to_vec().into_text() else {
+        return;
+    };
+    if let Ok(mut content) = content.write()
+        && !cancelled.load(Ordering::Acquire)
+    {
+        *content = PreviewContent::Text(text);
+    }
+}
+
+fn terminate_plain_child(child: &PlainChild) {
+    let Ok(mut guard) = child.lock() else {
+        return;
+    };
+    let Some(child) = guard.as_mut() else {
+        return;
+    };
+
+    #[cfg(unix)]
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        let _ = killpg(Pid::from_raw(process_group), Signal::SIGKILL);
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    let _ = child.kill();
+}
+
+/// Preview content options
 pub(crate) enum PreviewContent {
     /// Simple text content (for non-PTY previews and callbacks)
     Text(Text<'static>),
     /// Terminal screen (for PTY previews with cursor positioning)
-    Terminal(Arc<RwLock<vt100::Parser>>),
+    Terminal(Arc<RwLock<PreviewTerminal>>),
+    /// Image
+    #[cfg(feature = "image")]
+    Image {
+        source: image::DynamicImage,
+        protocol: Option<ImageProtocol>,
+        size: ratatui::layout::Size,
+    },
 }
 
 impl Default for PreviewContent {
@@ -46,6 +206,48 @@ impl Default for PreviewContent {
 #[derive(Clone)]
 pub struct PreviewCallback {
     inner: Arc<PreviewCallbackFn>,
+    streaming: Arc<StreamingCallbackFn>,
+}
+
+impl PreviewCallback {
+    /// Create a callback that writes preview bytes from a worker thread.
+    ///
+    /// Output is interpreted as ANSI text as it arrives, or as terminal output
+    /// when `preview_window.pty` is enabled. Terminal mode starts with New Line Mode
+    /// enabled, so `\n` also resets the column; write `ESC[20l` to disable it.
+    /// In text mode, only the first 1 MiB is retained; terminal mode uses bounded
+    /// scrollback instead. The writer
+    /// returns `BrokenPipe` when the preview is cancelled. Wrap it in `BufWriter`
+    /// if needed; flush the buffer to publish output before the callback ends.
+    /// The first argument is the item under the cursor, independent of the
+    /// selected items. It is `None` when the list is empty. Calls through `Deref`
+    /// also pass `None`, since no cursor is available, and wait for complete output.
+    /// Return `Ok(())` on success. On failure, the error replaces the preview output.
+    /// Errors from cancelled previews are discarded.
+    pub fn streaming<F>(func: F) -> Self
+    where
+        F: Fn(Option<Arc<dyn SkimItem>>, Vec<Arc<dyn SkimItem>>, Box<dyn Write + Send>) -> Result<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let streaming: Arc<StreamingCallbackFn> = Arc::new(func);
+        let callback = streaming.clone();
+        Self {
+            inner: Arc::new(move |items| {
+                let reader = callback_reader(callback.clone(), items, None, Arc::new(AtomicBool::new(false)));
+                let error = reader.error.clone();
+                let output = read_bounded(reader);
+                if let Ok(mut lock) = error.lock()
+                    && let Some(msg) = lock.take()
+                {
+                    return vec![msg];
+                }
+                vec![String::from_utf8_lossy(&output).into_owned()]
+            }),
+            streaming,
+        }
+    }
 }
 
 impl<F> From<F> for PreviewCallback
@@ -53,7 +255,15 @@ where
     F: Fn(Vec<Arc<dyn SkimItem>>) -> Vec<String> + Send + Sync + 'static,
 {
     fn from(func: F) -> Self {
-        Self { inner: Arc::new(func) }
+        let inner: Arc<PreviewCallbackFn> = Arc::new(func);
+        let callback = inner.clone();
+        Self {
+            inner,
+            streaming: Arc::new(move |_, items, mut writer| {
+                writer.write_all(callback(items).join("\n").as_bytes())?;
+                Ok(())
+            }),
+        }
     }
 }
 
@@ -70,11 +280,13 @@ pub struct Preview {
     pub cmd: String,
     pub rows: u16,
     pub cols: u16,
-    pub scroll_y: u16,
-    pub scroll_x: u16,
+    pub scroll_y: usize,
+    pub scroll_x: usize,
     pub thread_handle: Option<JoinHandle<()>>,
     /// Channel to signal thread interruption
     interrupt_tx: Option<mpsc::Sender<()>>,
+    plain_child: Option<PlainChild>,
+    plain_cancelled: Option<Arc<AtomicBool>>,
     pub theme: Arc<ColorTheme>,
     /// Border type
     pub border: BorderType,
@@ -82,29 +294,69 @@ pub struct Preview {
     pub wrap: bool,
     pty: Option<PtyPair>,
     pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    pub total_lines: u16,
+    #[cfg(feature = "image")]
+    image: bool,
+    #[cfg(feature = "image")]
+    image_picker: Option<Picker>,
+    pub total_lines: usize,
+    loading: bool,
+    spinner_start: Instant,
 }
 
 impl Default for Preview {
     fn default() -> Self {
-        Self::_default()
+        Self::default_inner()
     }
 }
 
 impl Preview {
+    #[cfg(feature = "image")]
+    fn image_protocol(
+        picker: Option<&Picker>,
+        source: image::DynamicImage,
+        size: ratatui::layout::Size,
+    ) -> std::result::Result<ImageProtocol, ratatui_image::errors::Errors> {
+        let fallback;
+        let picker = if let Some(picker) = picker {
+            picker
+        } else {
+            fallback = Picker::halfblocks();
+            &fallback
+        };
+
+        let font_size = picker.font_size();
+        let max_pixel_width = u128::from(size.width) * u128::from(font_size.width);
+        let max_pixel_height = u128::from(size.height) * u128::from(font_size.height);
+        let image_width = u128::from(source.width());
+        let image_height = u128::from(source.height());
+
+        let size = if image_height * max_pixel_width <= max_pixel_height * image_width {
+            let pixel_height = image_height * max_pixel_width / image_width;
+            let height = pixel_height.div_ceil(u128::from(font_size.height));
+
+            ratatui::layout::Size::new(size.width, u16::try_from(height).unwrap_or(u16::MAX).max(1))
+        } else {
+            let pixel_width = image_width * max_pixel_height / image_height;
+            let width = pixel_width.div_ceil(u128::from(font_size.width));
+
+            ratatui::layout::Size::new(u16::try_from(width).unwrap_or(u16::MAX).max(1), size.height)
+        };
+
+        picker.new_protocol(source, size, ratatui_image::Resize::Scale(None))
+    }
+
+    #[cfg(feature = "image")]
+    pub(crate) fn set_image_picker(&mut self, picker: Option<Picker>) {
+        self.image_picker = picker;
+    }
+
     /// Convert a Size value to an actual offset based on preview dimensions
-    fn size_to_offset(&self, size: super::Size, is_vertical: bool) -> u16 {
+    fn size_to_offset(&self, size: super::Size, is_vertical: bool) -> usize {
+        let dimension = if is_vertical { self.rows } else { self.cols };
         match size {
-            super::Size::Fixed(n) => n,
-            super::Size::Percent(p) => {
-                let dimension = if is_vertical { self.rows } else { self.cols };
-                // Result is at most dimension (a u16), so truncation cannot occur.
-                u16::try_from(u32::from(dimension) * u32::from(p) / 100).unwrap_or(u16::MAX)
-            }
-            super::Size::Neg(n) => {
-                let dimension = if is_vertical { self.rows } else { self.cols };
-                dimension.saturating_sub(n)
-            }
+            super::Size::Fixed(n) => usize::from(n),
+            super::Size::Percent(p) => usize::from(dimension) * usize::from(p) / 100,
+            super::Size::Neg(n) => usize::from(dimension.saturating_sub(n)),
         }
     }
 
@@ -166,14 +418,24 @@ impl Preview {
 
     pub fn content(&mut self, content: &[u8]) -> Result<()> {
         let text = content.to_owned().into_text()?;
+        self.kill();
         let Ok(mut content) = self.content.write() else {
-            return Err(color_eyre::eyre::eyre!("Failed to acquire content for writing"));
+            return Err(eyre::eyre!("Failed to acquire content for writing"));
         };
-        self.total_lines = text.lines.len().try_into().unwrap();
+        self.total_lines = text.lines.len();
         *content = PreviewContent::Text(text);
         self.scroll_y = 0;
         self.scroll_x = 0;
+        self.loading = false;
         Ok(())
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub(crate) fn mark_ready(&mut self) {
+        self.loading = false;
     }
 
     pub fn content_with_position(&mut self, content: &[u8], position: crate::PreviewPosition) -> Result<()> {
@@ -190,7 +452,7 @@ impl Preview {
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
-        self.scroll_y = self.scroll_y.saturating_sub(lines);
+        self.scroll_y = self.scroll_y.saturating_sub(usize::from(lines));
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
@@ -199,26 +461,26 @@ impl Preview {
             self.total_lines, self.rows
         );
         if self.total_lines > 0 {
-            self.scroll_y = self
-                .scroll_y
-                .saturating_add(lines)
-                .min(self.total_lines.saturating_sub(self.rows.saturating_sub(1)));
+            self.scroll_y = self.scroll_y.saturating_add(usize::from(lines)).min(
+                self.total_lines
+                    .saturating_sub(usize::from(self.rows.saturating_sub(1))),
+            );
         } else {
             // We might not have the actual total_lines value
-            self.scroll_y = self.scroll_y.saturating_add(lines);
+            self.scroll_y = self.scroll_y.saturating_add(usize::from(lines));
         }
     }
 
     pub fn scroll_left(&mut self, cols: u16) {
-        self.scroll_x = self.scroll_x.saturating_sub(cols);
+        self.scroll_x = self.scroll_x.saturating_sub(usize::from(cols));
     }
 
     pub fn scroll_right(&mut self, cols: u16) {
-        self.scroll_x = self.scroll_x.saturating_add(cols);
+        self.scroll_x = self.scroll_x.saturating_add(usize::from(cols));
     }
 
     pub fn set_offset(&mut self, offset: u16) {
-        self.scroll_y = offset.saturating_sub(1); // -1 because line numbers are 1-indexed
+        self.scroll_y = usize::from(offset.saturating_sub(1)); // -1 because line numbers are 1-indexed
     }
 
     pub fn page_up(&mut self) {
@@ -232,8 +494,17 @@ impl Preview {
     }
     /// Kill the preview child process and interrupt the reader thread.
     pub fn kill(&mut self) {
+        if let Some(cancelled) = self.plain_cancelled.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+
         if let Some(tx) = self.interrupt_tx.take() {
             let _ = tx.send(());
+        }
+
+        if let Some(child) = self.plain_child.take() {
+            trace!("killing plain preview child process group");
+            terminate_plain_child(&child);
         }
 
         if let Some(mut child) = self.pty_child.take() {
@@ -256,13 +527,83 @@ impl Preview {
         }
     }
 
+    pub(crate) fn spawn_callback<B: Backend>(
+        &mut self,
+        tui: &mut Tui<B>,
+        callback: &PreviewCallback,
+        pty: bool,
+        items: Vec<Arc<dyn SkimItem>>,
+        current: Option<Arc<dyn SkimItem>>,
+    ) where
+        B::Error: Send + Sync + 'static,
+    {
+        self.kill();
+        self.scroll_y = 0;
+        self.scroll_x = 0;
+        self.loading = true;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.plain_cancelled = Some(cancelled.clone());
+        let mut reader = callback_reader(callback.streaming.clone(), items, current, cancelled.clone());
+        let error = reader.error.clone();
+        let content = self.content.clone();
+        let parser = pty.then(|| {
+            let cols = if self.wrap { self.cols.max(1) } else { 1024 };
+            let mut parser = PreviewTerminal::new(self.rows, cols, VT_SCROLLBACK);
+            parser.process(b"\x1b[20h");
+            let parser = Arc::new(RwLock::new(parser));
+            if let Ok(mut content) = content.write() {
+                *content = PreviewContent::Terminal(parser.clone());
+            }
+            parser
+        });
+        let event_tx = tui.event_tx.clone();
+        self.thread_handle = Some(std::thread::spawn(move || {
+            if let Some(parser) = parser {
+                let mut buffer = [0; 8192];
+                while let Ok(size) = reader.read(&mut buffer) {
+                    if size == 0 || cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Ok(mut parser) = parser.write() {
+                        parser.process(&buffer[..size]);
+                    }
+                }
+                if let Ok(mut parser) = parser.write() {
+                    parser.finish();
+                }
+            } else {
+                let output = read_bounded_with_interval(reader, Duration::ZERO, |output| {
+                    update_plain_content(&content, &cancelled, output);
+                });
+                if output.is_empty() {
+                    update_plain_content(&content, &cancelled, &output);
+                }
+            }
+            if !cancelled.load(Ordering::Acquire) {
+                if let Some(error) = error.lock().unwrap().take()
+                    && let Ok(mut content) = content.write()
+                {
+                    *content = PreviewContent::Text(Text::raw(error));
+                }
+                let _ = event_tx.blocking_send(Event::PreviewReady);
+            }
+        }));
+    }
+
     #[allow(clippy::too_many_lines)]
-    pub fn spawn<B: Backend>(&mut self, tui: &mut Tui<B>, cmd: &str) -> Result<()>
+    pub fn spawn<B: Backend>(
+        &mut self,
+        tui: &mut Tui<B>,
+        cmd: &str,
+        env: &[(String, String)],
+        unset: &[String],
+    ) -> Result<()>
     where
         B::Error: Send + Sync + 'static,
     {
         self.kill();
         self.cmd = cmd.to_string();
+        self.loading = true;
 
         // Reset scroll position and manual_scroll flag for new preview
         self.scroll_y = 0;
@@ -271,9 +612,42 @@ impl Preview {
         let event_tx_clone = tui.event_tx.clone();
         let content = self.content.clone();
 
+        #[cfg(feature = "image")]
+        if self.image {
+            let cmd = self.cmd.clone();
+
+            let (interrupt_tx, interrupt_rx) = mpsc::channel();
+            self.interrupt_tx = Some(interrupt_tx);
+
+            self.thread_handle = Some(std::thread::spawn(move || {
+                let res: PreviewContent;
+                if let Ok(Ok(decoded)) = image::ImageReader::open(&cmd).map(image::ImageReader::decode) {
+                    res = PreviewContent::Image {
+                        source: decoded,
+                        protocol: None,
+                        size: ratatui::layout::Size::default(),
+                    };
+                } else {
+                    res = PreviewContent::Text(Text::raw(format!("Failed to open {cmd} as image")));
+                }
+
+                if interrupt_rx.try_recv().is_ok() {
+                    trace!("interrupt signal received, exiting");
+                    return;
+                }
+
+                if let Ok(mut c) = content.write() {
+                    *c = res;
+                    let _ = event_tx_clone.blocking_send(Event::PreviewReady);
+                }
+            }));
+
+            return Ok(());
+        }
+
         if let Some(pty) = self.pty.take() {
             // Ensure the PTY has the correct display dimensions before spawning.
-            // init_pty() creates PTYs with 1024 cols for non-wrap mode (for the vt100 parser's
+            // init_pty() creates PTYs with 1024 cols for non-wrap mode (for the terminal's
             // horizontal scrolling), but the child process needs to see the actual display size.
             // render() only resizes when the area changes, so if spawn() is called twice at the
             // same area size, the second PTY would still have 1024 cols.
@@ -296,6 +670,12 @@ impl Preview {
             shell_cmd.env("ROWS", self.rows.to_string());
             shell_cmd.env("COLUMNS", self.cols.to_string());
             shell_cmd.env("PAGER", "");
+            for name in unset {
+                shell_cmd.env_remove(name);
+            }
+            for (key, value) in env {
+                shell_cmd.env(key, value);
+            }
             shell_cmd.arg("-c");
             if let Ok(cwd) = env::current_dir() {
                 shell_cmd.cwd(cwd);
@@ -320,9 +700,9 @@ impl Preview {
             let (interrupt_tx, interrupt_rx) = mpsc::channel();
             self.interrupt_tx = Some(interrupt_tx);
 
-            // Create vt100 parser for PTY output with large scrollback buffer
+            // Create avt terminal for PTY output with bounded scrollback
             let cols = if self.wrap { self.cols } else { 1024 };
-            let parser = Arc::new(RwLock::new(vt100::Parser::new(self.rows, cols, VT_SCROLLBACK)));
+            let parser = Arc::new(RwLock::new(PreviewTerminal::new(self.rows, cols, VT_SCROLLBACK)));
 
             // Update content to use the parser
             if let Ok(mut c) = content.write() {
@@ -356,7 +736,6 @@ impl Preview {
 
                             if let Ok(mut parser_guard) = parser.write() {
                                 parser_guard.process(&filtered);
-                                parser_guard.screen_mut().set_scrollback(VT_SCROLLBACK);
                             }
 
                             // Clear the processed portion of the buffer
@@ -375,54 +754,211 @@ impl Preview {
                     }
                 }
 
+                if let Ok(mut parser) = parser.write() {
+                    parser.finish();
+                }
+
+                // Last check, I promise
+                if interrupt_rx.try_recv().is_ok() {
+                    trace!("interrupt signal received, exiting");
+                    return;
+                }
+
                 trace!("read complete");
                 let _ = event_tx_clone.blocking_send(Event::PreviewReady);
             }));
         } else {
             trace!("spawning preview cmd {cmd}");
             let mut shell_cmd = crate::shell_cmd(cmd);
+            crate::tui::util::apply_child_env(&mut shell_cmd, env, unset);
             shell_cmd
                 .env("ROWS", self.rows.to_string())
                 .env("COLUMNS", self.cols.to_string())
-                .env("PAGER", "");
+                .env("PAGER", "")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             if let Ok(cwd) = env::current_dir() {
                 shell_cmd.current_dir(cwd);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                shell_cmd.process_group(0);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt as _;
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                shell_cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
             }
 
             let (interrupt_tx, interrupt_rx) = mpsc::channel();
             self.interrupt_tx = Some(interrupt_tx);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.plain_cancelled = Some(cancelled.clone());
+
+            let mut child = match shell_cmd.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    log::info!("Shell cmd in error: {error:?}");
+                    let _ = event_tx_clone.blocking_send(Event::PreviewReady);
+                    return Ok(());
+                }
+            };
+            let stdout = child.stdout.take().expect("stdout was configured as piped");
+            let stderr = child.stderr.take().expect("stderr was configured as piped");
+            let child = Arc::new(Mutex::new(Some(child)));
+            self.plain_child = Some(child.clone());
 
             self.thread_handle = Some(std::thread::spawn(move || {
-                if interrupt_rx.try_recv().is_ok() {
-                    return;
-                }
+                let streaming_content = content.clone();
+                let streaming_cancelled = cancelled.clone();
+                let stdout_reader = std::thread::spawn(move || {
+                    read_bounded_with_updates(stdout, |output| {
+                        update_plain_content(&streaming_content, &streaming_cancelled, output);
+                    })
+                });
+                let stderr_reader = std::thread::spawn(move || read_bounded(stderr));
 
-                let try_out = shell_cmd.output();
-                if try_out.is_err() {
-                    println!("Shell cmd in error: {try_out:?}");
-                    return;
-                }
-
-                let mut out = try_out.unwrap();
-
-                if interrupt_rx.try_recv().is_ok() {
-                    return;
-                }
-
-                if let Ok(mut c) = content.write() {
-                    if out.status.success() {
-                        out.stdout.resize(PREVIEW_MAX_BYTES.min(out.stdout.len()), 0);
-                        *c = PreviewContent::Text(out.stdout.into_text().unwrap_or_default());
-                    } else {
-                        *c = PreviewContent::Text(out.stderr.clone().into_text().unwrap_or_default());
+                let status = loop {
+                    match interrupt_rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            terminate_plain_child(&child);
+                            break None;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
+
+                    let wait_result = match child.lock() {
+                        Ok(mut guard) => guard.as_mut().map(Child::try_wait),
+                        Err(_) => break None,
+                    };
+                    match wait_result {
+                        Some(Ok(Some(status))) => break Some(status),
+                        Some(Ok(None)) => {}
+                        Some(Err(error)) => {
+                            log::info!("Failed to wait for preview command: {error:?}");
+                            break None;
+                        }
+                        None => break None,
+                    }
+                };
+
+                // A shell can exit while a background descendant still owns the pipes.
+                // Terminate the whole process group before joining the drain threads.
+                terminate_plain_child(&child);
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                if let Ok(mut guard) = child.lock()
+                    && let Some(mut child) = guard.take()
+                    && status.is_none()
+                {
+                    let _ = child.wait();
                 }
 
-                trace!("sending ready ping");
-                let _ = event_tx_clone.blocking_send(Event::PreviewReady);
+                let Some(status) = status else {
+                    return;
+                };
+                if let Ok(mut c) = content.write()
+                    && !cancelled.load(Ordering::Acquire)
+                {
+                    let output = if status.success() { stdout } else { stderr };
+                    *c = PreviewContent::Text(output.into_text().unwrap_or_default());
+                }
+
+                if !cancelled.load(Ordering::Acquire) {
+                    trace!("sending ready ping");
+                    let _ = event_tx_clone.blocking_send(Event::PreviewReady);
+                }
             }));
         }
         Ok(())
+    }
+
+    fn render_text(
+        &self,
+        mut outer: Block,
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::prelude::Buffer,
+        text: &Text,
+    ) -> usize {
+        // Calculate total lines in content
+        let total_lines = text.lines.len();
+
+        // Ratatui terminal coordinates are u16. Saturate previews that exceed that range.
+        let scroll_y = u16::try_from(self.scroll_y).unwrap_or(u16::MAX);
+        let scroll_x = u16::try_from(self.scroll_x).unwrap_or(u16::MAX);
+        let mut paragraph = Paragraph::new(text.clone()).scroll((scroll_y, scroll_x));
+
+        // Enable wrapping if wrap is true
+        if self.wrap {
+            paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
+        }
+
+        // Add scroll position indicator at top-right if scrolled
+        if self.scroll_y > 0 && total_lines > 0 {
+            let current_line = self.scroll_y.saturating_add(1); // Display line numbers are 1-indexed.
+            let title = format!("{current_line}/{total_lines}");
+
+            outer = outer.title_top(Line::from(title).alignment(Alignment::Right).reversed());
+        }
+
+        paragraph = paragraph.block(outer);
+        paragraph.render(area, buf);
+        total_lines
+    }
+
+    fn render_pty(
+        &self,
+        mut outer: Block,
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::prelude::Buffer,
+        parser: &RwLock<PreviewTerminal>,
+    ) -> usize {
+        let Ok(terminal) = parser.try_read() else {
+            return self.total_lines;
+        };
+        let total_lines = terminal.total_lines();
+        if self.scroll_y > 0 && total_lines > 0 {
+            let title = format!("{}/{}", self.scroll_y + 1, total_lines);
+            outer = outer.title_top(Line::from(title).alignment(Alignment::Right).reversed());
+        }
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        terminal.render(inner, buf, self.scroll_y, self.scroll_x);
+        total_lines
+    }
+    #[cfg(feature = "image")]
+    fn render_image(
+        &self,
+        mut outer: Block,
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::prelude::Buffer,
+        source: &image::DynamicImage,
+        protocol: &mut Option<ImageProtocol>,
+        size: &mut ratatui::layout::Size,
+    ) {
+        let title = format!("{}x{}", source.width(), source.height());
+        outer = outer.title_top(Line::from(title).alignment(Alignment::Right).reversed());
+
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+        let image_size = ratatui::layout::Size::new(inner.width, inner.height);
+        if image_size.width > 0 && image_size.height > 0 && (protocol.is_none() || *size != image_size) {
+            match Self::image_protocol(self.image_picker.as_ref(), source.clone(), image_size) {
+                Ok(new_protocol) => {
+                    *protocol = Some(new_protocol);
+                    *size = image_size;
+                }
+                Err(err) => {
+                    warn!("failed to render image preview: {err:?}");
+                }
+            }
+        }
+        if let Some(protocol) = protocol {
+            let image = ratatui_image::Image::new(protocol).allow_clipping(true);
+            image.render(inner, buf);
+        }
     }
 }
 
@@ -452,9 +988,17 @@ impl SkimWidget for Preview {
             scroll_x: 0,
             thread_handle: None,
             interrupt_tx: None,
+            plain_child: None,
+            plain_cancelled: None,
             pty: None,
             pty_child: None,
+            #[cfg(feature = "image")]
+            image: options.image.is_some(),
+            #[cfg(feature = "image")]
+            image_picker: options.image_picker.clone(),
             total_lines: 0,
+            loading: false,
+            spinner_start: Instant::now(),
         };
         #[cfg(target_os = "linux")]
         if options.preview_window.pty {
@@ -475,7 +1019,7 @@ impl SkimWidget for Preview {
                 })
             });
         }
-        let Ok(content) = self.content.try_read() else {
+        let Ok(mut content) = self.content.try_write() else {
             return SkimRender::default();
         };
 
@@ -495,77 +1039,27 @@ impl SkimWidget for Preview {
         }
 
         Clear.render(area, buf);
+        let spinner_area = block.inner(area);
 
-        match &*content {
-            PreviewContent::Text(text) => {
-                // Calculate total lines in content
-                self.total_lines = text.lines.len().try_into().unwrap();
-
-                // Create paragraph with optional block
-                let mut paragraph = Paragraph::new(text.clone()).scroll((self.scroll_y, self.scroll_x));
-
-                // Enable wrapping if wrap is true
-                if self.wrap {
-                    paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
-                }
-
-                // Add scroll position indicator at top-right if scrolled
-                if self.scroll_y > 0 && self.total_lines > 0 {
-                    let current_line = (self.scroll_y + 1) as usize; // +1 because scroll_y is 0-indexed but we want 1-indexed display
-                    let title = format!("{}/{}", current_line, self.total_lines);
-
-                    block = block.title_top(Line::from(title).alignment(Alignment::Right).reversed());
-                }
-
-                paragraph = paragraph.block(block);
-                paragraph.render(area, buf);
+        match &mut *content {
+            PreviewContent::Text(text) => self.total_lines = self.render_text(block, area, buf, text),
+            PreviewContent::Terminal(parser) => self.total_lines = self.render_pty(block, area, buf, parser.as_ref()),
+            #[cfg(feature = "image")]
+            PreviewContent::Image { source, protocol, size } => {
+                self.render_image(block, area, buf, source, protocol, size);
             }
-            PreviewContent::Terminal(parser) => {
-                // For terminal content, manipulate scrollback to implement scrolling
-                if let Ok(mut parser_guard) = parser.try_write() {
-                    let scrollback_len = parser_guard.screen().scrollback();
-                    // Reset scrollback to its full size first
-                    parser_guard.screen_mut().set_scrollback(VT_SCROLLBACK);
-                    // If the scrollback is not empty, we seem to be off by one
-                    self.total_lines = (scrollback_len.saturating_sub(1)
-                        + parser_guard.screen().contents().lines().count())
-                    .try_into()
-                    .unwrap();
-                    if self.scroll_y > 0 {
-                        trace!("scrolling in vt buffer: {}/{}", self.scroll_y, self.total_lines);
-                        // Reduce scrollback by scroll_y to show earlier content
-                        parser_guard
-                            .screen_mut()
-                            .set_scrollback(scrollback_len.saturating_sub(self.scroll_y.into()));
-                    }
-                }
+        }
 
-                // Render using PseudoTerminal widget for proper terminal emulation
-                if let Ok(parser_guard) = parser.try_read() {
-                    let screen = parser_guard.screen();
-
-                    // Add scroll position indicator if scrolled
-                    if self.scroll_y > 0 && self.total_lines > 0 {
-                        let title = format!("{}/{}", self.scroll_y + 1, self.total_lines);
-                        block = block.title_top(Line::from(title).alignment(Alignment::Right).reversed());
-                    }
-
-                    // Use PseudoTerminal widget to render the vt100 screen
-                    let pseudo_term = PseudoTerminal::new(screen)
-                        .cursor(tui_term::widget::Cursor::default().visibility(false))
-                        .block(block);
-                    pseudo_term.render(area, buf);
-                }
-
-                // Reset scrollback after rendering
-                if self.scroll_y > 0
-                    && let Ok(mut parser_guard) = parser.try_write()
-                {
-                    parser_guard.screen_mut().set_scrollback(VT_SCROLLBACK);
-                }
-            }
+        if self.loading && spinner_area.width > 0 && spinner_area.height > 0 {
+            let x = spinner_area.x + spinner_area.width.saturating_sub(1);
+            let y = spinner_area.y + spinner_area.height.saturating_sub(1);
+            buf.set_string(x, y, spinner_char(self.spinner_start).to_string(), self.theme.spinner);
         }
 
         SkimRender::default()
     }
 }
+
+#[cfg(test)]
+#[path = "preview_tests.rs"]
+mod tests;

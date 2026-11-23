@@ -1,23 +1,23 @@
-use std::{rc::Rc, sync::Arc};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use indexmap::IndexSet;
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListDirection, ListItem, Scrollbar, ScrollbarOrientation, ScrollbarState,
     StatefulWidget, Widget,
 };
 use regex::Regex;
 
+use crate::item::MatchedItem;
 use crate::options::feature_flag;
-use crate::{
-    Selector, SkimOptions,
-    item::MatchedItem,
-    spinlock::SpinLock,
-    theme::ColorTheme,
-    tui::BorderType,
-    tui::item_renderer::ItemRenderer,
-    tui::options::TuiLayout,
-    tui::widget::{SkimRender, SkimWidget},
-};
+use crate::theme::ColorTheme;
+use crate::tui::BorderType;
+use crate::tui::item_renderer::ItemRenderer;
+use crate::tui::options::TuiLayout;
+use crate::tui::widget::{SkimRender, SkimWidget};
+use crate::{Selector, SkimOptions};
 
 /// How to apply processed items to the display list
 #[derive(Default, Clone, Copy)]
@@ -29,12 +29,15 @@ pub(crate) enum MergeStrategy {
     SortedMerge,
     /// Append to existing list without sorting (for --no-sort)
     Append,
+    /// Prepend to existing list without sorting (for --tac --no-sort)
+    Prepend,
 }
 
 /// Processed items ready for rendering
 pub(crate) struct ProcessedItems {
     pub(crate) items: Vec<MatchedItem>,
     pub(crate) merge: MergeStrategy,
+    pub(crate) generation: usize,
 }
 
 impl Default for ProcessedItems {
@@ -42,15 +45,18 @@ impl Default for ProcessedItems {
         Self {
             items: Vec::new(),
             merge: MergeStrategy::Replace,
+            generation: 0,
         }
     }
 }
 
 /// Widget for displaying and managing the list of filtered items
+#[allow(clippy::struct_excessive_bools)]
 pub struct ItemList {
     pub(crate) items: Vec<MatchedItem>,
     pub(crate) selection: IndexSet<MatchedItem>,
-    pub(crate) processed_items: Arc<SpinLock<Option<ProcessedItems>>>,
+    pub(crate) processed_items: Arc<Mutex<Option<ProcessedItems>>>,
+    pub(crate) matcher_generation: Arc<AtomicUsize>,
     pub(crate) direction: ListDirection,
     pub(crate) offset: usize,
     /// How many leading sub-lines of items[offset] have been scrolled off the top.
@@ -69,8 +75,9 @@ pub struct ItemList {
     selector: Option<Rc<dyn Selector>>,
     pre_select_target: usize, // How many items we want to pre-select
     no_clear_if_empty: bool,
-    interactive: bool,              // Whether we're in interactive mode
-    showing_stale_items: bool,      // True when displaying old items due to no_clear_if_empty
+    interactive: bool,         // Whether we're in interactive mode
+    showing_stale_items: bool, // True when displaying old items due to no_clear_if_empty
+    pub(crate) keep_on_reload: bool,
     pub(crate) manual_hscroll: i32, // Manual horizontal scroll offset for ScrollLeft/ScrollRight
     pub(crate) selector_icon: String,
     pub(crate) multi_select_icon: String,
@@ -91,7 +98,7 @@ pub struct ItemList {
 
 impl Default for ItemList {
     fn default() -> Self {
-        Self::_default()
+        Self::default_inner()
     }
 }
 
@@ -111,13 +118,39 @@ impl ItemList {
     /// Returns the currently selected item, if any
     #[must_use]
     pub fn selected(&self) -> Option<MatchedItem> {
-        self.items.get(self.cursor()).cloned()
+        let item = self.items.get(self.cursor());
+        if item.is_some_and(|i| !i.item.disabled()) {
+            item.cloned()
+        } else {
+            None
+        }
     }
 
     /// Appends new matched items to the list
     pub fn append(&mut self, items: &mut Vec<MatchedItem>) {
         self.items.append(items);
         self.showing_stale_items = false;
+    }
+
+    /// Prepends a batch while preserving either the head-following behavior or
+    /// the item currently focused by a user who has moved away from the head.
+    fn prepend(&mut self, mut items: Vec<MatchedItem>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let added = items.len();
+        let follows_head = self.current == 0;
+        items.append(&mut self.items);
+        self.items = items;
+
+        if follows_head {
+            self.offset = 0;
+            self.sub_offset = 0;
+        } else {
+            self.current = self.current.saturating_add(added);
+            self.offset = self.offset.saturating_add(added);
+        }
     }
 
     /// Toggles the selection state of the item at the given index
@@ -153,12 +186,16 @@ impl ItemList {
     /// Add row to selection
     pub fn select_row(&mut self, index: usize) {
         let item = self.items[index].clone();
-        self.selection.insert(item);
+        if !item.disabled() {
+            self.selection.insert(item);
+        }
     }
     /// Selects all items
     pub fn select_all(&mut self) {
         for item in self.items.clone() {
-            self.selection.insert(item.clone());
+            if !item.disabled() {
+                self.selection.insert(item.clone());
+            }
         }
     }
     /// Clears all selections
@@ -173,6 +210,7 @@ impl ItemList {
         self.offset = 0;
         self.sub_offset = 0;
         self.showing_stale_items = false;
+        self.keep_on_reload = false;
     }
     /// Scrolls the list by `rows` terminal rows, counting each item's sub-lines.
     /// Positive = toward higher indices (up the screen in default layout).
@@ -209,16 +247,14 @@ impl ItemList {
         if self.reserved >= self.items.len() {
             return;
         }
-        let reserved = i32::try_from(self.reserved).unwrap_or(i32::MAX);
+        let reserved = i32::try_from(self.reserved).unwrap_or(0);
         let total = i32::try_from(self.items.len()).unwrap_or(i32::MAX);
-        let mut new = i32::try_from(self.current).unwrap_or(i32::MAX) + offset;
+        let mut new = i32::try_from(self.current).unwrap_or(0) + offset;
         if self.cycle {
             let n = total - reserved;
             new = reserved + (new + n - reserved) % n;
         } else {
-            new = new
-                .min(i32::try_from(self.items.len()).unwrap_or(i32::MAX) - 1)
-                .max(i32::try_from(self.reserved).unwrap_or(i32::MAX));
+            new = new.min(total - 1).max(reserved);
         }
         self.current = new.max(0).unsigned_abs() as usize;
         debug!("Scrolled to {}", self.current);
@@ -390,7 +426,8 @@ impl SkimWidget for ItemList {
             (None, 0)
         };
 
-        let processed_items = Arc::new(SpinLock::new(None));
+        let processed_items = Arc::new(Mutex::new(None));
+        let matcher_generation = Arc::new(AtomicUsize::new(0));
 
         let interactive = options.interactive;
         let no_clear_if_empty = options.no_clear_if_empty;
@@ -399,6 +436,7 @@ impl SkimWidget for ItemList {
         // Spawn background processing thread with the appropriate configuration
         Self {
             processed_items,
+            matcher_generation,
             reserved: 0, // header_lines are now displayed in the Header widget, not ItemList
             direction: match options.layout {
                 TuiLayout::Default => ratatui::widgets::ListDirection::BottomToTop,
@@ -417,6 +455,7 @@ impl SkimWidget for ItemList {
             no_clear_if_empty,
             interactive,
             showing_stale_items: false,
+            keep_on_reload: false,
             manual_hscroll: 0,
             items: Default::default(),
             selection: Default::default(),
@@ -478,22 +517,40 @@ impl SkimWidget for ItemList {
         }
         let initial_current = this.selected();
 
-        // Check for pre-processed items from background thread (non-blocking)
-        let items_updated = if let Some(processed) = this.processed_items.lock().take() {
+        // Check for pre-processed items from background thread (non-blocking).
+        // Bind the result separately so the lock guard is dropped before a merge
+        // mutates the item list.
+        let processed = this
+            .processed_items
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let current_generation = this.matcher_generation.load(Ordering::Acquire);
+        let processed = processed.filter(|result| result.generation == current_generation);
+        let items_updated = if let Some(processed) = processed {
             debug!("Render: Got {} processed items", processed.items.len());
 
             // Check if items are empty or blank for no_clear_if_empty handling
             let items_are_empty_or_blank =
                 processed.items.is_empty() || processed.items.iter().all(|item| item.item.text().trim().is_empty());
 
-            if this.interactive && this.no_clear_if_empty && items_are_empty_or_blank && !this.items.is_empty() {
+            if !this.items.is_empty()
+                && ((this.keep_on_reload && processed.items.is_empty())
+                    || (this.interactive && this.no_clear_if_empty && items_are_empty_or_blank))
+            {
                 debug!(
                     "no_clear_if_empty: keeping {} old items for display (new items are empty/blank)",
                     this.items.len()
                 );
                 this.showing_stale_items = true;
             } else {
-                match processed.merge {
+                let merge = if this.keep_on_reload {
+                    this.clear();
+                    MergeStrategy::Replace
+                } else {
+                    processed.merge
+                };
+                match merge {
                     MergeStrategy::Replace => {
                         this.items = processed.items;
                         this.sub_offset = 0;
@@ -505,6 +562,9 @@ impl SkimWidget for ItemList {
                     }
                     MergeStrategy::Append => {
                         this.items.extend(processed.items);
+                    }
+                    MergeStrategy::Prepend => {
+                        this.prepend(processed.items);
                     }
                 }
                 this.showing_stale_items = false;
@@ -597,8 +657,18 @@ impl SkimWidget for ItemList {
 
             // Both Default and Custom use a thumb-only style (no track/begin/end arrows).
             // Default uses ▐ (right half-block), which gives a clean minimal look.
+            // The thumb style is patched onto the cell of the row drawn beneath it.
+            // The themed `scrollbar` color replaces the row's fg, so the thumb doesn't
+            // take the current-line highlight's fg. Clearing every modifier first stops
+            // a dim or bold item that reaches the rightmost column from dimming or
+            // bolding the thumb. The bg stays the row's, so the current-line highlight
+            // still spans the full width.
+            let thumb_style = Style::new()
+                .remove_modifier(Modifier::all())
+                .patch(self.theme.scrollbar);
             let scrollbar: Scrollbar<'_> = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .thumb_symbol(&self.scrollbar_thumb)
+                .thumb_style(thumb_style)
                 .track_symbol(None)
                 .begin_symbol(None)
                 .end_symbol(None);
@@ -622,7 +692,11 @@ impl SkimWidget for ItemList {
 fn toggle_item(sel: &mut IndexSet<MatchedItem>, item: &MatchedItem) {
     if sel.contains(item) {
         sel.shift_remove(item);
-    } else {
+    } else if !item.disabled() {
         sel.insert(item.clone());
     }
 }
+
+#[cfg(test)]
+#[path = "item_list_tests.rs"]
+mod tests;

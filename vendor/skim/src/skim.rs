@@ -1,18 +1,122 @@
 //! Module containing skim's entry point
-use std::env;
 use std::io::{BufWriter, Stderr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use color_eyre::eyre::Result;
-use color_eyre::eyre::{self, OptionExt};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::{runtime::Handle, select, task::block_in_place};
+use eyre::{self, OptionExt, Result};
+#[cfg(feature = "image")]
+use ratatui_image::picker::Picker;
+use tokio::runtime::Handle;
+use tokio::select;
+use tokio::task::block_in_place;
 
+use crate::binds::SkimEvent;
 use crate::reader::{Reader, ReaderControl};
-use crate::tui::TICK_RATE;
-use crate::tui::{App, Event, Size, Tui, event::Action};
-use crate::{SkimItem, SkimItemReceiver, SkimOptions, SkimOutput};
+use crate::tui::actions::Action;
+#[cfg(feature = "image")]
+use crate::tui::util::detect_image_picker;
+use crate::tui::{App, Event, Size, TICK_RATE, Tui};
+use crate::{SkimItem, SkimItemReceiver, SkimItemSender, SkimOptions, SkimOutput};
+
+/// Stream type yielded by the IPC listener. With the `listen` feature disabled the
+/// listener branch can never fire, so its payload type is uninhabited.
+#[cfg(feature = "listen")]
+type RemoteStream = interprocess::local_socket::tokio::Stream;
+#[cfg(not(feature = "listen"))]
+type RemoteStream = std::convert::Infallible;
+
+#[cfg(all(feature = "listen", unix))]
+fn check_remote_user(stream: &RemoteStream, uid: nix::unistd::Uid) -> std::io::Result<()> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+    use std::io::{Error, ErrorKind};
+
+    if stream.peer_creds()?.euid() != Some(uid.as_raw()) {
+        return Err(Error::new(ErrorKind::PermissionDenied, "peer user ID does not match"));
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "listen", windows))]
+fn remote_pipe_security() -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use interprocess::os::windows::security_descriptor::{AsSecurityDescriptorMutExt as _, SecurityDescriptor};
+    use std::io::Error;
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, SET_ACCESS, SetEntriesInAclW,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    #[repr(C)]
+    struct TokenUserBuffer {
+        user: TOKEN_USER,
+        sid: [u8; SECURITY_MAX_SID_SIZE as usize],
+    }
+
+    let mut security = SecurityDescriptor::new()?;
+    let mut token = null_mut();
+    let mut user = MaybeUninit::<TokenUserBuffer>::uninit();
+    // The buffers have the required size and alignment. Each successful call initializes its output.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) == 0 {
+            return Err(Error::last_os_error());
+        }
+        let token = OwnedHandle::from_raw_handle(token);
+        let mut size = 0;
+        if GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            u32::try_from(size_of::<TokenUserBuffer>()).unwrap(),
+            &raw mut size,
+        ) == 0
+        {
+            return Err(Error::last_os_error());
+        }
+        let mut entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            grfAccessMode: SET_ACCESS,
+            ..Default::default()
+        };
+        BuildTrusteeWithSidW(&raw mut entry.Trustee, (*user.as_ptr()).user.User.Sid);
+        let mut acl = null_mut();
+        let status = SetEntriesInAclW(1, &raw const entry, null(), &raw mut acl);
+        if status != ERROR_SUCCESS {
+            return Err(Error::from_raw_os_error(status.cast_signed()));
+        }
+        if let Err(err) = security.set_dacl(acl, false) {
+            LocalFree(acl.cast());
+            return Err(err);
+        }
+    }
+    Ok(security)
+}
+
+fn enqueue_items<I, T>(items: I) -> Result<(SkimItemSender, SkimItemReceiver)>
+where
+    I: IntoIterator<Item = T>,
+    T: SkimItem,
+{
+    const BATCH_SIZE: usize = 1024;
+    let (tx, rx) = crate::prelude::unbounded();
+    let mut batch: Vec<Arc<dyn SkimItem>> = Vec::with_capacity(BATCH_SIZE);
+    for item in items {
+        if batch.len() == BATCH_SIZE {
+            tx.send(batch)?;
+            batch = Vec::with_capacity(BATCH_SIZE);
+        }
+        batch.push(Arc::new(item) as Arc<dyn SkimItem>);
+    }
+    tx.send(batch)?;
+    Ok((tx, rx))
+}
 
 /// Main entry point for running skim
 pub struct Skim<Backend = ratatui::backend::CrosstermBackend<BufWriter<Stderr>>>
@@ -28,9 +132,12 @@ where
     initial_cmd: String,
     reader_control: Option<ReaderControl>,
     matcher_interval: Option<tokio::time::Interval>,
+    #[cfg(feature = "listen")]
     listener: Option<interprocess::local_socket::tokio::Listener>,
     final_event: Event,
     final_key: KeyEvent,
+    /// Whether the `start` event has already been fired (fired exactly once).
+    start_fired: bool,
 }
 
 impl Skim {
@@ -101,17 +208,7 @@ impl Skim {
         I: IntoIterator<Item = T>,
         T: SkimItem,
     {
-        const BATCH_SIZE: usize = 1024;
-        let (tx, rx) = crate::prelude::unbounded();
-        let mut batch: Vec<Arc<dyn SkimItem>> = Vec::with_capacity(BATCH_SIZE);
-        for item in items {
-            if batch.len() == 1024 {
-                tx.send(batch)?;
-                batch = Vec::with_capacity(BATCH_SIZE);
-            }
-            batch.push(Arc::new(item) as Arc<dyn SkimItem>);
-        }
-        tx.send(batch)?;
+        let (_, rx) = enqueue_items(items)?;
         Self::run_with(options, Some(rx))
     }
 
@@ -121,8 +218,40 @@ impl Skim {
     ///
     /// Returns an error if the TUI backend cannot be initialized.
     pub fn init_tui(&mut self) -> Result<()> {
-        self.tui = Some(Tui::new_with_height(self.height)?);
+        let mut tui = Tui::new_with_height(self.height)?;
+        if self.app.options.no_mouse {
+            tui.disable_mouse();
+        }
+        let min_height = crate::options::parse_min_height(&self.app.options.min_height).map_err(eyre::Report::msg)?;
+        tui.min_height(min_height)?;
+        self.init_tui_with(tui);
         Ok(())
+    }
+
+    /// Initialize and start skim without entering the terminal UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if skim or the TUI backend cannot be initialized.
+    pub fn new(options: SkimOptions, source: Option<SkimItemReceiver>) -> Result<Self> {
+        let mut res = Self::init(options, source)?;
+        res.start();
+        res.init_tui()?;
+        Ok(res)
+    }
+
+    /// Initialize and start skim with items without entering the terminal UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if sending items or initializing skim or its TUI fails.
+    pub fn new_items<I, T>(options: SkimOptions, items: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: SkimItem,
+    {
+        let (_, rx) = enqueue_items(items)?;
+        Self::new(options, Some(rx))
     }
 }
 
@@ -135,6 +264,10 @@ where
     /// # Errors
     ///
     /// Returns an error if parsing the height or other options fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the margin is invalid.
     pub fn init(options: SkimOptions, source: Option<SkimItemReceiver>) -> Result<Self> {
         let height = Size::try_from(options.height.as_str())?;
 
@@ -142,11 +275,7 @@ where
         // Initialize theme from options
         let theme = Arc::new(crate::theme::ColorTheme::init_from_options(&options));
         let mut reader = Reader::from_options(&options).source(source);
-        let default_command = String::from(match env::var("SKIM_DEFAULT_COMMAND").as_deref() {
-            Err(_) | Ok("") => crate::SKIM_DEFAULT_COMMAND,
-            Ok(v) => v,
-        });
-        let cmd = options.cmd.clone().unwrap_or(default_command);
+        let cmd = options.cmd.clone().unwrap_or_default();
 
         let app = App::from_options(options, theme.clone(), cmd.clone());
 
@@ -159,7 +288,7 @@ where
         // reader
         // In interactive mode, expand all placeholders ({}, {q}, etc) with initial query (empty or from --query)
         let initial_cmd = if app.options.interactive && app.options.cmd.is_some() {
-            let expanded = app.expand_cmd(&cmd, true);
+            let expanded = app.expand_shell_cmd(&cmd, true)?;
             log::debug!("Interactive mode: initial_cmd = {expanded:?} (from template {cmd:?})");
             expanded
         } else {
@@ -174,17 +303,44 @@ where
             tui: None,
             reader_control: None,
             matcher_interval: None,
+            #[cfg(feature = "listen")]
             listener: None,
             final_event: Event::Quit,
             final_key: KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            start_fired: false,
         })
     }
 
     /// Start the reader and matcher, but do not enter the TUI yet
     pub fn start(&mut self) {
         debug!("Starting reader with initial_cmd: {:?}", self.initial_cmd);
-        self.reader_control = Some(self.reader.collect(self.app.item_pool.clone(), &self.initial_cmd));
+        // Give the initial command the same contract as a reload: it sees the
+        // state skim starts with (`--query`, counts, geometry, …).
+        let (env, unset) = self.app.child_env_snapshot();
+        self.start_reader(&self.initial_cmd.clone(), &env, &unset);
         self.app.restart_matcher(true);
+        // If the TUI is already available (e.g. test harnesses that build the
+        // TUI before starting), fire the `start` event now. In the normal
+        // binary flow the TUI is created after `start()`, so `enter()` fires it.
+        self.fire_start_event();
+    }
+
+    /// Fire the `start` event exactly once, as soon as the TUI event channel is
+    /// available. The event is routed through the keymap like any other key, so
+    /// a `--bind start:<action>` binding runs when skim comes up. In sync mode,
+    /// render the completed matcher output first so the action sees every item.
+    fn fire_start_event(&mut self) {
+        if self.start_fired {
+            return;
+        }
+        if let Some(tui) = self.tui.as_ref() {
+            if self.app.options.sync && tui.event_tx.try_send(Event::Render).is_err() {
+                return;
+            }
+            if tui.event_tx.try_send(Event::Key(SkimEvent::Start.into())).is_ok() {
+                self.start_fired = true;
+            }
+        }
     }
 
     /// Handle a reload event by killing the current reader, clearing items, and starting a new reader.
@@ -193,20 +349,43 @@ where
     /// be reused by test harnesses without reimplementing it.
     pub fn handle_reload(&mut self, new_cmd: &str) {
         debug!("reloading with cmd {new_cmd}");
+        // Export the state that triggered the reload (issue #1195) *before*
+        // clearing anything, so the command still sees the focused and
+        // selected items and the counts they imply.
+        let (env, unset) = self
+            .app
+            .pending_reload_env
+            .pop_front()
+            .unwrap_or_else(|| self.app.child_env_snapshot());
         // Kill the current reader
         if let Some(rc) = self.reader_control.as_mut() {
             rc.kill();
         }
         // Clear items
         self.app.item_pool.clear();
-        // Clear displayed items unless no_clear_if_empty is set
-        if !self.app.options.no_clear_if_empty {
+        // Keep the old display until replacement results arrive when requested.
+        if !self.app.options.no_clear_if_empty && !self.app.options.no_clear_start {
             self.app.item_list.clear();
         }
+        self.app.item_list.keep_on_reload = self.app.options.no_clear_start || self.app.options.no_clear_if_empty;
         self.app.restart_matcher(true);
-        // Start a new reader with the new command
-        self.reader_control = Some(self.reader.collect(self.app.item_pool.clone(), new_cmd));
-        self.reader_done = false;
+        self.start_reader(new_cmd, &env, &unset);
+    }
+
+    fn start_reader(&mut self, cmd: &str, env: &[(String, String)], unset: &[String]) {
+        let query_too_short =
+            self.app.options.interactive && self.app.options.cmd.is_some() && self.app.query_below_min_length();
+        self.reader_control = if query_too_short {
+            // The threshold hides all results, even with --no-clear-if-empty.
+            self.app.item_list.clear();
+            None
+        } else {
+            self.reader.set_child_env(env, unset);
+            Some(self.reader.collect(self.app.item_pool.clone(), cmd))
+        };
+        self.reader_done = query_too_short;
+        self.app.reader_done = query_too_short;
+        self.app.load_event_fired = false;
     }
 
     /// Check if the reader has finished and restart the matcher if needed.
@@ -223,6 +402,11 @@ where
             && !self.reader_done
         {
             self.reader_done = true;
+            // Signal that reading is complete. The `load` event is fired later
+            // from `App::poll_completion_events` (the heartbeat handler) once the
+            // reader is done, the matcher has stopped, and every item has been
+            // consumed, so a `load` binding sees a fully-populated, stable list.
+            self.app.reader_done = true;
             self.app.restart_matcher(false);
             // If the matcher already consumed everything, stop the periodic
             // interval immediately rather than waiting for the next tick.
@@ -254,7 +438,8 @@ where
     ///
     /// Use this instead of [`init_tui()`](Skim::init_tui) when you need a
     /// non-default backend (e.g. `TestBackend` for snapshot tests).
-    pub fn init_tui_with(&mut self, tui: Tui<Backend>) {
+    pub fn init_tui_with(&mut self, mut tui: Tui<Backend>) {
+        tui.no_clear = self.app.options.no_clear;
         self.tui = Some(tui);
     }
 
@@ -340,14 +525,44 @@ where
     ///
     /// This will call `init_listener`, which requires a tokio runtime
     /// Though it is not technically async code, this is a good hint.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, unknown_lints, clippy::unused_async_trait_impl)]
     pub async fn enter(&mut self) -> Result<()> {
         debug!("Entering TUI");
+        let tui = self
+            .tui
+            .as_mut()
+            .expect("TUI needs to be initialized using Skim::init_tui before entering");
+
+        tui.enter_terminal()?;
+        #[cfg(feature = "image")]
+        if self.app.options.image == Some(crate::options::ImageProtocol::Detect) {
+            if !tui.is_fullscreen {
+                crossterm::execute!(std::io::stderr(), crossterm::terminal::EnterAlternateScreen)?;
+            }
+            let picker = detect_image_picker().unwrap_or_else(|err| {
+                warn!("failed to query terminal image protocol: {err:?}");
+                Picker::halfblocks()
+            });
+            if !tui.is_fullscreen {
+                crossterm::execute!(std::io::stderr(), crossterm::terminal::LeaveAlternateScreen)?;
+            }
+            self.app.options.image_picker = Some(picker.clone());
+            self.app.preview.set_image_picker(Some(picker));
+        } else if self.app.options.image == Some(crate::options::ImageProtocol::Halfblocks) {
+            let picker = Picker::halfblocks();
+            self.app.options.image_picker = Some(picker.clone());
+            self.app.preview.set_image_picker(Some(picker));
+        }
+
         self.init_listener()?;
         self.tui
             .as_mut()
-            .expect("TUI needs to be initialized using Skim::init_tui before entering")
-            .enter()
+            .expect("TUI needs to be initialized using Skim::init_tui before starting")
+            .start();
+        // In the normal binary flow the TUI is created after `start()`, so this
+        // is the first point at which the `start` event can be queued.
+        self.fire_start_event();
+        Ok(())
     }
 
     /// Checks read-0 select-1, filter, and sync to wait and returns whether or not we should enter
@@ -356,25 +571,49 @@ where
     ///
     /// Panics if `start` has not been called before this method.
     pub fn should_enter(&mut self) -> bool {
-        let reader_control = self
-            .reader_control
-            .as_ref()
-            .expect("reader_control needs to be initialized using Skim::start");
+        assert!(
+            self.reader_control.is_some() || self.reader_done,
+            "reader_control needs to be initialized using Skim::start"
+        );
+        // A short interactive query has no reader: it is already complete.
+        let reader_control = self.reader_control.as_ref();
         let app = &mut self.app;
 
         // Filter mode: wait for all items to be read and matched, then return without entering TUI
         if app.options.filter.is_some() {
             trace!("filter mode: waiting for all items to be processed");
             loop {
+                // `--min-query-length` short-circuits `restart_matcher`, so the pool would
+                // never be drained and this loop would spin forever. There is nothing to
+                // match in that case: stop as soon as the reader is done.
+                if app.query_below_min_length() {
+                    if reader_control.is_none_or(ReaderControl::is_done) {
+                        debug!("filter mode: query shorter than --min-query-length, no results");
+                        app.item_list.items.clear();
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 let matcher_stopped = app.matcher_control.stopped();
-                let reader_done = reader_control.is_done();
+                let reader_done = reader_control.is_none_or(ReaderControl::is_done);
                 if matcher_stopped && reader_done && app.item_pool.num_not_taken() == 0 {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
                 app.restart_matcher(false);
             }
-            app.item_list.items = app.item_list.processed_items.lock().take().unwrap_or_default().items;
+            app.item_list.items = app
+                .item_list
+                .processed_items
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_default()
+                .items
+                .into_iter()
+                .filter(|i| !i.item.disabled())
+                .collect();
             debug!("filter mode: matched {} items", app.item_list.items.len());
             return false;
         }
@@ -398,10 +637,10 @@ where
                 min_items_before_enter,
                 app.item_pool.num_not_taken(),
                 app.input.value,
-                reader_control.is_done()
+                reader_control.is_none_or(ReaderControl::is_done)
             );
             while app.matcher_control.get_num_matched() < min_items_before_enter
-                && (!app.matcher_control.stopped() || !reader_control.is_done())
+                && (!app.matcher_control.stopped() || !reader_control.is_none_or(ReaderControl::is_done))
             {
                 trace!("still waiting");
                 std::thread::sleep(Duration::from_millis(1));
@@ -413,14 +652,21 @@ where
                 app.matcher_control.get_num_processed(),
                 app.item_pool.num_not_taken(),
                 app.input.value,
-                reader_control.is_done()
+                reader_control.is_none_or(ReaderControl::is_done)
             );
             trace!(
                 "checking for matched item count before entering: {}/{min_items_before_enter}",
                 app.matcher_control.get_num_matched()
             );
             if app.matcher_control.get_num_matched() == min_items_before_enter - 1 {
-                app.item_list.items = app.item_list.processed_items.lock().take().unwrap_or_default().items;
+                app.item_list.items = app
+                    .item_list
+                    .processed_items
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .unwrap_or_default()
+                    .items;
                 debug!("early exit, result: {:?}", app.results());
                 return false;
             }
@@ -430,15 +676,18 @@ where
 
     /// Initialize the IPC socket listener
     /// This needs to be called from an async context despite being sync
+    #[cfg_attr(not(feature = "listen"), allow(clippy::unnecessary_wraps, clippy::unused_self))]
     fn init_listener(&mut self) -> Result<()> {
+        #[cfg(feature = "listen")]
         if let Some(socket_name) = &self.app.options.listen {
-            self.listener = Some(
-                interprocess::local_socket::ListenerOptions::new()
-                    .name(interprocess::local_socket::ToNsName::to_ns_name::<
-                        interprocess::local_socket::GenericNamespaced,
-                    >(socket_name.to_owned())?)
-                    .create_tokio()?,
-            );
+            use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName as _};
+            #[cfg(windows)]
+            use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+
+            let options = ListenerOptions::new().name(socket_name.clone().to_ns_name::<GenericNamespaced>()?);
+            #[cfg(windows)]
+            let options = options.security_descriptor(remote_pipe_security()?);
+            self.listener = Some(options.create_tokio()?);
         }
         Ok(())
     }
@@ -531,6 +780,11 @@ where
     /// }
     /// ```
     pub async fn tick(&mut self) -> Result<bool> {
+        // Retry the one-shot `start` event until the (bounded) event channel
+        // accepts it. `start()`/`enter()` fire it eagerly, but if the channel was
+        // momentarily full there, this guarantees it is not lost. Idempotent: the
+        // `start_fired` guard makes every call after the first a no-op.
+        self.fire_start_event();
         let matcher_interval = &mut self.matcher_interval;
         let items_available = self.app.item_pool.items_available.clone();
         select! {
@@ -549,6 +803,10 @@ where
                     self.handle_reload(&new_cmd.clone());
                 } else {
                     self.app.handle_event(self.tui.as_mut().expect("TUI should be initialized before handling events"), &evt)?;
+                }
+
+                if let Some(action) = self.app.final_action.take() {
+                    self.final_event = Event::Action(action);
                 }
 
                 // Check reader status and update
@@ -592,26 +850,43 @@ where
                 self.app.restart_matcher(false);
                 self.try_flush_render();
             }
+            // IPC listener branch. `tokio::select!` does not allow `#[cfg]` on a
+            // branch, so the branch stays but its body is gated: with the `listen`
+            // feature off the future is a never-resolving `pending()` and the handler
+            // is unreachable (`RemoteStream` is uninhabited).
             Ok(stream) = async {
-                match &self.listener {
-                    Some(l) => interprocess::local_socket::traits::tokio::Listener::accept(l).await,
-                    None => std::future::pending().await,
+                #[cfg(feature = "listen")]
+                if let Some(l) = self.listener.as_ref() {
+                    return interprocess::local_socket::traits::tokio::Listener::accept(l).await;
                 }
+                std::future::pending::<std::io::Result<RemoteStream>>().await
             } => {
-                debug!("Listener accepted a connection");
-                let event_tx_clone_ipc = self.tui.as_ref().expect("TUI should be initialized before listening").event_tx.clone();
-                tokio::spawn(async move {
-                    use tokio::io::AsyncBufReadExt;
-                    let reader = tokio::io::BufReader::new(stream);
-                    let mut lines = reader.lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        debug!("listener: got {line}");
-                        if let Ok(act) = ron::from_str::<Action>(&line) {
-                            debug!("listener: parsed into action {act:?}");
-                            _ = event_tx_clone_ipc.try_send(Event::Action(act));
-                        }
+                #[cfg(feature = "listen")]
+                {
+                    #[cfg(unix)]
+                    if let Err(err) = check_remote_user(&stream, nix::unistd::geteuid()) {
+                        warn!("listener: rejected connection: {err}");
+                        return Ok(self.app.should_quit);
                     }
-                });
+                    debug!("Listener accepted a connection");
+                    let event_tx_clone_ipc = self.tui.as_ref().expect("TUI should be initialized before listening").event_tx.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncBufReadExt;
+                        let reader = tokio::io::BufReader::new(stream);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            debug!("listener: got {line}");
+                            if let Ok(act) = ron::from_str::<Action>(&line) {
+                                debug!("listener: parsed into action {act:?}");
+                                if let Err(e) = event_tx_clone_ipc.try_send(Event::Action(act)) {
+                                    warn!("listener: failed to send action to backend: {e:?}");
+                                }
+                            }
+                        }
+                    });
+                }
+                #[cfg(not(feature = "listen"))]
+                match stream {}
             }
         }
 
@@ -675,3 +950,7 @@ where
             .await
     }
 }
+
+#[cfg(test)]
+#[path = "skim_tests.rs"]
+mod tests;

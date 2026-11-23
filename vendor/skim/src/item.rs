@@ -24,12 +24,14 @@ use tokio::sync::Notify;
 #[derive(Debug)]
 pub struct RankBuilder {
     criterion: Vec<RankCriteria>,
+    tac: bool,
 }
 
 impl Default for RankBuilder {
     fn default() -> Self {
         Self {
             criterion: vec![RankCriteria::Score, RankCriteria::Begin, RankCriteria::End],
+            tac: false,
         }
     }
 }
@@ -43,7 +45,13 @@ impl RankBuilder {
         }
 
         criterion.dedup();
-        Self { criterion }
+        Self { criterion, tac: false }
+    }
+
+    #[must_use]
+    pub(crate) fn tac(mut self, tac: bool) -> Self {
+        self.tac = tac;
+        self
     }
 
     /// Returns the tiebreak criteria slice.
@@ -52,11 +60,40 @@ impl RankBuilder {
         &self.criterion
     }
 
-    /// Computes the byte offset of the first character after the last path separator
-    /// (`/` or `\`) in `text`.  Returns `0` when no separator is present.
+    fn sort_key(&self, rank: &Rank) -> [i32; 6] {
+        let configured = rank.sort_key(&self.criterion);
+        let mut key = [0; 6];
+        key[..5].copy_from_slice(&configured);
+
+        if self.tac {
+            for (priority, criterion) in self.criterion.iter().take(5).enumerate() {
+                key[priority] = match criterion {
+                    RankCriteria::Index => rank.index.saturating_neg(),
+                    RankCriteria::NegIndex => rank.index,
+                    _ => key[priority],
+                };
+            }
+        }
+        key[5] = if self.tac {
+            rank.index.saturating_neg()
+        } else {
+            rank.index
+        };
+        key
+    }
+
+    /// Computes the **character** index of the first character after the last path
+    /// separator (`/` or `\`) in `text`.  Returns `0` when no separator is present.
+    ///
+    /// This must be a char index, not a byte offset: the `PathName` tiebreak
+    /// subtracts it from [`Rank::begin`], which is a char index, so counting bytes
+    /// here would mix units and mis-rank any path with a non-ASCII component.
     fn path_name_offset(text: &str) -> i32 {
-        text.rfind(['/', '\\'])
-            .map_or(0, |pos| i32::try_from(pos).unwrap_or(i32::MAX).saturating_add(1))
+        text.rfind(['/', '\\']).map_or(0, |pos| {
+            i32::try_from(text[..pos].chars().count())
+                .unwrap_or(i32::MAX)
+                .saturating_add(1)
+        })
     }
 
     /// Builds a `Rank` from raw match measurements.
@@ -121,8 +158,9 @@ pub struct MatchedItem {
     /// Range of characters that matched the pattern
     pub matched_range: Option<MatchRange>,
     /// Sort key precomputed at construction time from `rank` and the tiebreak
-    /// criteria.  Caching avoids recomputing it on every comparison during sort.
-    sort_key: [i32; 5],
+    /// criteria. The sixth slot is the tac-aware implicit index tiebreak.
+    /// Caching avoids recomputing it on every comparison during sort.
+    sort_key: [i32; 6],
 }
 
 impl std::fmt::Debug for MatchedItem {
@@ -162,7 +200,7 @@ impl MatchedItem {
             item,
             rank,
             matched_range,
-            sort_key: rank.sort_key(rank_builder.criteria()),
+            sort_key: rank_builder.sort_key(&rank),
         }
     }
     /// Merge two sorted `Vec<MatchedItem>` lists into one, preserving sort order by rank.
@@ -359,9 +397,7 @@ impl PartialOrd for MatchedItem {
 
 impl Ord for MatchedItem {
     fn cmp(&self, other: &Self) -> CmpOrd {
-        self.sort_key
-            .cmp(&other.sort_key)
-            .then_with(|| self.rank.index.cmp(&other.rank.index))
+        self.sort_key.cmp(&other.sort_key)
     }
 }
 
@@ -481,19 +517,7 @@ impl ItemPool {
             // Header items are always in input order, regardless of tac
             header_items.extend(items);
 
-            if self.tac {
-                // For --tac, prepend non-header items (newest items go to front)
-                for item in remaining {
-                    pool.insert(0, item);
-                }
-            } else {
-                pool.extend(remaining);
-            }
-        } else if self.tac {
-            // For --tac, prepend items (newest items go to front)
-            for item in items {
-                pool.insert(0, item);
-            }
+            pool.extend(remaining);
         } else {
             pool.extend(items);
         }
@@ -515,7 +539,10 @@ impl ItemPool {
         let guard = self.pool.lock();
         let taken = self.taken.swap(guard.len(), Ordering::SeqCst);
         // Copy the new items out so we can release the lock immediately
-        let items = guard[taken..].to_vec();
+        let mut items = guard[taken..].to_vec();
+        if self.tac {
+            items.reverse();
+        }
         drop(guard); // Explicitly release lock
         items
     }
@@ -613,3 +640,8 @@ impl ValueEnum for RankCriteria {
         })
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+#[path = "item_tests.rs"]
+mod tests;

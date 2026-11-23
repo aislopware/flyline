@@ -30,9 +30,11 @@ pub struct SkimItemReaderOption {
     use_ansi_color: bool,
     transform_fields: Vec<FieldRange>,
     matching_fields: Vec<FieldRange>,
+    hidden_fields: Vec<FieldRange>,
     delimiter: Regex,
     line_ending: u8,
     show_error: bool,
+    disable_pattern: Option<Regex>,
 }
 
 impl Default for SkimItemReaderOption {
@@ -43,8 +45,10 @@ impl Default for SkimItemReaderOption {
             use_ansi_color: false,
             transform_fields: Vec::new(),
             matching_fields: Vec::new(),
+            hidden_fields: Vec::new(),
             delimiter: Regex::new(DELIMITER_STR).unwrap(),
             show_error: false,
+            disable_pattern: None,
         }
     }
 }
@@ -67,8 +71,14 @@ impl SkimItemReaderOption {
                 .iter()
                 .filter_map(|f| if f.is_empty() { None } else { FieldRange::from_str(f) })
                 .collect(),
+            hidden_fields: options
+                .hide_nth
+                .iter()
+                .filter_map(|f| if f.is_empty() { None } else { FieldRange::from_str(f) })
+                .collect(),
             delimiter: options.delimiter.clone(),
             show_error: options.show_cmd_error,
+            disable_pattern: options.disable_pattern.clone(),
         }
     }
 
@@ -134,6 +144,23 @@ impl SkimItemReaderOption {
         self
     }
 
+    /// Sets the fields to hide from display (while keeping them searchable)
+    #[must_use]
+    pub fn hide_nth<'a, T>(mut self, hide_nth: T) -> Self
+    where
+        T: Iterator<Item = &'a str>,
+    {
+        self.hidden_fields = hide_nth.filter_map(FieldRange::from_str).collect();
+        self
+    }
+
+    /// Sets the hidden fields directly
+    #[must_use]
+    pub fn hidden_fields(mut self, hidden_fields: Vec<FieldRange>) -> Self {
+        self.hidden_fields = hidden_fields;
+        self
+    }
+
     /// Enables reading null-terminated lines instead of newline-terminated
     #[must_use]
     pub fn read0(mut self, enable: bool) -> Self {
@@ -169,6 +196,11 @@ pub struct SkimItemReader {
     /// [`with_thread_pool`](Self::with_thread_pool) or
     /// [`set_thread_pool`](Self::set_thread_pool).
     thread_pool: Arc<ThreadPool>,
+    /// Environment variables exported to the spawned command (see issue #1195).
+    env: Vec<(String, String)>,
+    /// State variables to remove from the inherited environment before spawning,
+    /// because the current snapshot omits them (see issue #1195).
+    env_unset: Vec<String>,
 }
 
 fn default_thread_pool() -> Arc<ThreadPool> {
@@ -182,6 +214,8 @@ impl Default for SkimItemReader {
         Self {
             option: Arc::new(Default::default()),
             thread_pool: default_thread_pool(),
+            env: Vec::new(),
+            env_unset: Vec::new(),
         }
     }
 }
@@ -193,6 +227,8 @@ impl SkimItemReader {
         Self {
             option: Arc::new(option),
             thread_pool: default_thread_pool(),
+            env: Vec::new(),
+            env_unset: Vec::new(),
         }
     }
 
@@ -238,16 +274,13 @@ impl SkimItemReader {
     /// 1. **I/O thread** (dedicated) — reads large byte chunks (~256 KB) from
     ///    `source`, splitting on line boundaries, and sends them tagged with
     ///    monotonic sequence numbers into a bounded channel.
-    /// 2. **Dispatcher thread** (dedicated, lightweight) — drains that channel
-    ///    and submits one pool job per chunk.  The bounded channel provides
-    ///    natural back-pressure on the I/O thread when the pool is busy.
+    /// 2. **Bounded dispatcher** — submits chunk jobs to the pool while a token
+    ///    limit bounds queued and running work. It stops draining the input
+    ///    channel when that limit is reached, which applies back-pressure to I/O.
     /// 3. **Pool jobs** — parse lines, validate UTF-8, apply ANSI stripping and
     ///    field transforms, and create `DefaultSkimItem` + `Arc` per line.
-    ///    Because these jobs share the same pool as the matcher, reader and
-    ///    matcher compete for the same thread budget rather than over-subscribing
-    ///    available CPU cores.
-    /// 4. **Reorder thread** (dedicated) — collects `(seq, items)` from pool
-    ///    jobs and emits them in sequence order so downstream index assignment
+    /// 4. **Reorder thread** (dedicated) — collects `(seq, items)` from workers
+    ///    and emits them in sequence order so downstream index assignment
     ///    and `--tac` behaviour are correct.
     ///
     /// When `child` is `Some`, a **killer thread** is also spawned.  It waits
@@ -276,18 +309,27 @@ impl SkimItemReader {
         // Stage 1: I/O thread.
         Self::spawn_io_reader(source, tx_chunks, line_ending);
 
-        // Stage 2: dispatcher thread — bridges the bounded channel to the pool.
+        // Stage 2: dispatch at most a fixed number of queued or running jobs.
+        // A worker returns its token only after it sends the parsed result.
+        let max_in_flight = num_threads * 4;
+        let (tx_permits, rx_permits) = std::sync::mpsc::sync_channel(max_in_flight);
+        for _ in 0..max_in_flight {
+            tx_permits.send(()).expect("permit receiver is alive");
+        }
         thread::spawn(move || {
             while let Ok((seq, chunk)) = rx_chunks.recv() {
+                if rx_permits.recv().is_err() {
+                    break;
+                }
                 let tx = tx_results.clone();
+                let return_permit = tx_permits.clone();
                 let opt = option.clone();
                 pool.spawn(move || {
                     let result = Self::process_chunk(seq, &chunk, &opt);
                     let _ = tx.send(result);
+                    let _ = return_permit.send(());
                 });
             }
-            // rx_chunks closed → all chunks dispatched; tx_results dropped here
-            // so the reorder thread exits once the last pool job finishes.
         });
 
         // A zero-capacity channel used as a completion signal: the reorder
@@ -432,13 +474,18 @@ impl SkimItemReader {
             let Ok(line) = std::str::from_utf8(line_bytes) else {
                 continue;
             };
-            items.push(Arc::new(DefaultSkimItem::new(
+            let mut item = DefaultSkimItem::new(
                 line,
                 opt.use_ansi_color,
                 &opt.transform_fields,
                 &opt.matching_fields,
                 &opt.delimiter,
-            )) as Arc<dyn SkimItem>);
+            )
+            .hidden_fields(&opt.hidden_fields, &opt.delimiter);
+            if opt.disable_pattern.as_ref().is_some_and(|re| re.is_match(line)) {
+                item.disable();
+            }
+            items.push(Arc::new(item) as Arc<dyn SkimItem>);
         }
 
         (seq, items)
@@ -489,20 +536,32 @@ impl CommandCollector for SkimItemReader {
         components_to_stop: Arc<AtomicUsize>,
     ) -> (SkimItemReceiver, crate::prelude::Sender<i32>) {
         let send_error = self.option.show_error;
-        let (child, source) = get_command_output(cmd, send_error).expect("command not found");
+        let (child, source) =
+            get_command_output(cmd, send_error, &self.env, &self.env_unset).expect("command not found");
         self.parallel_bufread(source, child, &components_to_stop)
     }
 
     fn set_thread_pool(&mut self, pool: Arc<ThreadPool>) {
         self.thread_pool = pool;
     }
+
+    fn set_env(&mut self, env: &[(String, String)], unset: &[String]) {
+        self.env = env.to_vec();
+        self.env_unset = unset.to_vec();
+    }
 }
 
 type CommandOutput = (Option<Child>, Box<dyn BufRead + Send>);
 
-fn get_command_output(cmd: &str, send_error: bool) -> Result<CommandOutput, Box<dyn Error>> {
+fn get_command_output(
+    cmd: &str,
+    send_error: bool,
+    env: &[(String, String)],
+    unset: &[String],
+) -> Result<CommandOutput, Box<dyn Error>> {
     let (reader, writer) = std::io::pipe()?;
     let mut command = crate::shell_cmd(cmd);
+    crate::tui::util::apply_child_env(&mut command, env, unset);
     command.stdout(writer.try_clone()?);
     if send_error {
         trace!("redirecting stderr to the output");
@@ -513,3 +572,7 @@ fn get_command_output(cmd: &str, send_error: bool) -> Result<CommandOutput, Box<
 
     Ok((command.spawn().ok(), Box::new(BufReader::new(reader))))
 }
+
+#[cfg(test)]
+#[path = "item_reader_tests.rs"]
+mod tests;

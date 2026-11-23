@@ -5,44 +5,41 @@
 - Run: `cargo run [--release]`
 - Test (all): `cargo nextest run`
 - Test (single): `cargo nextest test_name`
-- Integration/E2E tests: `cargo nextest --tests` (will need tmux under the hood)
+- Integration/E2E tests: `cargo nextest run --tests` (drives `sk` through Zellij under the hood; needs `zellij` >= 0.44 and `bash` on `$PATH`)
 - Memory leak detection: `cargo nextest run --profile valgrind`
 - Thread leak/race detection:
   1. Build: `RUSTFLAGS="-Zsanitizer=thread" cargo +nightly build --tests -Zbuild-std --target x86_64-unknown-linux-gnu`
   2. Run: `TSAN_OPTIONS="detect_deadlocks=1" cargo +nightly nextest run --profile tsan --target x86_64-unknown-linux-gnu`
 - Lint: `cargo clippy`
-- Format: `cargo fmt` (check only: `cargo fmt --check`)
-
-## Code Style
-- Format with 120 char line width (defined in .rustfmt.toml)
-- Use standard Rust naming conventions (snake_case for functions/variables, CamelCase for types)
-- Organize imports by standard library, external crates, then internal modules
-- Prefer Option/Result types for error handling over panicking
-- Use proper error propagation with `?` operator
-- Document public API with rustdoc comments
-- Use meaningful type annotations, especially for public functions
-- Follow the existing structure for new modules (see src/engine/ or src/model/)
-- Implement relevant traits (SkimItem, etc.) for new types when needed
-
-## Architecture Documentation
-- `ARCHITECTURE.md` documents the full architecture: data flow, operating modes, subsystems, threading model, and public API.
-- **Update `ARCHITECTURE.md` whenever you make structural changes**, including:
-  - Adding, removing, or renaming modules, structs, or traits
-  - Changing the data flow between subsystems (reader → pool → matcher → TUI)
-  - Adding new operating modes or modifying existing ones
-  - Changing the threading model or synchronization primitives
-  - Adding or removing public API surface (`SkimItem`, `SkimOptions`, `SkimOutput`, etc.)
-  - Changing the event/action system or key binding infrastructure
-- Keep call-site line numbers in the cross-reference table up to date when the referenced functions move.
-
+- Format: `cargo +nightly fmt` (check only: `cargo +nightly fmt --check`)
+- Fuzz (requires nightly + `cargo install cargo-fuzz`): `cargo +nightly fuzz run <target>` — see `fuzz/README.md` for target list
 
 ## Testing
 
-This application can be tested by :
-- creating a new `tmux` session in the background (`tmux new-session -s <session name> -d`). Make sure to clear the `SKIM_DEFAULT_OPTIONS` env var.
-- creating a new named tmux window in that session : `tmux new-window -d -P -F '#I' -n <window name> -t <session name>` and configuring the pane naming using `tmux set-window-option -t <window name> pane-base-index 0`
-- sending the command to run and input using `tmux send-keys -t <window name> <keys>`
-- when ready, capturing the window using `tmux capture-pane -b <window name> -t <window name>.0` and then saving the capture to a file using `tmux save-buffer -b <window name> <output file>`
+The end-to-end tests drive a real `sk` process through a terminal, using the
+Zellij-backed harness in `tests/common/zellij.rs` (`ZellijController` + the
+`sk_test!` DSL). It requires `zellij` (>= 0.44) and `bash` on `$PATH`. The
+harness is cross-platform (Linux, macOS and Windows). The pure-harness tests in
+`interactive.rs` run on all three platforms; `execute.rs`, `popup.rs` and
+`listen.rs` stay `#![cfg(unix)]` for reasons unrelated to the multiplexer (they
+install POSIX mock binaries / bind a unix socket), so they run on Linux and
+macOS. A few harness details make the non-Linux runners work: the pane's shell
+is resolved to an absolute `bash` path (the Zellij server's environment may lack
+`bash` on `PATH`); `ZELLIJ_SOCKET_DIR` is forced to a short path so the session's
+unix socket path stays under the OS cap (macOS's default `$TMPDIR` is too long);
+the drain thread answers the client's cursor-position report (`ESC[6n`), which
+the Windows ConPTY client blocks on to learn the terminal size; and `wait_ready`
+nudges the client's terminal size until the server gives the pane a non-zero
+geometry to render into. The harness drives Zellij with:
+- `zellij attach --create <session>` (spawned on an in-process PTY via
+  `portable-pty`) to start a detached session; `SKIM_DEFAULT_OPTIONS` and friends
+  are cleared on the spawned process.
+- `zellij --session <session> action write <bytes...>` to inject keystrokes.
+- `zellij --session <session> action dump-screen [--ansi]` to capture the pane.
+
+When exploring manually you can reproduce the same flow with those commands; the
+config the harness writes disables startup tips, pane frames and the kitty
+keyboard protocol (so injected legacy escape sequences reach `sk`).
 
 ## Insta Snapshot Tests
 
@@ -62,7 +59,8 @@ insta_test!(my_test, @interactive, &["-i", "--cmd", "echo {q}"]);
 **DSL variant** (multiple snapshots with interaction between them):
 ```rust
 insta_test!(my_test, ["a", "b", "c"], &["--multi"], {
-    @snap;                      // take a snapshot
+    @snap;                      // take a snapshot (cell text only)
+    @snap_color;                // snapshot cell styling (fg/bg/modifier) instead
     @key Up;                    // send a named key (Enter, Down, Tab, …)
     @char 'f';                  // send a single character
     @type "foo";                // type a string
@@ -83,6 +81,7 @@ insta_test!(my_test, ["a", "b", "c"], &["--multi"], {
 |---|---|---|
 | Simple variant | `{file}__{test}.snap` | `options__opt_wrap.snap` |
 | DSL variant — Nth `@snap` | `{file}__{test}@{NNN}.snap` | `options__opt_cycle@002.snap` |
+| DSL variant — Nth `@snap_color` | `{file}__{test}@color{NNN}.snap` | `ansi__ansi_flag_enabled@color002.snap` |
 
 DSL snapshots use a zero-padded three-digit suffix (`@001`, `@002`, …) so that
 `cargo insta review` presents them in the order they were taken.

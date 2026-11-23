@@ -29,7 +29,8 @@ auto-release:
 test target="":
     cargo test --doc
     cargo nextest run {{ target }}
-    tmux kill-session -t skim_e2e
+    # Each e2e test creates and tears down its own Zellij session, so there is
+    # no shared multiplexer session to clean up here.
 
 bench-plot bins="./target/release/sk sk fzf":
     #!/usr/bin/env bash
@@ -86,3 +87,13 @@ pr-review id="":
 
     just generate-files
     (git add man/ shell/ && git commit -m 'chore: generate-files' && git push) || echo "Nothing to do"
+
+coverage *args="":
+    cargo +nightly llvm-cov nextest --ignore-run-fail --branch --lib --bins --examples --tests {{ args }}
+    cargo +nightly llvm-cov report --html
+
+clippy *args="":
+    cargo clippy --all-targets {{ args }}
+
+fmt *args="":
+    cargo +nightly fmt {{ args }}

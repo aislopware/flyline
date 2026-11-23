@@ -1,8 +1,6 @@
 use crossterm::terminal;
-use ratatui::{
-    style::Style,
-    text::{Line, Span, Text},
-};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span, Text};
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::{
@@ -253,6 +251,124 @@ impl Drop for RawMode {
     }
 }
 
+/// Detect the terminal's image protocol and cell size through its controlling TTY.
+///
+/// Unlike `Picker::from_query_stdio`, this does not read from standard input, which may be the
+/// item stream when skim is used in a pipeline. The caller must have put the terminal in raw mode.
+#[cfg(all(feature = "image", unix))]
+pub(crate) fn detect_image_picker() -> eyre::Result<ratatui_image::picker::Picker> {
+    use std::env;
+    use std::os::fd::AsRawFd as _;
+    use std::time::Instant;
+
+    use eyre::eyre;
+    use nix::sys::time::{suseconds_t, time_t};
+    use ratatui_image::FontSize;
+    use ratatui_image::picker::cap_parser::{Parser, QueryStdioOptions, Response};
+    use ratatui_image::picker::{Picker, ProtocolType};
+
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open("/dev/tty")?;
+
+    let mut options = QueryStdioOptions::default();
+    let is_wezterm = env::var("WEZTERM_EXECUTABLE").is_ok_and(|value| !value.is_empty());
+    let is_konsole = env::var("KONSOLE_VERSION").is_ok_and(|value| !value.is_empty());
+    if is_wezterm || is_konsole {
+        options.blacklist_protocols = vec![ProtocolType::Kitty, ProtocolType::Sixel];
+    }
+
+    let timeout = options.timeout;
+    let is_tmux = env::var("TMUX").is_ok_and(|value| !value.is_empty());
+    tty.write_all(Parser::query(is_tmux, options).as_bytes())?;
+    tty.flush()?;
+
+    let deadline = Instant::now() + timeout;
+    let mut parser = Parser::new();
+    let mut responses = Vec::new();
+
+    'query: loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(eyre!("terminal image protocol detection timed out"));
+        };
+        let micros = i32::try_from(remaining.as_micros()).unwrap_or(i32::MAX);
+        let mut select_timeout =
+            nix::sys::time::TimeVal::new(time_t::from(micros / 1_000_000), suseconds_t::from(micros % 1_000_000));
+        let mut rfds = nix::sys::select::FdSet::new();
+        rfds.insert(tty.as_fd());
+
+        match nix::sys::select::select(
+            rfds.highest().unwrap().as_raw_fd() + 1,
+            Some(&mut rfds),
+            None,
+            None,
+            Some(&mut select_timeout),
+        ) {
+            Ok(0) => return Err(eyre!("terminal image protocol detection timed out")),
+            Ok(_) => {
+                let mut buf = [0; 128];
+                match tty.read(&mut buf) {
+                    Ok(0) => return Err(eyre!("controlling terminal closed during image protocol detection")),
+                    Ok(read) => {
+                        for byte in &buf[..read] {
+                            for response in parser.push(char::from(*byte)) {
+                                if response == Response::Status {
+                                    break 'query;
+                                }
+                                responses.push(response);
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(err) => return Err(io::Error::from_raw_os_error(err as i32).into()),
+        }
+    }
+
+    let mut protocol = None;
+    let mut font_size = None;
+    for response in responses {
+        match response {
+            Response::Kitty => protocol = Some(ProtocolType::Kitty),
+            Response::Sixel if protocol.is_none() => protocol = Some(ProtocolType::Sixel),
+            Response::CellSize(Some((width, height))) => font_size = Some(FontSize::new(width, height)),
+            _ => {}
+        }
+    }
+
+    let font_size = font_size.or_else(|| {
+        let size = crossterm::terminal::window_size().ok()?;
+        if size.width == 0 || size.height == 0 || size.columns == 0 || size.rows == 0 {
+            return None;
+        }
+        Some(FontSize::new(size.width / size.columns, size.height / size.rows))
+    });
+    let Some(font_size) = font_size else {
+        return Ok(Picker::halfblocks());
+    };
+
+    // This deprecated constructor is currently the only public way to set the font size while also
+    // initializing ratatui-image's private tmux state.
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(font_size);
+    if let Some(protocol) = protocol {
+        picker.set_protocol_type(protocol);
+    }
+    Ok(picker)
+}
+
+/// Detect the image protocol through standard I/O on Windows.
+#[cfg(all(feature = "image", windows))]
+pub(crate) fn detect_image_picker() -> eyre::Result<ratatui_image::picker::Picker> {
+    Ok(ratatui_image::picker::Picker::from_query_stdio()?)
+}
+
+/// Get cursor position, 1-based
 #[cfg(unix)]
 pub(crate) fn cursor_pos_from_tty() -> io::Result<(u16, u16)> {
     let _guard = RawMode::new()?;
@@ -309,286 +425,26 @@ pub(crate) fn cursor_pos_from_tty() -> io::Result<(u16, u16)> {
     Ok((cx, cy))
 }
 
+/// Get cursor position, 1-based
 #[cfg(windows)]
 pub(crate) fn cursor_pos_from_tty() -> io::Result<(u16, u16)> {
     let _guard = RawMode::new()?;
-    crossterm::cursor::position()
+    crossterm::cursor::position().map(|(x, y)| (x + 1, y + 1))
+}
+
+/// Applies a child-process environment snapshot to `command`.
+///
+/// Every name in `unset` is first removed from the inherited environment: a
+/// skipped pair does not unset an inherited variable, so a skim started inside
+/// fzf would otherwise pass the enclosing process's stale `FZF_*` values to its
+/// children. The pairs in `env` are then set.
+pub(crate) fn apply_child_env(command: &mut std::process::Command, env: &[(String, String)], unset: &[String]) {
+    for name in unset {
+        command.env_remove(name);
+    }
+    command.envs(env.iter().cloned());
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ansi_to_tui::IntoText as _;
-    use ratatui::style::{Color, Style};
-
-    #[test]
-    fn test_wrap_text_no_wrap_needed() {
-        // Text shorter than width should not be wrapped
-        let input = Text::from("short");
-        let result = wrap_text(input.clone(), 10);
-        assert_eq!(result.lines.len(), 1);
-        assert_eq!(result.lines[0].spans[0].content, "short");
-    }
-
-    #[test]
-    fn test_wrap_text_exact_width() {
-        // Text exactly at width should not be wrapped
-        let input = Text::from("exact");
-        let result = wrap_text(input, 5);
-        assert_eq!(result.lines.len(), 1);
-        assert_eq!(result.lines[0].spans[0].content, "exact");
-    }
-
-    #[test]
-    fn test_wrap_text_simple_wrap() {
-        // Text longer than width should wrap
-        let input = Text::from("hello world");
-        let result = wrap_text(input, 5);
-        assert!(result.lines.len() > 1);
-        assert_eq!(result.lines[0].spans[0].content, "hello");
-        assert_eq!(result.lines[1].spans[0].content, " worl");
-        assert_eq!(result.lines[2].spans[0].content, "d");
-    }
-
-    #[test]
-    fn test_wrap_text_preserves_style() {
-        // Create styled text
-        let style = Style::default().fg(Color::Red);
-        let span = Span::styled("hello world", style);
-        let input = Text::from(Line::from(vec![span]));
-
-        let result = wrap_text(input, 5);
-
-        // Verify style is preserved across all spans
-        for line in &result.lines {
-            for span in &line.spans {
-                assert_eq!(span.style.fg, Some(Color::Red));
-            }
-        }
-    }
-
-    #[test]
-    fn test_wrap_text_multiple_spans() {
-        // Create text with multiple spans
-        let span1 = Span::styled("hello", Style::default().fg(Color::Red));
-        let span2 = Span::styled(" world", Style::default().fg(Color::Blue));
-        let input = Text::from(Line::from(vec![span1, span2]));
-
-        let result = wrap_text(input, 5);
-
-        // Should wrap into multiple lines
-        assert!(result.lines.len() > 1);
-
-        // Verify content is preserved
-        let reconstructed: String = result
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(reconstructed, "hello world");
-    }
-
-    #[test]
-    fn test_wrap_text_multiple_lines() {
-        // Create text with multiple input lines
-        let input = Text::from(vec![Line::from("first line"), Line::from("second line")]);
-
-        let result = wrap_text(input, 5);
-
-        // Each input line should be processed
-        assert!(result.lines.len() >= 2);
-    }
-
-    #[test]
-    fn test_wrap_text_unicode_characters() {
-        // Test with wide Unicode characters
-        let input = Text::from("こんにちは"); // Japanese characters (2 width each)
-        let result = wrap_text(input, 6);
-
-        // Should wrap correctly based on display width
-        assert!(result.lines.len() > 1);
-    }
-
-    #[test]
-    fn test_wrap_text_zero_width_characters() {
-        // Test with combining characters
-        let input = Text::from("a\u{0301}b"); // a with accent
-        let result = wrap_text(input, 10);
-
-        // Should handle zero-width characters
-        assert_eq!(result.lines.len(), 1);
-    }
-
-    #[test]
-    fn test_wrap_text_width_one() {
-        // Edge case: wrap at width 1
-        let input = Text::from("abc");
-        let result = wrap_text(input, 1);
-
-        // Each character should be on its own line
-        assert_eq!(result.lines.len(), 3);
-        assert_eq!(result.lines[0].spans[0].content, "a");
-        assert_eq!(result.lines[1].spans[0].content, "b");
-        assert_eq!(result.lines[2].spans[0].content, "c");
-    }
-
-    #[test]
-    fn test_wrap_text_empty_input() {
-        // Test with empty text
-        let input = Text::default();
-        let result = wrap_text(input, 10);
-
-        // Should return empty text
-        assert_eq!(result.lines.len(), 0);
-    }
-
-    #[test]
-    fn test_wrap_text_preserves_multiple_styles() {
-        // Create complex multi-styled text
-        let red_style = Style::default().fg(Color::Red);
-        let blue_style = Style::default().fg(Color::Blue);
-        let green_style = Style::default().fg(Color::Green);
-
-        let span1 = Span::styled("hello", red_style);
-        let span2 = Span::styled("world", blue_style);
-        let span3 = Span::styled("test", green_style);
-
-        let input = Text::from(Line::from(vec![span1, span2, span3]));
-        let result = wrap_text(input, 5);
-
-        // Collect all styles from result
-        let styles: Vec<_> = result
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.style.fg)
-            .collect();
-
-        // Should contain all original colors
-        assert!(styles.contains(&Some(Color::Red)));
-        assert!(styles.contains(&Some(Color::Blue)));
-        assert!(styles.contains(&Some(Color::Green)));
-    }
-
-    #[test]
-    fn test_clip_line_to_chars_basic() {
-        let line = Line::from("hello world");
-        let clipped = clip_line_to_chars(line, 5);
-        let content: String = clipped.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(content, "hello");
-    }
-
-    #[test]
-    fn test_clip_line_to_chars_exact_length() {
-        let line = Line::from("hello");
-        let clipped = clip_line_to_chars(line, 5);
-        let content: String = clipped.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(content, "hello");
-    }
-
-    #[test]
-    fn test_clip_line_to_chars_longer_than_input() {
-        let line = Line::from("hi");
-        let clipped = clip_line_to_chars(line, 100);
-        let content: String = clipped.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(content, "hi");
-    }
-
-    #[test]
-    fn test_clip_line_to_chars_zero() {
-        let line = Line::from("hello");
-        let clipped = clip_line_to_chars(line, 0);
-        let content: String = clipped.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(content, "");
-    }
-
-    #[test]
-    fn test_clip_line_to_chars_preserves_styles() {
-        use ratatui::style::Color;
-        let red = Style::default().fg(Color::Red);
-        let blue = Style::default().fg(Color::Blue);
-        let line = Line::from(vec![Span::styled("abc", red), Span::styled("def", blue)]);
-        // Clip at the span boundary.
-        let clipped = clip_line_to_chars(line, 3);
-        assert_eq!(clipped.spans.len(), 1);
-        assert_eq!(clipped.spans[0].content.as_ref(), "abc");
-        assert_eq!(clipped.spans[0].style.fg, Some(Color::Red));
-    }
-
-    #[test]
-    fn test_clip_line_to_chars_splits_span() {
-        use ratatui::style::Color;
-        let red = Style::default().fg(Color::Red);
-        let blue = Style::default().fg(Color::Blue);
-        let line = Line::from(vec![Span::styled("abcde", red), Span::styled("fghij", blue)]);
-        // Clip inside the first span.
-        let clipped = clip_line_to_chars(line, 3);
-        assert_eq!(clipped.spans.len(), 1);
-        assert_eq!(clipped.spans[0].content.as_ref(), "abc");
-        assert_eq!(clipped.spans[0].style.fg, Some(Color::Red));
-    }
-
-    #[test]
-    fn test_clip_line_to_chars_splits_across_spans() {
-        use ratatui::style::Color;
-        let red = Style::default().fg(Color::Red);
-        let blue = Style::default().fg(Color::Blue);
-        let line = Line::from(vec![Span::styled("abc", red), Span::styled("def", blue)]);
-        // Clip into the second span.
-        let clipped = clip_line_to_chars(line, 5);
-        assert_eq!(clipped.spans.len(), 2);
-        assert_eq!(clipped.spans[0].content.as_ref(), "abc");
-        assert_eq!(clipped.spans[1].content.as_ref(), "de");
-        assert_eq!(clipped.spans[1].style.fg, Some(Color::Blue));
-    }
-
-    #[test]
-    fn test_clip_line_to_chars_unicode() {
-        // Each kanji is one char.
-        let line = Line::from("日本語テスト");
-        let clipped = clip_line_to_chars(line, 3);
-        let content: String = clipped.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(content, "日本語");
-    }
-
-    #[test]
-    fn test_merge_styles() {
-        use ratatui::style::{Color::*, Modifier};
-        let input = "before \x1b[1;34mline1\x1b[0m nocol";
-        let styled = input.into_text().unwrap().lines[0].clone();
-        let red = Style::new().red();
-        let underline = Style::new().underlined();
-        assert_eq!(merge_styles(red, styled.spans[0].style).fg, Some(Red));
-        assert_eq!(merge_styles(red, styled.spans[1].style).fg, Some(Blue));
-        assert_eq!(merge_styles(red, styled.spans[1].style).add_modifier, Modifier::BOLD);
-        assert_eq!(merge_styles(red, styled.spans[2].style).fg, Some(Red));
-        assert_eq!(
-            merge_styles(underline, styled.spans[0].style).add_modifier & Modifier::UNDERLINED,
-            Modifier::UNDERLINED
-        );
-        assert_eq!(
-            merge_styles(underline, styled.spans[1].style).add_modifier & Modifier::UNDERLINED,
-            Modifier::UNDERLINED
-        );
-        assert_eq!(
-            merge_styles(underline, styled.spans[2].style).add_modifier & Modifier::UNDERLINED,
-            Modifier::UNDERLINED
-        );
-    }
-
-    #[test]
-    fn test_style_text() {
-        use ratatui::style::{Color::*, Modifier};
-        let input = "before \x1b[1;34mline1\x1b[0m nocol";
-        let mut styled = input.into_text().unwrap();
-        let red = Style::new().red();
-        style_text(&mut styled, red);
-        assert_eq!(styled.lines.len(), 1);
-        let line = styled.lines[0].clone();
-        assert_eq!(line.spans[0].style.fg, Some(Red));
-        assert_eq!(line.spans[1].style.fg, Some(Blue));
-        assert_eq!(line.spans[1].style.add_modifier, Modifier::BOLD);
-        assert_eq!(line.spans[2].style.fg, Some(Red));
-    }
-}
+#[path = "util_tests.rs"]
+mod tests;

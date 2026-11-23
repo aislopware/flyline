@@ -10,14 +10,16 @@ pub use app::App;
 pub use event::Event;
 pub use preview::PreviewCallback;
 use thiserror::Error;
-pub use widget::{SkimRender, SkimWidget};
+pub use widget::SkimRender;
 mod app;
 mod backend;
 pub(crate) mod util;
 #[cfg(windows)]
 mod windows;
 pub use backend::Tui;
-/// Event handling and action definitions
+/// Action definitions, catalog and parsing
+pub mod actions;
+/// Event handling
 pub mod event;
 /// Header display components
 pub mod header;
@@ -31,6 +33,7 @@ pub mod layout;
 /// TUI-specific options and configuration
 pub mod options;
 mod preview;
+mod preview_terminal;
 /// Status line display
 pub mod statusline;
 /// Widget rendering utilities
@@ -135,7 +138,7 @@ impl std::fmt::Display for Size {
 /// This mirrors Ratatui's border type
 ///
 /// We need it so that we can properly use `ValueEnum`
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[allow(missing_docs)]
 pub enum BorderType {
@@ -192,6 +195,20 @@ impl BorderType {
     }
 }
 
+#[cfg(feature = "cli")]
+impl std::str::FromStr for BorderType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use clap::ValueEnum as _;
+        for variant in Self::value_variants() {
+            if variant.to_possible_value().unwrap().matches(s, false) {
+                return Ok(*variant);
+            }
+        }
+        Ok(Self::Plain)
+    }
+}
 #[cfg(test)]
 mod size_test {
     use super::*;
@@ -246,5 +263,40 @@ mod size_test {
         };
         assert_eq!(internal_error.kind(), &IntErrorKind::Empty);
         assert_eq!(value, String::from("%"));
+    }
+
+    #[test]
+    fn default_is_full_percent() {
+        assert_eq!(Size::default(), Size::Percent(100));
+    }
+
+    #[test]
+    fn display_formats_each_variant() {
+        assert_eq!(Size::Percent(50).to_string(), "50%");
+        assert_eq!(Size::Fixed(20).to_string(), "20");
+        assert_eq!(Size::Neg(5).to_string(), "-5");
+    }
+
+    #[test]
+    fn direction_try_from_parses_each() {
+        assert_eq!(Direction::try_from("up"), Ok(Direction::Up));
+        assert_eq!(Direction::try_from("DOWN"), Ok(Direction::Down));
+        assert_eq!(Direction::try_from("Left"), Ok(Direction::Left));
+        assert_eq!(Direction::try_from("right"), Ok(Direction::Right));
+        assert!(Direction::try_from("sideways").is_err());
+    }
+
+    #[test]
+    fn border_type_none_and_some() {
+        assert!(BorderType::None.is_none());
+        assert!(BorderType::ForceOff.is_none());
+        assert!(!BorderType::Plain.is_none());
+        assert!(BorderType::Rounded.is_some());
+
+        assert_eq!(BorderType::None.into_ratatui(), None);
+        assert_eq!(
+            BorderType::Plain.into_ratatui(),
+            Some(ratatui::widgets::BorderType::Plain)
+        );
     }
 }

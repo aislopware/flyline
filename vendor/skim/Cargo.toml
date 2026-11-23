@@ -1,12 +1,10 @@
 [package]
 name = "skim"
-version = "4.6.0"
+version = "5.9.0"
 authors = ["Loric ANDRE", "Zhang Jinzhou <lotabout@gmail.com>"]
 description = "Fuzzy Finder in rust!"
 documentation = "https://docs.rs/skim"
-homepage = "https://github.com/skim-rs/skim"
 repository = "https://github.com/skim-rs/skim"
-readme = "README.md"
 keywords = ["fuzzy", "menu", "util"]
 license = "MIT"
 edition = "2024"
@@ -24,35 +22,31 @@ required-features = ["cli"]
 
 [features]
 # Default is destined to the CLI, not to library usage.
-default = ["cli", "frizbee", "tui"]
-# Everything needed to use skim as a CLI (argument parsing, shell integrations...). This should not be needed for most libraries.
-cli = ["dep:clap", "dep:clap_complete", "dep:shlex", "dep:env_logger", "dep:clap_mangen", "dep:clap_complete_nushell", "dep:roff", "tui"]
+default = ["cli", "frizbee", "image", "listen", "tui"]
+# Everything needed to use skim as a cli (argument parsing, shell integrations...). This should not be needed for most libraries.
+cli = ["dep:clap", "dep:clap_complete", "dep:clap_complete_nushell", "dep:shlex", "dep:env_logger", "dep:clap_mangen", "dep:roff", "tui"]
 # Full TUI + runtime dependencies (ratatui, crossterm, tokio, …). Required for interactive use.
 # When disabled (e.g. with --no-default-features), only the matching-algorithm modules are compiled.
 tui = [
     "dep:ansi-to-tui",
-    "dep:assert_enum_variants",
-    "dep:color-eyre",
+    "dep:avt",
     "dep:crossterm",
     "dep:derive_builder",
     "dep:derive_more",
+    "dep:eyre",
     "dep:futures",
     "dep:indexmap",
-    "dep:interprocess",
     "dep:kanal",
     "dep:mimalloc",
     "dep:nix",
     "dep:portable-pty",
     "dep:ratatui",
     "dep:regex",
-    "dep:ron",
-    "dep:serde",
     "dep:shell-quote",
     "dep:tempfile",
     "dep:thiserror",
     "dep:tokio",
     "dep:tokio-util",
-    "dep:tui-term",
     "dep:unicode-display-width",
     "dep:unicode-normalization",
     "dep:which",
@@ -63,6 +57,10 @@ tui = [
 algos_only = []
 # Include frizbee as a matching algorithm
 frizbee = ["dep:frizbee"]
+# Enable image previews (renders the preview argument as an image)
+image = ["dep:image", "dep:ratatui-image", "tui"]
+# Enable the IPC socket (--listen / --remote), driving skim from other processes
+listen = ["dep:interprocess", "dep:ron", "dep:serde", "nix/user", "dep:windows-sys", "tui"]
 # Enable gungraun (Valgrind-based) benchmarks
 gungraun = ["dep:gungraun"]
 
@@ -81,62 +79,76 @@ inherits = "release"
 debug = true
 strip = false
 
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
+[lints.rust]
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage, coverage_nightly)'] }
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+incompatible_msrv = "warn"
+collapsible_match = "allow"
+default_trait_access = "allow"
+
 [dependencies]
+avt = { version = "0.20", optional = true }
 ansi-to-tui = { version = "8.0.1", optional = true }
-assert_enum_variants = { version = "0.1.2", optional = true }
 clap = { version = "4.6.1" , optional = true, features = ["cargo", "derive", "unstable-markdown"] }
-clap_complete = { version = "4.6.0", optional = true }
+clap_complete = { version = "4.6.5", optional = true }
 clap_complete_nushell = { version = "4.6.0", optional = true }
 clap_mangen = { version = "0.3.0", optional = true }
-color-eyre = { version = "0.6.5", optional = true }
+eyre = { version = "0.6.12", optional = true }
 # Crossterm's version is selected by ratatui
-crossterm = { version = ">=0.0.0", optional = true, features = ["event-stream", "use-dev-tty", "libc"] }
+crossterm = { version = ">=0.0.0", features = ["event-stream", "use-dev-tty", "libc"], optional = true }
 derive_builder = { version = "0.20.2", optional = true }
-derive_more = { version = "2.1.1", optional = true, features = ["debug", "eq"] }
+derive_more = { version = "2.1.1", features = ["debug", "eq"], optional = true }
 env_logger = { version = "0.11.10", optional = true, features = ["humantime"] }
+frizbee = { version = "=0.13.0", optional = true }
 futures = { version = "0.3.32", optional = true }
-gungraun = { version = "0.18.1", optional = true }
+gungraun = { version = "0.20.0", optional = true }
+image = { version = "0.25.10", optional = true, default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 indexmap = { version = "2.13.1", optional = true }
-interprocess = { version = "2.4.2", optional = true, features = ["tokio"] }
+interprocess = { version = "2.4.2", features = ["tokio"], optional = true }
 kanal = { version = "0.1.1", optional = true }
-log = "0.4.29"
-memchr = "2.8.0"
-mimalloc = { version = "0.1.48", optional = true, features = ["v3"] }
-nix = { version = "0.31.2", optional = true, features = ["fs", "poll"] }
+log = "0.4.31"
+memchr = "2.8.1"
+mimalloc = { version = "0.1.48", features = ["v3"], optional = true }
+nix = { version = "0.31.3", features = ["fs", "poll", "signal"], optional = true }
 portable-pty = { version = "0.9.0", optional = true }
-ratatui = { version = "0.30.0", optional = true }
+ratatui = { version = "0.30.2", optional = true }
+ratatui-image = { version = "11.0.4", features = ["crossterm"], default-features = false, optional = true }
 regex = { version = "1.12.3", optional = true }
 roff = { version = "1.1.1", optional = true }
 ron = { version = "0.12.1", optional = true }
-serde = { version = "1.0.228", optional = true, features = ["derive"] }
-shell-quote = { version = "0.7.2", optional = true }
-shlex = { version = "1.3.0", optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+shell-quote = { version = "0.8.0", optional = true }
+shlex = { version = "2.0.1", optional = true }
 tempfile = { version = "3.27.0", optional = true }
 thiserror = { version = "2.0.18", optional = true }
 thread_local = "1.1.9"
-tokio = { version = "1.52.1", optional = true, features = ["macros", "net", "rt-multi-thread", "sync", "time", "tokio-macros"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "sync", "time", "tokio-macros"], optional = true }
 tokio-util = { version = "0.7.18", optional = true }
-tui-term = { version = "0.3.4", optional = true }
 unicode-display-width = { version = "0.3.0", optional = true }
 unicode-normalization = { version = "0.1.25", optional = true }
 which = { version = "8.0.2", optional = true }
 
-[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
-frizbee = { version = "=0.9.0", optional = true }
-
-[build-dependencies]
-cfg_aliases = "0.2.1"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"], optional = true }
 
 [dev-dependencies]
+assert_enum_variants = "0.1.2"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 gnuplot = "0.0.46"
 insta = "1.47"
 rand = "0.10.0"
-serde_json = { version = "=1.0.149" }
-serial_test = "=3.4.0"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage, coverage_nightly)'] }
+serde_json = { version = "=1.0.154" }
+serial_test = "=3.5.0"
+shlex = "2.0.1"
 
 [[bench]]
 name = "read_and_match"
@@ -169,3 +181,33 @@ upgrade-guid = "6DDAED06-EBE2-41C4-94F5-CB03F2A4B92E"
 path-guid = "05D1A327-19E0-4C82-B5EC-6B28E40C691B"
 license = false
 eula = false
+
+# Debian package (.deb) built via `cargo deb`.
+# Ships the `sk` executable, the man pages and the shell completions.
+[package.metadata.deb]
+maintainer = "Loric ANDRE, Zhang Jinzhou <lotabout@gmail.com>"
+copyright = "The skim developers"
+section = "utils"
+priority = "optional"
+extended-description = "skim is a general purpose fuzzy finder written in Rust, usable as a command line tool and as a library."
+assets = [
+    ["target/release/sk", "usr/bin/", "755"],
+    ["man/man1/sk.1", "usr/share/man/man1/", "644"],
+    ["shell/completion.bash", "usr/share/bash-completion/completions/sk", "644"],
+    ["shell/completion.zsh", "usr/share/zsh/vendor-completions/_sk", "644"],
+    ["shell/completion.fish", "usr/share/fish/vendor_completions.d/sk.fish", "644"],
+    ["README.md", "usr/share/doc/skim/README.md", "644"],
+]
+
+# RPM package (.rpm) built via `cargo generate-rpm`.
+# Ships the `sk` executable, the man pages and the shell completions.
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/sk", dest = "/usr/bin/sk", mode = "755" },
+    { source = "man/man1/sk.1", dest = "/usr/share/man/man1/sk.1", mode = "644", doc = true },
+    { source = "shell/completion.bash", dest = "/usr/share/bash-completion/completions/sk", mode = "644" },
+    { source = "shell/completion.zsh", dest = "/usr/share/zsh/site-functions/_sk", mode = "644" },
+    { source = "shell/completion.fish", dest = "/usr/share/fish/vendor_completions.d/sk.fish", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/skim/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/skim/LICENSE", mode = "644", doc = true },
+]

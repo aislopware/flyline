@@ -1,4 +1,7 @@
-use skim::{Skim, prelude::SkimOptionsBuilder};
+//! Runs skim repeatedly to check that runs clean up their worker threads.
+
+use skim::Skim;
+use skim::prelude::SkimOptionsBuilder;
 
 // Hint: use `ps -T -p $(pgrep -f target/debug/examples/multiple_runs)` to watch threads while the
 // different invocations run, and make sure none is leaking through
@@ -10,7 +13,7 @@ fn main() {
             .build()
             .unwrap();
         let res = Skim::run_with(opts, None).unwrap();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
         unsafe {
             nix::libc::malloc_trim(0);
         }

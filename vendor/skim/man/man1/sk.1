@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH sk 1  "sk 4.6.0" 
+.TH sk 1  "sk 5.9.0" 
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SH NAME
@@ -8,7 +8,7 @@ sk \- Fuzzy Finder in rust!
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SH SYNOPSIS
-\fBsk\fR [\fB\-\-tac\fR] [\fB\-\-min\-query\-length\fR] [\fB\-\-no\-sort\fR] [\fB\-t\fR|\fB\-\-tiebreak\fR] [\fB\-n\fR|\fB\-\-nth\fR] [\fB\-\-with\-nth\fR] [\fB\-d\fR|\fB\-\-delimiter\fR] [\fB\-e\fR|\fB\-\-exact\fR] [\fB\-\-regex\fR] [\fB\-\-algo\fR] [\fB\-\-case\fR] [\fB\-\-typos\fR] [\fB\-\-no\-typos\fR] [\fB\-\-normalize\fR] [\fB\-\-split\-match\fR] [\fB\-\-last\-match\fR] [\fB\-\-scheme\fR] [\fB\-b\fR|\fB\-\-bind\fR] [\fB\-m\fR|\fB\-\-multi\fR] [\fB\-\-no\-multi\fR] [\fB\-\-no\-mouse\fR] [\fB\-c\fR|\fB\-\-cmd\fR] [\fB\-i\fR|\fB\-\-interactive\fR] [\fB\-I \fR] [\fB\-\-color\fR] [\fB\-\-highlight\-line\fR] [\fB\-\-no\-hscroll\fR] [\fB\-\-keep\-right\fR] [\fB\-\-skip\-to\-pattern\fR] [\fB\-\-no\-clear\-if\-empty\fR] [\fB\-\-no\-clear\-start\fR] [\fB\-\-no\-clear\fR] [\fB\-\-show\-cmd\-error\fR] [\fB\-\-cycle\fR] [\fB\-\-disabled\fR] [\fB\-\-layout\fR] [\fB\-\-reverse\fR] [\fB\-\-height\fR] [\fB\-\-no\-height\fR] [\fB\-\-min\-height\fR] [\fB\-\-margin\fR] [\fB\-p\fR|\fB\-\-prompt\fR] [\fB\-\-cmd\-prompt\fR] [\fB\-\-selector\fR] [\fB\-\-multi\-selector\fR] [\fB\-\-ansi\fR] [\fB\-\-tabstop\fR] [\fB\-\-info\fR] [\fB\-\-no\-info\fR] [\fB\-\-inline\-info\fR] [\fB\-\-header\fR] [\fB\-\-header\-lines\fR] [\fB\-\-border\fR] [\fB\-\-no\-border\fR] [\fB\-\-wrap\fR] [\fB\-\-multiline\fR] [\fB\-\-scrollbar\fR] [\fB\-\-no\-scrollbar\fR] [\fB\-\-history\fR] [\fB\-\-history\-size\fR] [\fB\-\-cmd\-history\fR] [\fB\-\-cmd\-history\-size\fR] [\fB\-\-preview\fR] [\fB\-\-preview\-window\fR] [\fB\-q\fR|\fB\-\-query\fR] [\fB\-\-cmd\-query\fR] [\fB\-\-read0\fR] [\fB\-\-print0\fR] [\fB\-\-print\-query\fR] [\fB\-\-print\-cmd\fR] [\fB\-\-print\-score\fR] [\fB\-\-print\-header\fR] [\fB\-\-print\-current\fR] [\fB\-\-output\-format\fR] [\fB\-\-no\-strip\-ansi\fR] [\fB\-1\fR|\fB\-\-select\-1\fR] [\fB\-0\fR|\fB\-\-exit\-0\fR] [\fB\-\-sync\fR] [\fB\-\-pre\-select\-n\fR] [\fB\-\-pre\-select\-pat\fR] [\fB\-\-pre\-select\-items\fR] [\fB\-\-pre\-select\-file\fR] [\fB\-f\fR|\fB\-\-filter\fR] [\fB\-\-shell\fR] [\fB\-\-shell\-bindings\fR] [\fB\-\-man\fR] [\fB\-\-listen\fR] [\fB\-\-remote\fR] [\fB\-\-popup\fR] [\fB\-\-log\-level\fR] [\fB\-\-log\-file\fR] [\fB\-\-expect\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] 
+\fBsk\fR [\fB\-\-tac\fR] [\fB\-\-min\-query\-length\fR] [\fB\-\-no\-sort\fR] [\fB\-t\fR|\fB\-\-tiebreak\fR] [\fB\-n\fR|\fB\-\-nth\fR] [\fB\-\-with\-nth\fR] [\fB\-\-hide\-nth\fR] [\fB\-d\fR|\fB\-\-delimiter\fR] [\fB\-e\fR|\fB\-\-exact\fR] [\fB\-\-regex\fR] [\fB\-\-algo\fR] [\fB\-\-case\fR] [\fB\-\-typos\fR] [\fB\-\-no\-typos\fR] [\fB\-\-normalize\fR] [\fB\-\-split\-match\fR] [\fB\-\-last\-match\fR] [\fB\-\-scheme\fR] [\fB\-b\fR|\fB\-\-bind\fR] [\fB\-m\fR|\fB\-\-multi\fR] [\fB\-\-no\-multi\fR] [\fB\-\-no\-mouse\fR] [\fB\-c\fR|\fB\-\-cmd\fR] [\fB\-i\fR|\fB\-\-interactive\fR] [\fB\-I \fR] [\fB\-\-color\fR] [\fB\-\-highlight\-line\fR] [\fB\-\-no\-hscroll\fR] [\fB\-\-keep\-right\fR] [\fB\-\-skip\-to\-pattern\fR] [\fB\-\-no\-clear\-if\-empty\fR] [\fB\-\-no\-clear\-start\fR] [\fB\-\-no\-clear\fR] [\fB\-\-show\-cmd\-error\fR] [\fB\-\-cycle\fR] [\fB\-\-disabled\fR] [\fB\-\-disable\-pattern\fR] [\fB\-\-layout\fR] [\fB\-\-reverse\fR] [\fB\-\-height\fR] [\fB\-\-no\-height\fR] [\fB\-\-min\-height\fR] [\fB\-\-margin\fR] [\fB\-p\fR|\fB\-\-prompt\fR] [\fB\-\-cmd\-prompt\fR] [\fB\-\-selector\fR] [\fB\-\-multi\-selector\fR] [\fB\-\-ansi\fR] [\fB\-\-tabstop\fR] [\fB\-\-info\fR] [\fB\-\-no\-info\fR] [\fB\-\-inline\-info\fR] [\fB\-\-header\fR] [\fB\-\-header\-lines\fR] [\fB\-\-separator\fR] [\fB\-\-no\-separator\fR] [\fB\-\-border\fR] [\fB\-\-border\-no\-collapse\fR] [\fB\-\-no\-border\fR] [\fB\-\-wrap\fR] [\fB\-\-multiline\fR] [\fB\-\-scrollbar\fR] [\fB\-\-no\-scrollbar\fR] [\fB\-\-history\fR] [\fB\-\-history\-size\fR] [\fB\-\-cmd\-history\fR] [\fB\-\-cmd\-history\-size\fR] [\fB\-\-preview\fR] [\fB\-\-preview\-window\fR] [\fB\-\-image\fR] [\fB\-q\fR|\fB\-\-query\fR] [\fB\-\-cmd\-query\fR] [\fB\-\-read0\fR] [\fB\-\-print0\fR] [\fB\-\-print\-query\fR] [\fB\-\-print\-cmd\fR] [\fB\-\-print\-score\fR] [\fB\-\-print\-header\fR] [\fB\-\-print\-current\fR] [\fB\-\-output\-format\fR] [\fB\-\-no\-strip\-ansi\fR] [\fB\-1\fR|\fB\-\-select\-1\fR] [\fB\-0\fR|\fB\-\-exit\-0\fR] [\fB\-\-sync\fR] [\fB\-\-pre\-select\-n\fR] [\fB\-\-pre\-select\-pat\fR] [\fB\-\-pre\-select\-items\fR] [\fB\-\-pre\-select\-file\fR] [\fB\-f\fR|\fB\-\-filter\fR] [\fB\-\-shell\fR] [\fB\-\-shell\-bindings\fR] [\fB\-\-man\fR] [\fB\-\-listen\fR] [\fB\-\-remote\fR] [\fB\-\-popup\fR] [\fB\-\-popup\-name\fR] [\fB\-\-log\-level\fR] [\fB\-\-log\-file\fR] [\fB\-\-expect\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] 
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SH OPTIONS
@@ -28,7 +28,7 @@ Often used in combination with \-\-no\-sort
 \fB\-\-min\-query\-length\fR \fI<MIN_QUERY_LENGTH>\fR
 Minimum query length to start showing results
 
-Only show results when the query is at least this many characters long
+Only show results when the query is at least this many characters long. In interactive mode with \-\-cmd, also wait before running the command. Has no effect under \-\-disabled.
 .TP
 \fB\-\-no\-sort\fR
 Do not sort the results
@@ -94,10 +94,20 @@ Fields to be transformed
 
 See nth for the details
 .TP
+\fB\-\-hide\-nth\fR \fI<HIDE_NTH>\fR [default: ]
+Fields to hide from display while keeping them searchable
+
+Takes the same comma\-separated field index expressions as **nth**. The listed
+fields are removed from the displayed line but remain part of the text used for
+matching, so a query can still match them. Characters in the hidden fields are
+ignored for match highlighting and horizontal scrolling.
+
+See **nth** for the field index expression syntax.
+.TP
 \fB\-d\fR, \fB\-\-delimiter\fR \fI<DELIMITER>\fR [default: [\\t\\n ]+]
 Delimiter between fields
 
-In regex format, default to AWK\-style. Escape sequences like \\x00, \\t, \\n are supported.
+In regex format, defaults to AWK\-style. Escape sequences like \\x00, \\t, \\n are supported.
 .TP
 \fB\-e\fR, \fB\-\-exact\fR
 Run in exact mode
@@ -116,28 +126,28 @@ Fuzzy matching algorithm
 
 \- fzy     Algorithm from fzy (<https://github.com/jhawthorn/fzy>)
 
-\- frizbee Algorithm used in the blink.cmp neovim plugin, supported on aarch64 and x86 only
+\- frizbee Algorithm used in the blink.cmp neovim plugin
 .br
 
 .br
 \fIPossible values:\fR
 .RS 14
 .IP \(bu 2
-skim_v2: Improved skim fuzzy matching algorithm (v2)
+arinae: Arinae: typo\-resistant & natural algorithm, default
 .IP \(bu 2
 clangd: Clangd fuzzy matching algorithm
 .IP \(bu 2
 fzy: Fzy matching algorithm (https://github.com/jhawthorn/fzy)
 .IP \(bu 2
-frizbee: Frizbee matching algorithm, typo resistant (x86_64 and aarch64 only)
+frizbee: Frizbee matching algorithm, typo resistant
 .IP \(bu 2
-arinae: Arinae: typo\-resistant & natural algorithm, default
+skim_v2: Previous skim fuzzy matching algorithm (v2)
 .RE
 .TP
 \fB\-\-case\fR \fI<CASE>\fR [default: smart]
 Case sensitivity
 
-Determines whether or not to ignore case while matching Note: this is not used for the Frizbee matcher, it uses a penalty system to favor case\-sensitivity without enforcing it
+Determines whether or not to ignore case while matching
 .br
 
 .br
@@ -154,10 +164,10 @@ smart: Smart case: case\-insensitive unless query contains uppercase
 \fB\-\-typos\fR [\fI<TYPOS>\fR] [default: disabled]
 Enable typo\-tolerant matching
 
-When passed without a value (\-\-typos), uses adaptive formula (pattern_length / 4). When passed with a value (e.g. \-\-typos=2), uses that exact number as the maximum allowed typos. \-\-typos=0 explicitly disables typo tolerance. Applies to both fzy and frizbee matchers.
+For fzy and frizbee, \-\-typos uses an adaptive limit (pattern_length / 4), and \-\-typos=N sets the maximum number of typos. Arinae uses its own typo model; any non\-zero value enables it without setting a limit. \-\-typos=0 disables typo tolerance. Ignored by skim_v2 and clangd.
 .TP
 \fB\-\-no\-typos\fR
-Disable typo\-resistant matching
+Disable typo\-tolerant matching
 .TP
 \fB\-\-normalize\fR
 Normalize unicode characters
@@ -170,9 +180,13 @@ Enable split matching and set delimiter
 Split matching runs the matcher in splits: foo:bar will match all items matching foo, then :, then bar if the delimiter is present, or match normally if not.
 .TP
 \fB\-\-last\-match\fR
-Highlight the last match found, not the first one This makes tiebreak more pertinent on path items where we want to prioritize a match on the last parts
+Prefer the last equally scoring match with the Arinae algorithm
+
+This helps path ranking prefer a match in the last path component. Has no effect with other algorithms, exact matching, or regex matching.
 .TP
 \fB\-\-scheme\fR \fI<SCHEME>\fR [default: default]
+Matching preset: default, path (prefer the last path component), or history (prefer input order)
+.br
 
 .br
 \fIPossible values:\fR
@@ -180,20 +194,23 @@ Highlight the last match found, not the first one This makes tiebreak more perti
 .IP \(bu 2
 default: Default scheme, no modifications to the options
 .IP \(bu 2
-path: Path scheme: will find the furthest match in the item and set pathname as the main tiebreak
+path: Path scheme: enable last\-match for Arinae and rank by score, then pathname
 .IP \(bu 2
 history: History scheme: will force index as the first tiebreak
 .RE
 .SH INTERFACE
 .TP
 \fB\-b\fR, \fB\-\-bind\fR [\fI<BIND>...\fR] [default: ]
-Comma separated list of bindings
+Comma\-separated key, event, and action bindings
 
-You can customize key bindings of sk with `\-\-bind` option which takes a  comma\-separated  list  of
-key binding expressions. Each key binding expression follows the following format: `<key>:<action>`
-See the [KEYBINDS] section for details
+`\-\-bind` takes comma\-separated `<trigger>:<action>` expressions. A trigger can be a key, the
+`double\-click` mouse binding, a finder event (`change`, `start`, `load`, `result`, `focus`, `zero`, or
+`one`), or an action name. Use the
+`act\-` prefix for action triggers; it is recommended to avoid ambiguity and required when the action
+name is also a key, for example `act\-up:last`. See the [KEYBINDS] section for details and its
+[Default key bindings] subsection for the defaults.
 
-**Example**: `sk \-\-bind=ctrl\-j:accept,ctrl\-k:kill\-line`
+**Example**: `sk \-\-bind=ctrl\-j:accept,load:last,act\-up:down`
 
 ## Multiple actions can be chained using + separator.
 
@@ -212,19 +229,19 @@ Note: if no argument is supplied to reload, the default command is run.
 
 You can use the same placeholder expressions as in \-\-preview.
 
-sk  switches  to  the  alternate screen when executing a command. However, if the command is ex‐
-pected to complete quickly, and you are not interested in its output, you might want to use exe‐
-cute\-silent instead, which silently executes the command without the  switching.  Note  that  sk
+`sk` switches to the alternate screen when executing a command. However, if the command is
+expected to complete quickly, and you are not interested in its output, you might want to use
+execute\-silent instead, which silently executes the command without the  switching.  Note  that  sk
 will  not  be  responsive  until the command is complete. For asynchronous execution, start your
-command as a background process (i.e. appending &).
+command as a background process (i.e. appending `&`).
 
-With if\-query\-empty and if\-query\-not\-empty action, you could specify the action to  execute  de‐
-pends on the query condition. For example:
+With the `if\-query\-empty` and `if\-query\-not\-empty` actions, you could specify the action to execute
+depending on the query condition. For example:
 
 `sk \-\-bind \*(Aqctrl\-d:if\-query\-empty(abort)+delete\-char\*(Aq`
 
 If  the query is empty, skim will execute abort action, otherwise execute delete\-char action. It
-is equal to ‘delete\-char/eof‘.
+is equal to \*(Aqdelete\-char/eof\*(Aq.
 .TP
 \fB\-m\fR, \fB\-\-multi\fR
 Enable multiple selection
@@ -240,7 +257,7 @@ Disable mouse
 \fB\-c\fR, \fB\-\-cmd\fR \fI<CMD>\fR
 Command to invoke dynamically in interactive mode
 
-Will be invoked using sh \-c on unix\-like systems and cmd /c on Windows
+Will be invoked using sh \-c on Unix\-like systems and cmd /c on Windows
 .TP
 \fB\-i\fR, \fB\-\-interactive\fR
 Start skim in interactive mode
@@ -255,6 +272,9 @@ Set color theme
 
 Format: [BASE][,COLOR:ANSI[:ATTR1:ATTR2:..]]
 See [THEME] section for details
+
+Repeated \-\-color options are merged in order, so a later value
+overrides an earlier one for the same element.
 .TP
 \fB\-\-highlight\-line\fR
 Highlight the entire current line, not just the text
@@ -281,12 +301,14 @@ Do not clear previous line if the command returns an empty result
 Do not clear previous items if new command returns empty result. This might be useful  to
 reduce flickering when typing new commands and the half\-complete commands are not valid.
 
-This is not the default behavior because similar use cases for grep and rg have already been op‐
-timized where empty query results actually mean "empty" and previous results should be
+This is not the default behavior because similar use cases for `grep` and `rg` have already been
+optimized where empty query results actually mean "empty" and previous results should be
 cleared.
 .TP
 \fB\-\-no\-clear\-start\fR
-Do not clear items on start
+Keep previous items while a reload command starts
+
+Replace them when the new command produces results, or clear them when it finishes empty.
 .TP
 \fB\-\-no\-clear\fR
 Do not clear screen on exit
@@ -301,6 +323,9 @@ Cycle the results by wrapping around when scrolling
 .TP
 \fB\-\-disabled\fR
 Disable matching entirely
+.TP
+\fB\-\-disable\-pattern\fR \fI<DISABLE_PATTERN>\fR
+Disable items based on this regex pattern
 .SH LAYOUT
 .TP
 \fB\-\-layout\fR \fI<LAYOUT>\fR [default: default]
@@ -330,10 +355,11 @@ Can either be a row count or a percentage A negative row count will use term hei
 Disable height (force full screen)
 .TP
 \fB\-\-min\-height\fR \fI<MIN_HEIGHT>\fR [default: 10]
-Minimum height of skim\*(Aqs window
+Minimum height of skim\*(Aqs window as a non\-negative row count
 
-Useful when the height is set as a percentage
-Ignored when \-\-height is not specified
+Must be a non\-negative row count, not a percentage.
+Useful when the height is set as a percentage.
+Ignored when \-\-height is not specified.
 .TP
 \fB\-\-margin\fR \fI<MARGIN>\fR [default: 0]
 Screen margin
@@ -357,7 +383,7 @@ Set prompt in command mode
 Set selected item icon
 .TP
 \fB\-\-multi\-selector\fR \fI<MULTI_SELECT_ICON>\fR [default: >]
-Set selected item icon
+Set multi\-selected item icon
 .SH DISPLAY
 .TP
 \fB\-\-ansi\fR
@@ -386,6 +412,8 @@ Set matching result count display position
   \- inline[:SEP]  display info in the same row as the input with an optional non\-default
     separator
   \- default  display info in a dedicated row above the input
+  \- left  display all info left\-aligned in a dedicated row above the input
+  \- right  display all info right\-aligned in a dedicated row above the input
   \- inline\-right[:SEP]  display info right\-aligned in the same row as the input with an optional
     non\-default separator
 .TP
@@ -404,6 +432,14 @@ The  given  string  will  be printed as the sticky header. The lines are display
 Number of lines of the input treated as header
 
 The  first N lines of the input are treated as the sticky header. When \-\-with\-nth is set, the lines are transformed just like the other lines that follow.
+.TP
+\fB\-\-separator\fR \fI<SEPARATOR>\fR
+Draw a repeating horizontal separator on the status line
+
+With inline info it follows the status on the prompt line. With inline\-right or hidden info it occupies a separate line. Disabled by default; an empty string also disables it. An enabled border row is reused where possible.
+.TP
+\fB\-\-no\-separator\fR
+Disable the horizontal separator
 .TP
 \fB\-\-border\fR [\fI<BORDER>...\fR] [default: none]
 Draw borders around the UI components
@@ -442,6 +478,9 @@ quadrant\-inside
 quadrant\-outside
 .RE
 .TP
+\fB\-\-border\-no\-collapse\fR
+Do not collapse adjacent borders into a shared row or column
+.TP
 \fB\-\-no\-border\fR
 Disables all borders, including in tmux/zellij popups
 .TP
@@ -456,7 +495,7 @@ Each item\*(Aqs text will be split on the separator and each part will be displa
 \fB\-\-scrollbar\fR \fI<THUMB>\fR [default: ▐]
 Set scrollbar style for the item list
 
-The optional value is used as the indicator
+The value is used as the indicator
 .TP
 \fB\-\-no\-scrollbar\fR
 Disable the scrollbar in the item list
@@ -466,7 +505,14 @@ Run in a tmux or zellij popup
 
 Format: `sk \-\-popup <center|top|bottom|left|right>[,SIZE[%]][,SIZE[%]]`
 Note: this will try to detect a Zellij session, then a Tmux session
-This means that in nested sesions, skim will prioritize Zellij over Tmux
+This means that in nested sessions, `skim` will prioritize Zellij over Tmux
+
+The popup pane is named after `\-\-popup\-name` (default: `skim`).
+.TP
+\fB\-\-popup\-name\fR \fI<POPUP_NAME>\fR
+Name of the popup pane (Zellij) / title of the popup (tmux)
+
+Only used with \-\-popup. Defaults to skim in Zellij; tmux popups get no title unless this is set. \-\-border\-label is accepted as an fzf\-compatible alias.
 .SH HISTORY
 .TP
 \fB\-\-history\fR \fI<HISTORY_FILE>\fR
@@ -493,9 +539,9 @@ Maximum number of query history entries to keep
 \fB\-\-preview\fR \fI<PREVIEW>\fR
 Preview command
 
-Execute the given command for the current line and display the result on the preview window. {} in the command
-is the placeholder that is replaced to the single\-quoted string of the current line. To transform the replace‐
-ment string, specify field index expressions between the braces (See FIELD INDEX EXPRESSION for the details).
+Execute the given command with `sh \-c` on linux and `cmd /c` on windows for the current line and display the result on the preview window.
+`{}` in the command is the placeholder that is replaced to the single\-quoted string of the current line.
+To transform the replacement string, specify field index expressions between the braces (See FIELD INDEX EXPRESSION for the details).
 
 **Examples**:
 
@@ -510,11 +556,11 @@ Format: [up|down|left|right][:SIZE][:hidden][:[no]wrap][:[no]pty][:+SCROLL[\-OFF
 
 Determine  the  layout of the preview window. If the argument ends with: hidden, the preview window will be hidden by default until toggle\-preview action is triggered. Long lines are truncated by default. Line wrap can be enabled with :wrap flag. For more interactive commands or previews that draw complex interfaces, the preview can use a PTY with the :pty flag.
 
-Note: the preview will run in a PTY (interactive session) on linux and when wrap is unset
+Note: the preview will run in a PTY (interactive session) on Linux and when wrap is unset
 
 SIZE can be either: \- 0, which will hide the preview window \- A positive size (eg 20) \- A percentage of the total size (eg 50%) \- A negative size, which will set the size of everything but the preview to that value
 
-+SCROLL[\-OFFSET] determines the initial scroll offset of the preview window. SCROLL can be either a  numeric  integer or  a  single\-field index expression that refers to a numeric integer. The optional \-OFFSET part is for adjusting the base offset so that you can see the text above it. It should be given as a numeric integer (\-INTEGER), or as a denom‐ inator form (\-/INTEGER) for specifying a fraction of the preview window height.
++SCROLL[\-OFFSET] determines the initial scroll offset of the preview window. SCROLL can be either a numeric integer or a single\-field index expression that refers to a numeric integer. The optional \-OFFSET part is for adjusting the base offset so that you can see the text above it. It should be given as a numeric integer (\-INTEGER), or as a denominator form (\-/INTEGER) for specifying a fraction of the preview window height.
 
 Examples:
 
@@ -525,7 +571,7 @@ Examples:
   # Initial scroll offset is set to the line number of each line of
   # git grep output *minus* 5 lines (\-5)
   git grep \-\-line\-number \*(Aq\*(Aq |
-    sk \-\-delimiter:  \-\-preview \*(Aqnl {1}\*(Aq \-\-preview\-window +{2}\-5
+    sk \-\-delimiter : \-\-preview \*(Aqnl {1}\*(Aq \-\-preview\-window +{2}\-5
   
               # Preview with bat, matching line in the middle of the window (\-/2)
               git grep \-\-line\-number \*(Aq\*(Aq |
@@ -533,6 +579,25 @@ Examples:
                     \-\-preview \*(Aqbat \-\-style=numbers \-\-color=always \-\-highlight\-line {2} {1}\*(Aq \\
                     \-\-preview\-window +{2}\-/2
 
+.TP
+\fB\-\-image\fR [\fI<IMAGE>...\fR]
+Enable image preview
+
+This will render the preview argument as an image instead of running it as a command.
+
+If set to detect or if no value is passed, it will try to detect the available image backends at startup, which will add a small delay before the first render. If set to halfblocks, it will always use the halfblocks rendering method
+
+Note: the backend detection will not work when piping data into skim, use SKIM_DEFAULT_COMMAND="find . \-type f" sk \-\-image instead of find . \-type f | sk \-\-image
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+detect: Default: automatically detect the available backend at startup
+.IP \(bu 2
+halfblocks: Force halfblocks if you want blurry previews but a faster startup or if the detection fails
+.RE
 .SH SCRIPTING
 .TP
 \fB\-q\fR, \fB\-\-query\fR \fI<QUERY>\fR
@@ -557,7 +622,7 @@ Print the command as the first line (after print\-query)
 Print the score after each item
 .TP
 \fB\-\-print\-header\fR
-Print the header as the first line (after print\-score)
+Print the header before the items (after print\-query and print\-cmd)
 .TP
 \fB\-\-print\-current\fR
 Print the current (highlighted) item as the first line (after print\-header)
@@ -577,7 +642,7 @@ Do not enter the TUI if the query passed in \-q does not match any item
 \fB\-\-sync\fR
 Synchronous search for multi\-staged filtering
 
-Synchronous search for multi\-staged filtering. If specified, skim will launch ncurses finder only after the input stream is complete. e.g. sk \-\-multi | sk \-\-sync
+Synchronous search for multi\-staged filtering. If specified, skim will launch the TUI finder only after the input stream is complete. e.g. sk \-\-multi | sk \-\-sync
 .TP
 \fB\-\-pre\-select\-n\fR \fI<PRE_SELECT_N>\fR [default: 0]
 Pre\-select the first n items in multi\-selection mode
@@ -597,13 +662,15 @@ Pre\-select the items read from this file
 .TP
 \fB\-f\fR, \fB\-\-filter\fR \fI<FILTER>\fR
 Query for filter mode
+
+If \-\-query is also set, it supplies the query instead.
 .TP
 \fB\-\-shell\fR \fI<SHELL>\fR
 Generate shell completion script
 
 Generate completion script for the specified shell: bash, zsh, fish, etc. The output can be directly sourced or saved to a file for automatic loading. Examples: source <(sk \-\-shell bash) (immediate use) sk \-\-shell bash >> ~/.bash_completion (persistent use)
 
-Supported shells: bash, zsh, fish, powershell, elvish
+Supported shells: bash, zsh, fish, powershell, elvish, nushell
 .br
 
 .br
@@ -639,7 +706,7 @@ The socket expects Actions in Ron format (similar to Rust code), see ./src/tui/e
 \fB\-\-remote\fR [\fI<REMOTE>...\fR]
 Send commands to an IPC socket with optional name (defaults to sk)
 
-The commands are read from stdin, one per line, in the same format as the actions in the bind flag. They can also be chained using + as a separator. All other arguments will be ignored
+The commands are read from stdin, one per line, in the same format as the actions in the bind flag. They can also be chained using + as a separator. Sends actions without starting the finder interface
 .TP
 \fB\-\-log\-level\fR \fI<LOG_LEVEL>\fR
 Set the log level
@@ -649,7 +716,7 @@ Pipe log output to a file
 .SH DEPRECATED
 .TP
 \fB\-\-expect\fR \fI<EXPECT>\fR [default: ]
-Deprecated, kept for compatibility purposes. See accept() bind instead
+Accepted for compatibility; has no effect. Use \-\-bind \*(AqKEY:accept(KEY)\*(Aq instead
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SH MODES
@@ -675,7 +742,7 @@ The command is specified with the `\-\-cmd` option.
 .br
 
 .br
-Example: `sk \-\-cmd \*(Aqrg {} \-\-color=always\*(Aq \-\-interactive` will use `rg` to search for the query
+Example: `sk \-\-cmd \*(Aqrg {q} \-\-color=always\*(Aq \-\-interactive` will use `rg` to search for the query
 .br
 in the current directory and display the results interactively.
 .br
@@ -715,9 +782,9 @@ If a term is prefixed by `!`, sk will exclude the items that match this term.
 .SH KEYBINDS
 
 .br
-Keybinds can be set by the `\-\-bind` option, which takes a comma\-separated list of [key]:[action[+action2].
+Bindings can be set by the `\-\-bind` option, which takes a comma\-separated list of `<trigger>:<action>[+action2]` expressions. A trigger can be a key, a finder event, or an action name.
 .br
-Actions can take arguments, specified either between parentheses `reload(ls)` or after a colon `reload:ls`
+Actions can take arguments, specified either between parentheses `reload(ls)` or after a colon `reload:ls`.
 .br
 
 .SS "Available keys (aliases in parentheses)"
@@ -797,131 +864,285 @@ Actions can take arguments, specified either between parentheses `reload(ls)` or
 .br
 * alt\-shift\-right
 .br
+* double\-click
+.br
 * any single character
 .br
 
-.SS "Actions[:default keys][*notes]"
+.SS "Bindable finder events"
 
 .br
-* abort: ctrl\-c  ctrl\-q  esc
+* change: the query changes
 .br
-* accept(...): enter *the argument will be printed when the binding is triggered*
+* start: skim enters its event loop; fired once
 .br
-* append\-and\-select
+* load: the reader and matcher finish consuming the current input; fired once per read, including reloads
 .br
-* backward\-char: ctrl\-b  left
+* result: filtering for the current query completes
 .br
-* backward\-delete\-char: ctrl\-h  bspace
+* focus: the focused item changes because of cursor movement or a result update
 .br
-* backward\-delete\-char/eof
+* zero: the input stream is complete and the final search has no matches
 .br
-* backward\-kill\-word: alt\-bs
+* one: the input stream is complete and the final search has exactly one match
 .br
-* backward\-word: alt\-b   shift\-left
+
+.SS "Actions as binding triggers"
+
 .br
-* beginning\-of\-line: ctrl\-a  home
+Actions can also be used as binding triggers. A follow\-up chain bound to an action name runs immediately after that action. Use the `act\-` prefix for action triggers; it is recommended to avoid ambiguity and required when the action name is also a key, for example `act\-up:last`.
 .br
-* clear\-screen: ctrl\-l
+
 .br
-* delete\-char: del
+Follow\-up chains use non\-recursive (`noremap`) semantics: their actions do not trigger further action bindings. Add `suppress` to skip the triggering action\*(Aqs default behavior, for example `act\-up:suppress+down`.
 .br
-* delete\-char/eof: ctrl\-d
+
+.SS Actions
+
 .br
-* deselect\-all
+* abort: Abort and exit with error
 .br
-* down: ctrl\-j  ctrl\-n  down
+* accept(...): Accept selection and exit with optional key. The argument is printed when the binding is triggered.
 .br
-* end\-of\-line: ctrl\-e  end
+* add\-char(...): Add a character to the query
 .br
-* execute(...): *arg will be a command, see COMMAND EXPANSION for details
+* append\-and\-select: Append to selection and select
 .br
-* execute\-silent(...): *arg will be a command, see COMMAND EXPANSION for details
+* backward\-char: Move cursor backward one character
 .br
-* forward\-char: ctrl\-f  right
+* backward\-delete\-char: Delete character before cursor
 .br
-* forward\-word: alt\-f   shift\-right
+* backward\-delete\-char/eof: Delete character before cursor or exit if the query is empty
 .br
-* if\-non\-matched
+* backward\-kill\-word: Delete word before cursor
 .br
-* if\-query\-empty
+* backward\-word: Move cursor backward one word
 .br
-* if\-query\-not\-empty
+* beginning\-of\-line: Move cursor to beginning of line
 .br
-* ignore
+* bind(...): Bind one or more keys to action chains. The argument is a comma\-separated list of `trigger:action[+action]` bindings to add, using the same syntax as `\-\-bind`, including action triggers such as `act\-up:last`.
 .br
-* kill\-line
+* cancel: Cancel current operation
 .br
-* kill\-word: alt\-d
+* clear\-screen: Clear the screen
 .br
-* next\-history: ctrl\-n with `\-\-history` or `\-\-cmd\-history`
+* delete\-char: Delete character under cursor
 .br
-* page\-down: pgdn
+* delete\-char/eof: Delete character or exit if empty
 .br
-* page\-up: pgup
+* deselect\-all: Deselect all items
 .br
-* half\-page\-down
+* down(...): Move selection down by N items
 .br
-* half\-page\-up
+* end\-of\-line: Move cursor to end of line
 .br
-* preview\-up: shift\-up
+* execute(...): Execute a command. The argument is a command, see COMMAND EXPANSION for details.
 .br
-* preview\-down: shift\-down
+* execute\-silent(...): Execute a command silently. The argument is a command, see COMMAND EXPANSION for details.
 .br
-* preview\-left
+* first: Jump to first item in list
 .br
-* preview\-right
+* forward\-char: Move cursor forward one character
 .br
-* preview\-page\-down
+* forward\-word: Move cursor forward one word
 .br
-* preview\-page\-up
+* if\-query\-empty(...): Execute action if query is empty
 .br
-* previous\-history: ctrl\-p with `\-\-history` or `\-\-cmd\-history`
+* if\-query\-not\-empty(...): Execute action if query is not empty
 .br
-* redraw
+* if\-non\-matched(...): Execute action if no items match
 .br
-* refresh\-cmd
+* ignore: Ignore the action
 .br
-* refresh\-preview
+* kill\-line: Delete from cursor to end of line
 .br
-* reload(...)
+* kill\-word: Delete word after cursor
 .br
-* select\-all
+* last: Jump to last item in list
 .br
-* select\-row
+* next\-history: Move to next history entry (requires `\-\-history` or `\-\-cmd\-history`)
 .br
-* set\-preview\-cmd(...): *arg will be a expanded expression, see COMMAND EXPANSION for details
+* half\-page\-down(...): Scroll down by half a page
 .br
-* set\-query(...): *arg will be a expanded expression, see COMMAND EXPANSION for details
+* half\-page\-up(...): Scroll up by half a page
 .br
-* toggle
+* page\-down(...): Scroll down by a page
 .br
-* toggle\-all
+* page\-up(...): Scroll up by a page
 .br
-* toggle+down: ctrl\-i  tab
+* preview\-up(...): Scroll preview up
 .br
-* toggle\-in: (\-\-layout=reverse ? toggle+up:  toggle+down)
+* preview\-down(...): Scroll preview down
 .br
-* toggle\-interactive
+* preview\-left(...): Scroll preview left
 .br
-* toggle\-out: (\-\-layout=reverse ? toggle+down:  toggle+up)
+* preview\-right(...): Scroll preview right
 .br
-* toggle\-preview
+* preview\-page\-up(...): Scroll preview up by a page
 .br
-* toggle\-preview\-wrap
+* preview\-page\-down(...): Scroll preview down by a page
 .br
-* toggle\-sort
+* previous\-history: Move to previous history entry (requires `\-\-history` or `\-\-cmd\-history`)
 .br
-* toggle+up: btab    shift\-tab
+* redraw: Redraw the screen
 .br
-* top
+* refresh\-cmd: Refresh the command
 .br
-* unix\-line\-discard: ctrl\-u
+* refresh\-preview: Refresh the preview
 .br
-* unix\-word\-rubout: ctrl\-w
+* restart\-matcher: Restart the matcher
 .br
-* up: ctrl\-k  ctrl\-p  up
+* reload(...): Reload with optional new command
 .br
-* yank: ctrl\-y
+* rotate\-mode: Rotate through matching modes
+.br
+* scroll\-left(...): Scroll item list left
+.br
+* scroll\-right(...): Scroll item list right
+.br
+* select\-all: Select all items
+.br
+* select\-row(...): Select a specific row
+.br
+* select: Select current item
+.br
+* suppress: Suppress the default behaviour of the action this is bound to. Only meaningful as a follow\-up bound to an action (e.g. `act\-up:suppress`): it cancels that action\*(Aqs own effect, so the remaining follow\-up chain runs in its place. On its own it is a no\-op (equivalent to `ignore`).
+.br
+* set\-cmd(...): Set the interactive\-mode command and rerun it. The argument is an expanded expression, see COMMAND EXPANSION for details.
+.br
+* set\-header(...): Set the header (or disable it on an empty value)
+.br
+* set\-preview\-cmd(...): Set the preview cmd and rerun preview. The argument is an expanded expression, see COMMAND EXPANSION for details.
+.br
+* set\-query(...): Set the query to the expanded value. The argument is an expanded expression, see COMMAND EXPANSION for details.
+.br
+* toggle: Toggle selection of current item
+.br
+* toggle\-all: Toggle selection of all items
+.br
+* toggle\-in: Toggle and move in
+.br
+* toggle\-interactive: Toggle interactive mode
+.br
+* toggle\-out: Toggle and move out
+.br
+* toggle\-preview: Toggle preview visibility
+.br
+* toggle\-preview\-wrap: Toggle preview line wrapping
+.br
+* toggle\-sort: Toggle sorting
+.br
+* top: Jump to first item in list (alias for First)
+.br
+* unbind(...): Unbind one or more keys. The argument is a comma\-separated list of keys or action triggers (e.g. `act\-up`) to unbind.
+.br
+* unix\-line\-discard: Discard line (unix\-style)
+.br
+* unix\-word\-rubout: Delete word backward (unix\-style)
+.br
+* up(...): Move selection up by N items
+.br
+* yank: Yank (paste)
+.br
+
+.SS "Default key bindings"
+
+.br
+* alt\-b: backward\-word
+.br
+* alt\-bspace: backward\-kill\-word
+.br
+* alt\-d: kill\-word
+.br
+* alt\-f: forward\-word
+.br
+* alt\-h: scroll\-left
+.br
+* alt\-l: scroll\-right
+.br
+* bspace: backward\-delete\-char
+.br
+* btab: toggle+up
+.br
+* ctrl\-a: beginning\-of\-line
+.br
+* ctrl\-b: backward\-char
+.br
+* ctrl\-c: abort
+.br
+* ctrl\-d: abort
+.br
+* ctrl\-e: end\-of\-line
+.br
+* ctrl\-f: forward\-char
+.br
+* ctrl\-g: abort
+.br
+* ctrl\-h: backward\-delete\-char
+.br
+* ctrl\-j: down
+.br
+* ctrl\-k: up
+.br
+* ctrl\-l: clear\-screen
+.br
+* ctrl\-left: backward\-word
+.br
+* ctrl\-n: down
+.br
+* ctrl\-p: up
+.br
+* ctrl\-q: toggle\-interactive
+.br
+* ctrl\-r: rotate\-mode
+.br
+* ctrl\-right: forward\-word
+.br
+* ctrl\-u: unix\-line\-discard
+.br
+* ctrl\-w: unix\-word\-rubout
+.br
+* ctrl\-y: yank
+.br
+* del: delete\-char
+.br
+* double\-click: accept
+.br
+* down: down
+.br
+* end: end\-of\-line
+.br
+* enter: accept
+.br
+* esc: abort
+.br
+* home: beginning\-of\-line
+.br
+* left: backward\-char
+.br
+* pgdn: page\-down
+.br
+* pgup: page\-up
+.br
+* right: forward\-char
+.br
+* shift\-btab: toggle+up
+.br
+* shift\-down: preview\-down
+.br
+* shift\-home: beginning\-of\-line
+.br
+* shift\-left: backward\-word
+.br
+* shift\-right: forward\-word
+.br
+* shift\-tab: toggle+up
+.br
+* shift\-up: preview\-up
+.br
+* tab: toggle+down
+.br
+* up: up
 .br
 
 .SH "COMMAND EXPANSION"
@@ -929,7 +1150,7 @@ Actions can take arguments, specified either between parentheses `reload(ls)` or
 .br
 In the `preview` flag, `execute`, `reload`, `set\-query`... binds, sk will expand placeholders:
 .br
-* {} (or \-\-replstr if used) will be expanded to the current item.
+* {} (or the string set with \-I) will be expanded to the current item.
 .br
 * {q} (or {cq} for legacy reasons) will be expanded to the current query input.
 .br
@@ -948,6 +1169,10 @@ In the `preview` flag, `execute`, `reload`, `set\-query`... binds, sk will expan
 * {+FIELD_INDEX_EXPRESSION} will be expanded to the field index expression run against the {+}
 .br
  item(s).
+.br
+
+.br
+Instead of placeholders, child commands can also read the same state from the `SKIM_*`/`FZF_*` variables listed under ENVIRONMENT VARIABLES.
 .br
 
 .SS "Field index expression"
@@ -1004,6 +1229,56 @@ Example:
 
 .SS NO_COLOR
 If set to a non\-empty value, will disable coloring
+.br
+
+.SS "Variables exported to child processes"
+
+.br
+Commands spawned by `\-\-preview`, `execute`, `execute\-silent` and `reload` inherit these variables.
+.br
+Every value is exported twice: under a `SKIM_` prefix and under the same name with an `FZF_` prefix.
+.br
+* `QUERY`: current query input.
+.br
+* `CURRENT_ITEM`: text of the current item, with ANSI sequences stripped; unset when there is none.
+.br
+* `SELECTED_ITEMS`: selected items, newline\-separated.
+.br
+* `POS`: 1\-based position of the current item in the list.
+.br
+* `TOTAL_COUNT`: total number of items.
+.br
+* `MATCH_COUNT`: number of matched items.
+.br
+* `SELECT_COUNT`: number of selected items.
+.br
+* `LINES`, `COLUMNS`: height and width of the skim area.
+.br
+* `DIRECTION`: list direction, `up` or `down`.
+.br
+* `INPUT_STATE`: `enabled` or `disabled`.
+.br
+* `PROMPT`, `POINTER`: current prompt and pointer (selector) strings.
+.br
+* `ACTION`, `KEY`: name of the last action performed and last key pressed (empty before any input).
+.br
+  `ACTION` is the action that is running, so a child spawned by a follow\-up
+.br
+  (`act\-up:execute\-silent(...)`) sees `execute\-silent`.
+.br
+* `WRAP`: `char` when item wrapping is enabled, otherwise unset.
+.br
+* `PREVIEW_LINES`, `PREVIEW_COLUMNS`, `PREVIEW_TOP`, `PREVIEW_LEFT`: geometry of the preview
+.br
+  window; only set when a preview is configured.
+.br
+* `NTH`, `WITH_NTH`: current `\-\-nth` and `\-\-with\-nth` values, when set.
+.br
+A variable that does not apply to the current state is removed from the child\*(Aqs environment, so a
+.br
+skim started inside another skim or fzf never passes the enclosing process\*(Aqs values through.
+.br
+Example: `sk \-\-preview \*(Aqprintf %s "$SKIM_QUERY"\*(Aq`.
 .br
 
 .SH THEME
@@ -1063,6 +1338,10 @@ Available color names:
 .br
     * border: border lines
 .br
+    * separator: horizontal separator (independent of borders and headers)
+.br
+    * scrollbar: item list scrollbar thumb
+.br
 
 .br
 Adding `\-fg`, `_fg`, `\-bg`, `_bg`, `\-underline`, `_underline` sets the corresponding part of
@@ -1085,7 +1364,7 @@ Available attrs:
 .br
     * b | bold
 .br
-    * u | underline
+    * u | underlined
 .br
     * c | crossed\-out
 .br
@@ -1113,7 +1392,7 @@ skim can be controlled from other processes, using the `\-\-listen` (and optiona
 .br
 To achieve this, run the server instance using `sk \-\-listen optional_address` (the address defaults to `sk`).
 .br
-It will then start listening on a named socket for instructions.
+It will then start listening on a named socket for instructions. Only clients that run as the same user can send instructions.
 .br
 
 .br
@@ -1139,4 +1418,4 @@ When using `sk \-\-remote`, pipe in action chains (see the KEYBINDS section), fo
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SH VERSION
-v4.6.0
+v5.9.0
