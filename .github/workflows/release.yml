@@ -148,7 +148,8 @@ jobs:
   test-installation:
     name: test-installation (${{ matrix.target }})
     needs: [create-release, publish-release]
-    runs-on: ubuntu-latest
+    # Termux runs on the arm64 runner: Android builds are aarch64 only.
+    runs-on: ${{ matrix.target == 'install-test-termux' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -163,3 +164,15 @@ jobs:
         run: |
           docker buildx bake -f docker-bake.hcl ${{ matrix.target }}
 
+
+  promote-release:
+    name: promote-release
+    needs: [create-release, test-installation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark release as latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ needs.create-release.outputs.version }}" \
+            --repo "${{ github.repository }}" --prerelease=false --latest

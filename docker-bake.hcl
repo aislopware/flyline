@@ -254,6 +254,7 @@ target "install-test-arch" {
 target "install-test-termux" {
     context = "."
     dockerfile = "docker/install_test_termux.Dockerfile"
+    platforms = ["linux/arm64"]
     args = {
         FLYLINE_INSTALL_VERSION = FLYLINE_INSTALL_VERSION
     }
