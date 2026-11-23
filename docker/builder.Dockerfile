@@ -28,6 +28,7 @@ RUN cargo install cargo-chef@0.1.78 --locked
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY crates ./crates
+COPY vendor ./vendor
 COPY src ./src
 COPY examples ./examples
 RUN cargo chef prepare --recipe-path recipe.json
@@ -36,6 +37,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3: Run final Build
 FROM chef AS flyline-builder
 COPY --from=planner /app/recipe.json recipe.json
+# The vendored forks are path dependencies outside the workspace, which the
+# recipe does not skeletonize; cook builds them with the other dependencies.
+COPY vendor ./vendor
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY crates ./crates

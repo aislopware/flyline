@@ -2,6 +2,10 @@ version: 2
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
+    # The vendored forks' manifests are updated with their upstreams
+    # (vendor/README.md), not one dependency at a time.
+    exclude-paths:
+      - "vendor/**"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

@@ -39,12 +39,9 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# ratatui (inline viewport), termina (terminal responses) and skim (matcher-only
-# build) are forks with no crates.io release carrying flyline's changes;
-# flycomp is HalFrgrd's own unpublished crate. Nothing else may come from git.
+# flycomp is HalFrgrd's own crate with no crates.io release. The ratatui,
+# termina and skim forks are vendored under vendor/. Nothing else may come
+# from git.
 allow-git = [
     "https://github.com/HalFrgrd/flycomp.git",
-    "https://github.com/HalFrgrd/ratatui.git",
-    "https://github.com/HalFrgrd/skim",
-    "https://github.com/HalFrgrd/termina.git",
 ]

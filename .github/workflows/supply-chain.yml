@@ -13,6 +13,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/*/Cargo.toml"
+      - "vendor/**/Cargo.toml"
       - "deny.toml"
       - ".cargo/audit.toml"
       - ".github/workflows/supply-chain.yml"
