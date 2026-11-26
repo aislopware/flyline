@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::app::actions;
 use crate::content::TaggedSpan;
 use crate::cursor::CursorConfig;
-use crate::palette::Palette;
+use crate::palette::{Palette, PaletteStyleKind, TerminalColors};
 use crate::term_info;
 use crate::tutorial::TutorialStep;
 use clap::ValueEnum;
@@ -366,9 +366,18 @@ pub struct Settings {
     /// Whether easter eggs (such as animated command words like `python`) are enabled.
     /// Enabled by default; pass `--enable-easter-eggs false` to disable.
     pub enable_easter_eggs: bool,
-    /// Active colour theme preset (`dark` / `light`). Used for theme-aware
-    /// cursor fading; updated when `flyline set-style --default-theme` is run.
+    /// Active colour theme preset (`dark` / `light`). Auto-detected from OSC 11 /
+    /// `$COLORFGBG` at startup unless explicitly overridden via `flyline set-style --default-theme`.
     pub colour_theme: ColourTheme,
+    /// Terminal foreground/background RGB colours probed via OSC 10 / OSC 11.
+    #[serde(skip)]
+    pub terminal_colors: TerminalColors,
+    /// True once the user explicitly selected a theme via `flyline set-style --default-theme`.
+    #[serde(skip)]
+    pub user_set_colour_theme: bool,
+    /// Palette slots explicitly overridden by the user via `flyline set-style NAME=STYLE`.
+    #[serde(skip)]
+    pub user_customized_palette_slots: HashSet<PaletteStyleKind>,
     /// Configurable colour palette for UI elements.
     #[serde(rename = "palette")]
     pub colour_palette: Palette,
@@ -444,6 +453,9 @@ impl Default for Settings {
             enable_extended_key_codes: true,
             enable_easter_eggs: true,
             colour_theme: ColourTheme::default(),
+            terminal_colors: TerminalColors::default(),
+            user_set_colour_theme: false,
+            user_customized_palette_slots: HashSet::new(),
             colour_palette: Palette::default(),
             keybindings: Vec::default(),
             key_remappings: Vec::default(),
@@ -502,6 +514,65 @@ pub struct SettingDiffEntry {
 }
 
 impl Settings {
+    /// Apply terminal foreground/background colours probed via OSC 10 / OSC 11
+    /// (and an optional `$COLORFGBG` fallback hint).
+    ///
+    /// Automatically selects the matching `Dark`/`Light` preset unless the user
+    /// explicitly ran `flyline set-style --default-theme`, and harmonizes the
+    /// default `popup-selected` pill background with the terminal's true canvas
+    /// colour unless the user explicitly customised `popup-selected`.
+    ///
+    /// Returns `true` if any active colour or theme state changed.
+    pub fn apply_detected_terminal_colors(
+        &mut self,
+        colors: TerminalColors,
+        colorfgbg_theme: Option<ColourTheme>,
+    ) -> bool {
+        let prev_theme = self.colour_theme;
+        let prev_palette = self.colour_palette.clone();
+        let prev_colors = self.terminal_colors;
+
+        if colors.fg.is_some() {
+            self.terminal_colors.fg = colors.fg;
+        }
+        if colors.bg.is_some() {
+            self.terminal_colors.bg = colors.bg;
+        }
+
+        let detected_theme = self.terminal_colors.detected_theme().or(colorfgbg_theme);
+        if !self.user_set_colour_theme
+            && let Some(theme) = detected_theme
+            && self.colour_theme != theme
+        {
+            self.colour_theme = theme;
+            self.colour_palette
+                .apply_theme_preserving(theme, &self.user_customized_palette_slots);
+        }
+
+        // Harmonize `popup-selected` bg directly with the terminal's real OSC 11
+        // canvas when the user hasn't explicitly customised it and the detected
+        // background matches the active theme polarity.
+        let theme_matches = self
+            .terminal_colors
+            .detected_theme()
+            .is_none_or(|t| t == self.colour_theme);
+        if theme_matches
+            && !self
+                .user_customized_palette_slots
+                .contains(&PaletteStyleKind::PopupSelected)
+            && let Some(sel_bg) = self.terminal_colors.popup_selected_bg()
+        {
+            self.colour_palette.set(
+                PaletteStyleKind::PopupSelected,
+                ratatui::style::Style::default().bg(sel_bg),
+            );
+        }
+
+        self.colour_theme != prev_theme
+            || self.colour_palette != prev_palette
+            || self.terminal_colors != prev_colors
+    }
+
     /// Computes the diff between this `Settings` instance and `Settings::default()`.
     pub fn diff(&self) -> Vec<SettingDiffEntry> {
         let curr_val = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
@@ -736,5 +807,47 @@ mod tests {
                 .iter()
                 .any(|e| e.name == "auto_suggest_inline" && e.current == "false")
         );
+    }
+
+    #[test]
+    fn test_apply_detected_terminal_colors_switches_to_light_and_blends_selection() {
+        let mut settings = Settings::default();
+        let solarized_light = TerminalColors {
+            fg: Some((101, 123, 131)),
+            bg: Some((253, 246, 227)),
+        };
+        assert!(settings.apply_detected_terminal_colors(solarized_light, None));
+        assert_eq!(settings.colour_theme, ColourTheme::Light);
+        assert_eq!(
+            settings.colour_palette.popup_selected().bg,
+            solarized_light.popup_selected_bg()
+        );
+        // Other Light preset slots were also applied.
+        assert_eq!(
+            settings.colour_palette.popup_indicator(),
+            Palette::light().popup_indicator()
+        );
+    }
+
+    #[test]
+    fn test_apply_detected_terminal_colors_respects_user_overrides() {
+        let mut settings = Settings::default();
+        let custom_sel = ratatui::style::Style::default().bg(ratatui::style::Color::Magenta);
+        settings
+            .colour_palette
+            .set(PaletteStyleKind::PopupSelected, custom_sel);
+        settings
+            .user_customized_palette_slots
+            .insert(PaletteStyleKind::PopupSelected);
+        settings.user_set_colour_theme = true;
+
+        let light_colors = TerminalColors {
+            fg: Some((0, 0, 0)),
+            bg: Some((255, 255, 255)),
+        };
+        settings.apply_detected_terminal_colors(light_colors, Some(ColourTheme::Light));
+        // Explicit user theme & custom popup-selected must stay untouched.
+        assert_eq!(settings.colour_theme, ColourTheme::Dark);
+        assert_eq!(settings.colour_palette.popup_selected(), custom_sel);
     }
 }

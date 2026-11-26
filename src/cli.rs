@@ -434,8 +434,11 @@ enum Commands {
     ///   recognised-command, unrecognised-command, single-quoted-text,
     ///   double-quoted-text, secondary-text, inline-suggestion, tutorial-hint,
     ///   matching-char, opening-and-closing-pair, normal-text, comment,
-    ///   env-var, markdown-heading1, markdown-heading2, markdown-heading3,
-    ///   markdown-code, key-sequence-style, selected-text, bash-reserved
+    ///   env-var, unrecognised-env-var, markdown-heading1, markdown-heading2,
+    ///   markdown-heading3, markdown-code, key-sequence-style, selected-text,
+    ///   bash-reserved, right-click-menu, scrollbar, popup-bg, popup-rail,
+    ///   popup-indicator, popup-selected, popup-description,
+    ///   popup-selected-description, rainbow-bracket1..4
     ///
     /// Examples:
     ///   flyline set-style --default-theme dark
@@ -1352,7 +1355,17 @@ pub(crate) fn call(words: *const bash_symbols::WordList) -> c_int {
                 }) => {
                     if let Some(preset) = default_theme {
                         settings.colour_theme = preset;
+                        settings.user_set_colour_theme = true;
+                        settings.user_customized_palette_slots.clear();
                         settings.colour_palette.apply_theme(preset);
+                        if settings.terminal_colors.detected_theme() == Some(preset)
+                            && let Some(sel_bg) = settings.terminal_colors.popup_selected_bg()
+                        {
+                            settings.colour_palette.set(
+                                palette::PaletteStyleKind::PopupSelected,
+                                ratatui::style::Style::default().bg(sel_bg),
+                            );
+                        }
                         log::info!("Colour theme set to {:?}", preset);
                     }
 
@@ -1375,6 +1388,7 @@ pub(crate) fn call(words: *const bash_symbols::WordList) -> c_int {
                         match palette::parse_str_to_style(style_str) {
                             Ok(style) => {
                                 settings.colour_palette.set(kind, style);
+                                settings.user_customized_palette_slots.insert(kind);
                                 log::info!("{} style set to {:?}", name, style_str);
                             }
                             Err(e) => {
@@ -2100,7 +2114,9 @@ fn show_version(copy: bool) {
     let term_program = term_info::term_program().unwrap_or_else(|| "unknown".to_string());
     let term_program_version =
         term_info::term_program_version().unwrap_or_else(|| "unknown".to_string());
-    let info = term_info::get_term_info();
+    // Read cached TermInfo (populated during interactive raw-mode startup) rather
+    // than issuing terminal queries in cooked mode or when stdout is piped.
+    let info = term_info::cached_term_info().unwrap_or_else(term_info::TermInfo::from_env);
     let detected_emulator = info.emulator.name().to_string();
     let detected_multiplexer = info
         .multiplexer
@@ -2111,6 +2127,25 @@ fn show_version(copy: bool) {
         Some(da) => (da.raw.as_str(), da.version.as_deref().unwrap_or("none")),
         None => ("none", "none"),
     };
+    let effective_colors = crate::palette::TerminalColors {
+        fg: crate::settings()
+            .terminal_colors
+            .fg
+            .or(info.terminal_colors.fg),
+        bg: crate::settings()
+            .terminal_colors
+            .bg
+            .or(info.terminal_colors.bg),
+    };
+    let fmt_rgb = |opt: Option<(u8, u8, u8)>| match opt {
+        Some((r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
+        None => "unknown".to_string(),
+    };
+    let term_colors_str = format!(
+        "fg={}, bg={}",
+        fmt_rgb(effective_colors.fg),
+        fmt_rgb(effective_colors.bg),
+    );
     let lang = shell::backend()
         .env_var("LANG")
         .unwrap_or_else(|| "unknown".to_string());
@@ -2141,6 +2176,7 @@ fn show_version(copy: bool) {
          multiplexer: {}\n\
          device attributes raw: {}\n\
          device attributes version: {}\n\
+         terminal colours: {}\n\
          program: {}\n\
          program version: {}\n\
          locale: {} (LC_ALL: {}, LC_CTYPE: {})\n\
@@ -2165,6 +2201,7 @@ fn show_version(copy: bool) {
         detected_multiplexer,
         da_raw,
         da_version,
+        term_colors_str,
         term_program,
         term_program_version,
         lang,

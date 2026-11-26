@@ -1,6 +1,6 @@
 use super::*;
 use crate::content::{
-    Coord, RelativePosition, gaussian_wave_animated, split_line_to_terminal_rows, vec_spans_width,
+    Coord, RelativePosition, gaussian_wave_animated_with_colors, split_line_to_terminal_rows,
 };
 use crate::settings::Settings;
 use crate::tutorial;
@@ -816,25 +816,29 @@ impl App<'_> {
                     } else {
                         None
                     };
-                    if crate::settings().show_animations {
+                    let settings = crate::settings();
+                    if settings.show_animations {
                         self.cursor.get_style(
                             focused,
-                            &crate::settings().cursor_config,
+                            &settings.cursor_config,
                             selection_bg,
                             selection_active && mouse_state(|m| m.is_left_button_down()),
-                            crate::settings().colour_theme,
+                            settings.colour_theme,
+                            settings.terminal_colors,
                         )
                     } else if focused {
                         Some(crate::cursor::Cursor::static_style(
                             255,
-                            &crate::settings().cursor_config.style,
-                            crate::settings().colour_theme,
+                            &settings.cursor_config.style,
+                            settings.colour_theme,
+                            settings.terminal_colors,
                         ))
                     } else {
                         Some(crate::cursor::Cursor::static_style(
                             crate::cursor::CURSOR_INTENSITY_UNFOCUSED,
-                            &crate::settings().cursor_config.style,
-                            crate::settings().colour_theme,
+                            &settings.cursor_config.style,
+                            settings.colour_theme,
+                            settings.terminal_colors,
                         ))
                     }
                 }
@@ -911,13 +915,10 @@ impl App<'_> {
             if mouse_state(|m| m.is_left_button_down()) {
                 crate::settings()
                     .colour_palette
-                    .scrollbar()
-                    .fg(Color::Rgb(150, 150, 150))
+                    .popup_indicator()
+                    .add_modifier(Modifier::BOLD)
             } else {
-                crate::settings()
-                    .colour_palette
-                    .scrollbar()
-                    .add_modifier(Modifier::DIM)
+                crate::settings().colour_palette.popup_indicator()
             }
         } else {
             crate::settings().colour_palette.scrollbar()
@@ -959,7 +960,14 @@ impl App<'_> {
                 if now.duration_since(*start_time) >= std::time::Duration::from_millis(100) {
                     if !*auto_started {
                         content.newline();
-                        let line = gaussian_wave_animated(LOADING_TEXT, now, *start_time);
+                        let s = crate::settings();
+                        let line = gaussian_wave_animated_with_colors(
+                            LOADING_TEXT,
+                            now,
+                            *start_time,
+                            s.terminal_colors.effective_fg(s.colour_theme),
+                            s.terminal_colors.effective_bg(s.colour_theme),
+                        );
                         content.write_tagged_line(&TaggedLine::from_line(line, Tag::Normal), false);
                     } else if crate::settings().auto_suggest {
                         Self::render_auto_suggestions_loading(
@@ -1194,7 +1202,14 @@ impl App<'_> {
                     "Running flycomp to synthesize completions for '{}'...",
                     command_word
                 );
-                let line = gaussian_wave_animated(&text, now, *start_time);
+                let s = crate::settings();
+                let line = gaussian_wave_animated_with_colors(
+                    &text,
+                    now,
+                    *start_time,
+                    s.terminal_colors.effective_fg(s.colour_theme),
+                    s.terminal_colors.effective_bg(s.colour_theme),
+                );
                 content.write_tagged_line(&TaggedLine::from_line(line, Tag::Normal), false);
             }
             ContentMode::TabCompletionFlycompResult {
@@ -1358,7 +1373,14 @@ impl App<'_> {
                 content.newline();
                 let elapsed_secs = start_time.elapsed().as_secs();
                 let text = format!("Running [{}s]: ", elapsed_secs);
-                let line = gaussian_wave_animated(&text, now, *start_time);
+                let s = crate::settings();
+                let line = gaussian_wave_animated_with_colors(
+                    &text,
+                    now,
+                    *start_time,
+                    s.terminal_colors.effective_fg(s.colour_theme),
+                    s.terminal_colors.effective_bg(s.colour_theme),
+                );
                 content.write_tagged_line(&TaggedLine::from_line(line, Tag::Normal), false);
                 let command_display_span = TaggedSpan::new(
                     Span::styled(
@@ -1808,7 +1830,7 @@ impl App<'_> {
         buffer: &str,
         cursor_byte_pos: usize,
         scrollbar_style: Style,
-        terminal_height: u16,
+        _terminal_height: u16,
     ) {
         let original_buf_len = content.buf.len();
         content.newline();
@@ -1818,6 +1840,7 @@ impl App<'_> {
         }
 
         let grid_start_row = content.cursor_position().row;
+        let palette = &settings.colour_palette;
 
         let mut max_inner_height = settings.num_suggestion_rows as usize;
         max_inner_height = max_inner_height.max(1);
@@ -1838,10 +1861,9 @@ impl App<'_> {
         }
 
         let max_inner_height = max_inner_height.max(1);
+        let num_rows_visible = max_inner_height.min(total_sugs);
 
-        let num_rows_visible = max_inner_height.min(active_suggestions.filtered_suggestions_len());
-
-        let items = active_suggestions.into_list(num_rows_visible, &settings.colour_palette);
+        let items = active_suggestions.into_list(num_rows_visible, palette);
         let num_rows_visible = items.len();
         if num_rows_visible == 0 {
             return;
@@ -1851,7 +1873,7 @@ impl App<'_> {
 
         // A zero-width terminal (reported transiently right after `exec`, during
         // a resize, or by some emulators) leaves no room for a popup and would
-        // underflow the box-width math below (which panics under the release
+        // underflow the layout math below (which panics under the release
         // profile's `overflow-checks`). Nothing useful can be drawn, so bail.
         if term_width == 0 {
             return;
@@ -1863,44 +1885,30 @@ impl App<'_> {
             .map(|sug| unicode_width::UnicodeWidthStr::width(sug.prefix.as_str()))
             .unwrap_or(0);
 
-        let pos_string = active_suggestions
-            .current_1d_index()
-            .map(|idx| idx.saturating_add(1).to_string())
-            .unwrap_or_else(|| " ".to_string());
+        let total_filtered = active_suggestions.filtered_suggestions_len();
 
-        let status_prefix = format!(
-            "{}/{}; ",
-            pos_string,
-            active_suggestions.filtered_suggestions_len(),
-        );
+        let popup_bg_only = palette
+            .popup_bg()
+            .bg
+            .map_or_else(Style::default, |bg| Style::default().bg(bg));
+        let rail_style = popup_bg_only.patch(palette.popup_rail());
 
-        let source_str = format!(
-            "{:.1}ms",
-            active_suggestions.load_time.as_secs_f32() * 1000.0,
-        );
+        // Squared Minimal Left-Rail horizontal anatomy (no footer, no right chrome):
+        //   [left rail / integrated scrollbar: ▎/▏] [left_pad: ' '] [inner content] [right_pad: ' ']
+        let has_rail = term_width >= 2;
+        let left_pad = usize::from(term_width >= 3);
+        let right_pad = usize::from(term_width >= 4);
+        let left_chrome = usize::from(has_rail) + left_pad;
+        let right_chrome = right_pad;
+        let total_chrome = left_chrome + right_chrome;
+        let show_scrollbar = total_filtered > num_rows_visible && has_rail;
 
-        let time_hover =
-            mouse_state(|m| m.last_mouse_over_cell_semantic) == Some(Tag::AutoCompletionTimeInfo);
-        let source_style = if time_hover {
-            settings
-                .colour_palette
-                .secondary_text()
-                .add_modifier(Modifier::UNDERLINED)
-        } else {
-            settings.colour_palette.secondary_text()
-        };
-
-        let min_box_width = (unicode_width::UnicodeWidthStr::width(status_prefix.as_str())
-            + unicode_width::UnicodeWidthStr::width(source_str.as_str())
-            + 4)
-        .min(term_width);
+        let min_box_width = (total_chrome + 1).min(term_width);
         let max_box_width = (term_width * 40 / 100).max(70).min(term_width);
 
-        // let max_item_width = active_suggestions.max_filtered_width();
         let max_item_width = active_suggestions.max_width();
-
-        let box_width = (max_item_width + 2).clamp(min_box_width, max_box_width);
-        let inner_width = box_width.saturating_sub(2).max(1);
+        let box_width = (max_item_width + total_chrome).clamp(min_box_width, max_box_width);
+        let inner_width = box_width.saturating_sub(total_chrome).max(1);
 
         let popup_anchor_col = cursor_pos_maybe
             .map(|pos| {
@@ -1910,6 +1918,7 @@ impl App<'_> {
                     suggestion_prefix_width,
                     buffer,
                     cursor_byte_pos,
+                    left_chrome,
                 )
             })
             .unwrap_or(0);
@@ -1917,283 +1926,153 @@ impl App<'_> {
         let max_x = term_width.saturating_sub(box_width);
         let x = popup_anchor_col.min(max_x) as u16;
         let y = cursor_pos_maybe
-            .map(|pos| pos.row + 1)
+            .map(|pos| pos.row.saturating_add(1))
             .unwrap_or(grid_start_row);
 
-        let mut total_item_rows = 0;
-        let bottom_y = y + 1 + max_inner_height as u16;
+        let selected_1d = active_suggestions.current_1d_index();
+        let mut rendered_items: Vec<(usize, bool, Vec<Vec<Span<'static>>>)> =
+            Vec::with_capacity(items.len());
+        let mut total_item_rows: usize = 0;
+
         for item in &items {
-            let remaining_rows =
-                (bottom_y as usize).saturating_sub((y + 1) as usize + total_item_rows);
+            let remaining_rows = max_inner_height.saturating_sub(total_item_rows);
             if remaining_rows == 0 {
                 break;
             }
-            let is_selected = active_suggestions.current_1d_index() == Some(item.filtered_idx);
-            if is_selected {
-                let main_text_width = vec_spans_width(&item.spans);
-                let has_description = !item.description_frame.is_empty();
-                let desc_total_width = if has_description {
-                    crate::active_suggestions::SuggestionFormatted::DESCRIPTION_SEPARATOR.len()
-                        + item.description_frame_width
-                } else {
-                    0
-                };
-                let total_width = main_text_width + desc_total_width;
-                if total_width <= inner_width {
-                    total_item_rows += 1;
-                } else {
-                    let occupied = 2.min(remaining_rows);
-                    total_item_rows += occupied;
-                }
-            } else {
-                total_item_rows += 1;
+            let is_selected = selected_1d == Some(item.filtered_idx);
+            let rows =
+                item.render_popup_rows(inner_width, remaining_rows.min(2), is_selected, palette);
+            if rows.is_empty() {
+                continue;
             }
+            total_item_rows += rows.len();
+            rendered_items.push((item.filtered_idx, is_selected, rows));
         }
 
-        let full_inner_area = Rect {
-            x: x + 1,
-            y: y + 1,
-            width: inner_width as u16,
+        if total_item_rows == 0 {
+            return;
+        }
+
+        // Fill the crisp rectangular popup footprint (item rows only) with the
+        // popup surface bg so underlying multiline buffer content never bleeds through.
+        let popup_area = Rect {
+            x,
+            y,
+            width: box_width as u16,
             height: total_item_rows as u16,
         };
-
-        content.fill_rect(full_inner_area, " ", Style::default(), Tag::TabSuggestion);
+        content.fill_rect(popup_area, " ", popup_bg_only, Tag::TabSuggestion);
 
         let window_range = active_suggestions.row_window_to_show.get_window_range();
         let mut selected_item_row: Option<u16> = None;
+        let mut current_y = y;
 
-        let mut current_y = y + 1;
-        let bottom_y = y + 1 + max_inner_height as u16;
+        for (filtered_idx, is_selected, item_rows) in &rendered_items {
+            let tag = Tag::Suggestion(*filtered_idx);
+            let row_bg_style = crate::active_suggestions::SuggestionFormatted::popup_row_bg_style(
+                *is_selected,
+                palette,
+            );
+            // Flush-left block rail: `▎` (2/8 accent on selected_bg) vs `▏` (1/8 hairline on surface_bg)
+            // keeps the left edge ruler-straight and 90-degree square with zero overhang.
+            let rail_glyph = if *is_selected { "▎" } else { "▏" };
+            let active_rail_style = if *is_selected {
+                let mut s = row_bg_style.patch(palette.popup_indicator());
+                if let Some(bg) = row_bg_style.bg {
+                    s = s.bg(bg);
+                }
+                if row_bg_style.has_modifier(Modifier::REVERSED) {
+                    s = s.add_modifier(Modifier::REVERSED);
+                }
+                s
+            } else {
+                rail_style
+            };
 
-        for item in items.iter() {
-            let remaining_rows = bottom_y.saturating_sub(current_y) as usize;
-            if remaining_rows == 0 {
-                break;
+            if *is_selected {
+                selected_item_row = Some(current_y);
             }
 
-            content.move_cursor_to(current_y, x + 1);
+            for row_spans in item_rows {
+                let mut col = x;
 
-            let is_selected = active_suggestions.current_1d_index() == Some(item.filtered_idx);
-            let tag = Tag::Suggestion(item.filtered_idx);
-
-            if is_selected {
-                selected_item_row = Some(current_y);
-
-                let main_text_width = vec_spans_width(&item.spans);
-                let has_description = !item.description_frame.is_empty();
-                let desc_total_width = if has_description {
-                    crate::active_suggestions::SuggestionFormatted::DESCRIPTION_SEPARATOR.len()
-                        + item.description_frame_width
-                } else {
-                    0
-                };
-                let total_width = main_text_width + desc_total_width;
-
-                if total_width <= inner_width {
-                    // Fits on one line! Render with right-aligned description
-                    let spans = item.render(inner_width, true);
-                    let rect = Rect {
-                        x: x + 1,
-                        y: current_y,
-                        width: inner_width as u16,
-                        height: 1,
-                    };
-                    for span in spans {
-                        content.write_tagged_span_area(&TaggedSpan::new(span, tag), rect);
-                    }
-
-                    // Retroactive style/fill pass for the single row
-                    let suggestion_width = main_text_width;
-                    let first_col = x as usize + 1;
-                    let row = &mut content.buf[current_y as usize];
-                    for (relative_col, cell) in row[first_col..first_col + inner_width]
-                        .iter_mut()
-                        .enumerate()
-                    {
-                        if cell.cell.symbol().is_empty() {
-                            cell.cell.set_symbol(" ");
-                        }
-                        cell.tag = tag;
-                        if relative_col < suggestion_width {
-                            cell.cell
-                                .set_style(Palette::convert_to_highlighted(cell.cell.style()));
-                        } else {
-                            cell.cell
-                                .set_style(settings.colour_palette.secondary_text());
-                        }
-                    }
-
-                    current_y += 1;
-                } else {
-                    // Does not fit! Wrap up to 2 lines
-                    let selected_spans = item.render_untruncated(true);
-
-                    let max_sug_height = 2.min(remaining_rows);
-                    if max_sug_height == 0 {
-                        break;
-                    }
-
-                    let rect = Rect {
-                        x: x + 1,
-                        y: current_y,
-                        width: inner_width as u16,
-                        height: max_sug_height as u16,
-                    };
-
-                    let item_start_row = current_y;
-                    let mut truncated = false;
-
-                    for span in &selected_spans {
-                        let tagged_span = TaggedSpan::new(span.clone(), tag);
-                        if !content.write_tagged_span_area(&tagged_span, rect) {
-                            truncated = true;
-                            break;
-                        }
-                    }
-
-                    let item_end_row = content.cursor_position().row;
-
-                    // Retroactive style/fill pass for the selected item rows to make sure they are highlighted properly
-                    let mut in_description = false;
-                    for row_idx in item_start_row..=item_end_row {
-                        let first_col = x as usize + 1;
-                        let row = &mut content.buf[row_idx as usize];
-                        for cell in &mut row[first_col..first_col + inner_width] {
-                            if !cell.cell.symbol().is_empty()
-                                && !cell.cell.style().add_modifier.contains(Modifier::REVERSED)
-                            {
-                                in_description = true;
-                            }
-                            if cell.cell.symbol().is_empty() {
-                                cell.cell.set_symbol(" ");
-                            }
-                            cell.tag = tag;
-                            if in_description {
-                                cell.cell
-                                    .set_style(settings.colour_palette.secondary_text());
-                            } else {
-                                cell.cell
-                                    .set_style(Palette::convert_to_highlighted(cell.cell.style()));
-                            }
-                        }
-                    }
-
-                    // Retroactive Ellipsis Pass if truncated
-                    if truncated {
-                        let mut last_row =
-                            if content.cursor_position().col as usize > (x as usize + 1) {
-                                content.cursor_position().row as usize
-                            } else {
-                                (content.cursor_position().row as usize).saturating_sub(1)
-                            };
-                        last_row = last_row.max(item_start_row as usize);
-
-                        let last_col = if content.cursor_position().col as usize > (x as usize + 1)
-                        {
-                            (content.cursor_position().col as usize).saturating_sub(1)
-                        } else {
-                            x as usize + inner_width
-                        };
-
-                        let ellipsis_style = if in_description {
-                            settings.colour_palette.secondary_text()
-                        } else {
-                            Palette::convert_to_highlighted(Style::default())
-                        };
-                        content.overwrite_with_char(last_row, last_col, "…", ellipsis_style, tag);
-                    }
-
-                    let occupied = item_end_row - item_start_row + 1;
-                    current_y += occupied;
+                if has_rail {
+                    content.move_cursor_to(current_y, col);
+                    content.write_tagged_span_area(
+                        &TaggedSpan::new(Span::styled(rail_glyph, active_rail_style), tag),
+                        Rect::new(col, current_y, 1, 1),
+                    );
+                    col = col.saturating_add(1);
                 }
-            } else {
-                let spans = item.render(inner_width, false);
-                let rect = Rect {
-                    x: x + 1,
+
+                if left_pad > 0 {
+                    content.move_cursor_to(current_y, col);
+                    content.write_tagged_span_area(
+                        &TaggedSpan::new(Span::styled(" ", row_bg_style), tag),
+                        Rect::new(col, current_y, 1, 1),
+                    );
+                    col = col.saturating_add(1);
+                }
+
+                let inner_rect = Rect {
+                    x: col,
                     y: current_y,
                     width: inner_width as u16,
                     height: 1,
                 };
-                for span in spans {
-                    content.write_tagged_span_area(&TaggedSpan::new(span, tag), rect);
+                content.move_cursor_to(current_y, col);
+                for span in row_spans {
+                    content.write_tagged_span_area(&TaggedSpan::new(span.clone(), tag), inner_rect);
                 }
-                current_y += 1;
+                col = col.saturating_add(inner_width as u16);
+
+                if right_pad > 0 {
+                    content.move_cursor_to(current_y, col);
+                    content.write_tagged_span_area(
+                        &TaggedSpan::new(Span::styled(" ", row_bg_style), tag),
+                        Rect::new(col, current_y, 1, 1),
+                    );
+                }
+
+                current_y = current_y.saturating_add(1);
             }
         }
 
-        let total_item_rows = current_y.saturating_sub(y + 1) as usize;
-
-        let box_area = Rect {
-            x,
-            y,
-            width: box_width as u16,
-            height: (total_item_rows + 2) as u16,
-        };
-
-        let status_line = TaggedLine::from(vec![
-            TaggedSpan::new(
-                Span::styled(
-                    status_prefix.clone(),
-                    settings.colour_palette.secondary_text(),
-                ),
-                Tag::TabSuggestion,
-            ),
-            TaggedSpan::new(
-                Span::styled(source_str, source_style),
-                Tag::AutoCompletionTimeInfo,
-            ),
-        ]);
-
-        content.render_border(
-            box_area,
-            Tag::TabSuggestion,
-            settings.colour_palette.secondary_text(),
-            false,
-            cursor_pos_maybe,
-            Some(status_line),
-        );
-
-        content.draw_vertical_scrollbar(
-            x + (box_width as u16).saturating_sub(1),
-            y + 1,
-            total_item_rows as u16,
-            active_suggestions.filtered_suggestions_len(),
-            num_rows_visible,
-            window_range.start,
-            scrollbar_style,
-            |cell_height, max_cell_height, y_start| Tag::TabCompletionScrollBar {
-                cell_height,
-                max_cell_height,
-                y_start,
-            },
-        );
+        // When scrollable, render the flush-left scrollbar directly into the left rail
+        // column `x`, preserving each row's background (selected highlight vs surface).
+        if show_scrollbar {
+            let mut thumb_style = scrollbar_style;
+            thumb_style.bg = None;
+            let mut track_style = palette.popup_rail();
+            track_style.bg = None;
+            content.draw_vertical_scrollbar(
+                x,
+                y,
+                total_item_rows as u16,
+                total_filtered,
+                num_rows_visible,
+                window_range.start,
+                thumb_style,
+                track_style,
+                |cell_height, max_cell_height, y_start| Tag::TabCompletionScrollBar {
+                    cell_height,
+                    max_cell_height,
+                    y_start,
+                },
+            );
+        }
 
         if let Some(sel_row) = selected_item_row {
             content.set_focus_row(sel_row);
         }
 
-        content.move_cursor_to(y + total_item_rows as u16 + 2, 0);
+        let last_row = y.saturating_add(total_item_rows.saturating_sub(1) as u16);
+        content.move_cursor_to(last_row, 0);
         content.newline();
 
-        let final_buf_len = ((y + total_item_rows as u16 + 3) as usize).max(original_buf_len);
+        let final_buf_len = ((last_row as usize) + 2).max(original_buf_len);
         if content.buf.len() > final_buf_len {
             content.buf.truncate(final_buf_len);
-        }
-
-        if time_hover {
-            let popup_style = settings.colour_palette.normal_text();
-            let comptype_msg = active_suggestions.comp_type.display_name();
-            let anchor_col =
-                (x + 2) + unicode_width::UnicodeWidthStr::width(status_prefix.as_str()) as u16;
-            let anchor_row = y + total_item_rows as u16 + 1;
-            content.draw_popup(
-                comptype_msg,
-                anchor_row + 1,
-                anchor_col,
-                terminal_height,
-                popup_style,
-                Tag::Normal,
-            );
         }
     }
 
@@ -2216,16 +2095,27 @@ impl App<'_> {
         let term_width = width as usize;
 
         // See `render_auto_suggestions`: a zero-width terminal has no room for the
-        // popup and would underflow the box math (panics under `overflow-checks`).
+        // popup and would underflow the layout math (panics under `overflow-checks`).
         if term_width == 0 {
             return;
         }
 
-        let loading_text = LOADING_TEXT;
-        let inner_width = unicode_width::UnicodeWidthStr::width(loading_text);
+        let palette = &settings.colour_palette;
+        let popup_bg_only = palette
+            .popup_bg()
+            .bg
+            .map_or_else(Style::default, |bg| Style::default().bg(bg));
+        let indicator_style = popup_bg_only.patch(palette.popup_indicator());
 
-        let box_width = (inner_width + 2).min(term_width);
-        let inner_width = box_width.saturating_sub(2).max(1);
+        let has_rail = term_width >= 2;
+        let left_pad = usize::from(term_width >= 3);
+        let right_pad = usize::from(term_width >= 4);
+        let left_chrome = usize::from(has_rail) + left_pad;
+
+        let loading_text = LOADING_TEXT;
+        let text_width = unicode_width::UnicodeWidthStr::width(loading_text);
+        let box_width = (left_chrome + text_width + right_pad).min(term_width);
+        let inner_width = box_width.saturating_sub(left_chrome + right_pad).max(1);
 
         let popup_anchor_col = cursor_pos_maybe
             .map(|pos| {
@@ -2235,6 +2125,7 @@ impl App<'_> {
                     0,
                     buffer,
                     cursor_byte_pos,
+                    left_chrome,
                 )
             })
             .unwrap_or(0);
@@ -2242,45 +2133,55 @@ impl App<'_> {
         let max_x = term_width.saturating_sub(box_width);
         let x = popup_anchor_col.min(max_x) as u16;
         let y = cursor_pos_maybe
-            .map(|pos| pos.row + 1)
+            .map(|pos| pos.row.saturating_add(1))
             .unwrap_or(grid_start_row);
 
-        let box_area = Rect {
-            x,
-            y,
-            width: box_width as u16,
-            height: 3,
-        };
+        content.fill_rect(
+            Rect {
+                x,
+                y,
+                width: box_width as u16,
+                height: 1,
+            },
+            " ",
+            popup_bg_only,
+            Tag::TabSuggestion,
+        );
 
-        let full_inner_area = Rect {
-            x: x + 1,
-            y: y + 1,
+        if has_rail {
+            content.move_cursor_to(y, x);
+            content.write_tagged_span_area(
+                &TaggedSpan::new(Span::styled("▎", indicator_style), Tag::TabSuggestion),
+                Rect::new(x, y, 1, 1),
+            );
+        }
+
+        let inner_area = Rect {
+            x: x.saturating_add(left_chrome as u16),
+            y,
             width: inner_width as u16,
             height: 1,
         };
-
-        content.fill_rect(full_inner_area, " ", Style::default(), Tag::TabSuggestion);
-
-        content.render_border(
-            box_area,
-            Tag::TabSuggestion,
-            settings.colour_palette.secondary_text(),
-            false,
-            cursor_pos_maybe,
-            None,
+        content.move_cursor_to(y, inner_area.x);
+        let mut line = gaussian_wave_animated_with_colors(
+            loading_text,
+            now,
+            start_time,
+            settings.terminal_colors.effective_fg(settings.colour_theme),
+            settings.terminal_colors.effective_bg(settings.colour_theme),
         );
+        if let Some(bg) = popup_bg_only.bg {
+            for span in &mut line.spans {
+                span.style = span.style.bg(bg);
+            }
+        }
+        content
+            .write_tagged_line_area(&TaggedLine::from_line(line, Tag::TabSuggestion), inner_area);
 
-        content.move_cursor_to(y + 1, x + 1);
-        let line = gaussian_wave_animated(loading_text, now, start_time);
-        content.write_tagged_line_area(
-            &TaggedLine::from_line(line, Tag::TabSuggestion),
-            full_inner_area,
-        );
-
-        content.move_cursor_to(y + 3, 0);
+        content.move_cursor_to(y, 0);
         content.newline();
 
-        let final_buf_len = ((y + 4) as usize).max(original_buf_len);
+        let final_buf_len = ((y as usize) + 2).max(original_buf_len);
         if content.buf.len() > final_buf_len {
             content.buf.truncate(final_buf_len);
         }
@@ -2293,6 +2194,7 @@ fn auto_suggestions_popup_anchor_col(
     suggestion_prefix_width: usize,
     buffer: &str,
     cursor_byte_pos: usize,
+    left_chrome: usize,
 ) -> usize {
     let wuc_start = word_under_cursor.start;
     if wuc_start <= cursor_byte_pos {
@@ -2303,14 +2205,14 @@ fn auto_suggestions_popup_anchor_col(
             let anchor = cursor_col - w;
             anchor
                 .saturating_add(suggestion_prefix_width)
-                .saturating_sub(1)
+                .saturating_sub(left_chrome)
         } else {
             0
         }
     } else {
         cursor_col
             .saturating_add(suggestion_prefix_width)
-            .saturating_sub(1)
+            .saturating_sub(left_chrome)
     }
 }
 
@@ -2324,10 +2226,16 @@ mod tests {
 
     #[test]
     fn test_auto_suggestions_popup_anchor_col_uses_cursor_col_for_empty_wuc() {
-        let anchor =
-            auto_suggestions_popup_anchor_col(9, &SubString::from_parts("", 4), 0, "echo test", 4);
+        let anchor = auto_suggestions_popup_anchor_col(
+            9,
+            &SubString::from_parts("", 4),
+            0,
+            "echo test",
+            4,
+            2,
+        );
 
-        assert_eq!(anchor, 8);
+        assert_eq!(anchor, 7);
     }
 
     #[test]
@@ -2338,6 +2246,7 @@ mod tests {
             0,
             "foo\nbar",
             7,
+            2,
         );
         assert_eq!(anchor, 0);
     }
@@ -2350,8 +2259,9 @@ mod tests {
             4,
             "echo src/l",
             10,
+            2,
         );
-        assert_eq!(anchor, 8);
+        assert_eq!(anchor, 7);
 
         let anchor = auto_suggestions_popup_anchor_col(
             12,
@@ -2359,8 +2269,9 @@ mod tests {
             0,
             "bind Ctrl+n always=",
             19,
+            2,
         );
-        assert_eq!(anchor, 11);
+        assert_eq!(anchor, 10);
     }
 
     #[test]
@@ -2671,13 +2582,11 @@ mod tests {
             content.get_buffer_lines(),
             vec![
                 "                                        ".to_string(),
-                "╭──────────────────────────────────────╮".to_string(),
-                "│sug1  this description is extremely lo│".to_string(),
-                "│ng and will wrap multiple times to te…│".to_string(),
-                "│sug2                                  │".to_string(),
-                "│sug3                                  │".to_string(),
-                "│sug4                                  │".to_string(),
-                "╰─1/5; 0.0ms───────────────────────────╯".to_string(),
+                "▎ sug1                                  ".to_string(),
+                "▎   this description is extremely long… ".to_string(),
+                "▏ sug2                                  ".to_string(),
+                "▏ sug3                                  ".to_string(),
+                "▏ sug4                                  ".to_string(),
                 "                                        ".to_string(),
             ]
         );
@@ -2708,7 +2617,7 @@ mod tests {
         let mut content = Contents::new(40);
 
         let mut sug1 = ProcessedSuggestion::new("sug1", "", "");
-        // Fits fully on 1 line: "sug1" (4) + separator (2) + "desc1" (5) = 11 <= 38.
+        // Fits fully on 1 line: "sug1" (4) + separator (2) + "desc1" (5) = 11 <= 37.
         sug1.description = SuggestionDescription::Static(vec![Span::raw("desc1")]);
 
         let mut sug2 = ProcessedSuggestion::new("sug2", "", "");
@@ -2758,10 +2667,8 @@ mod tests {
             content.get_buffer_lines(),
             vec![
                 "                                        ".to_string(),
-                "╭──────────────────────────────────────╮".to_string(),
-                "│sug1                             desc1│".to_string(),
-                "│sug2  this description is very long a…│".to_string(),
-                "╰─1/2; 0.0ms───────────────────────────╯".to_string(),
+                "▎ sug1                            desc1 ".to_string(),
+                "▏ sug2  this description is very long … ".to_string(),
                 "                                        ".to_string(),
             ]
         );
@@ -2782,11 +2689,10 @@ mod tests {
         let mut content = Contents::new(40);
 
         let mut sug1 = ProcessedSuggestion::new("sug1", "", "");
-        // Selected suggestion value + description wraps to exactly 2 rows on width=40.
-        // inner width = 40 - 2 = 38.
-        sug1.description = SuggestionDescription::Static(vec![Span::raw(
-            "this description is medium-long and wraps to exactly two rows",
-        )]);
+        // Selected suggestion value + description does not fit on 1 line (4 + 2 + 34 = 40 > 37),
+        // so it expands cleanly onto 2 rows with an indented full description on row 2.
+        sug1.description =
+            SuggestionDescription::Static(vec![Span::raw("medium description fits on row two")]);
 
         let mut sug2 = ProcessedSuggestion::new("sug2", "", "");
         sug2.description = SuggestionDescription::Static(vec![Span::raw("desc2")]);
@@ -2832,11 +2738,9 @@ mod tests {
             content.get_buffer_lines(),
             vec![
                 "                                        ".to_string(),
-                "╭──────────────────────────────────────╮".to_string(),
-                "│sug1  this description is medium-long │".to_string(),
-                "│and wraps to exactly two rows         │".to_string(),
-                "│sug2                             desc2│".to_string(),
-                "╰─1/2; 0.0ms───────────────────────────╯".to_string(),
+                "▎ sug1                                  ".to_string(),
+                "▎   medium description fits on row two  ".to_string(),
+                "▏ sug2                            desc2 ".to_string(),
                 "                                        ".to_string(),
             ]
         );
@@ -2907,12 +2811,9 @@ mod tests {
             crate::settings::FuzzyMode::default(),
         );
 
-        // Render auto suggestions. Since y = 0, the suggestions box should take:
-        // - y = 0: top border
-        // - y = 1: inner rows (1 item -> 1 row)
-        // - y = 2: bottom border
-        // - y = 3: cursor newline moved here
-        // Row 6 (index 6) is well below the bottom of the box and should remain untouched!
+        // Squared left-rail popup takes only the item rows (no top/bottom borders, no footer):
+        // - row 1: item row (`▏ sug1 `)
+        // Row 6 (index 6) is well below the popup and must remain untouched.
         App::render_auto_suggestions(
             &settings,
             &mut active,
@@ -2930,9 +2831,9 @@ mod tests {
             content.get_buffer_lines(),
             vec![
                 "                                        ".to_string(),
-                "╭────────────╮                          ".to_string(),
-                "│sug1        │                          ".to_string(),
-                "╰─ /1; 0.0ms─╯                          ".to_string(),
+                "▏ sug1                                  ".to_string(),
+                "                                        ".to_string(),
+                "                                        ".to_string(),
                 "                                        ".to_string(),
                 "                                        ".to_string(),
                 "     X                                  ".to_string(),
@@ -2946,6 +2847,590 @@ mod tests {
         let cell = &content.buf[6][5];
         assert_eq!(cell.cell.symbol(), "X");
         assert_eq!(cell.tag, tag_sentinel);
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_full_row_highlight_and_accent_rail() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
+        };
+        use crate::mouse_state::mouse_state;
+        use crate::settings::Settings;
+
+        let _guard = TEST_MOUSE_LOCK.lock().unwrap();
+        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
+
+        let settings = Settings::default();
+        let palette = &settings.colour_palette;
+        let mut content = Contents::new(40);
+
+        let mut sug1 = ProcessedSuggestion::new("checkout", "", "");
+        sug1.description = SuggestionDescription::Static(vec![Span::raw("Switch branches")]);
+        let mut sug2 = ProcessedSuggestion::new("commit", "", "");
+        sug2.description = SuggestionDescription::Static(vec![Span::raw("Record changes")]);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![sug1, sug2],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: Some(true),
+            should_run_flycomp: false,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            flybuffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true,
+            crate::settings::SuggestionSortOrder::default(),
+            crate::settings::FuzzyMode::default(),
+        );
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            40,
+            20,
+            None,
+            "",
+            0,
+            palette.scrollbar(),
+            20,
+        );
+
+        let expected_selected_bg = palette.popup_selected().bg.unwrap();
+
+        // Selected row (row 1): col 0 is flush-left `▎` accent on selected_bg, and cols 0..box_width
+        // form a seamless squared highlight rectangle with no harsh REVERSED modifier.
+        let box_width = content.buf[1]
+            .iter()
+            .rposition(|c| matches!(c.tag, Tag::Suggestion(0)))
+            .unwrap()
+            + 1;
+
+        let rail_cell = content.get_tagged_cell(1, 0).unwrap();
+        assert_eq!(rail_cell.cell.symbol(), "▎");
+        assert_eq!(rail_cell.cell.fg, palette.popup_indicator().fg.unwrap());
+        assert_eq!(rail_cell.cell.bg, expected_selected_bg);
+        assert!(!rail_cell.cell.modifier.contains(Modifier::REVERSED));
+
+        for col in 0..box_width {
+            let cell = content.get_tagged_cell(1, col as u16).unwrap();
+            assert_eq!(
+                cell.cell.bg, expected_selected_bg,
+                "col {col} should have full-row highlight bg"
+            );
+            assert!(!cell.cell.modifier.contains(Modifier::REVERSED));
+        }
+
+        // Unselected row (row 2): col 0 is flush-left `▏` rail in DIM terminal fg on transparent bg.
+        let unsel_rail = content.get_tagged_cell(2, 0).unwrap();
+        assert_eq!(unsel_rail.cell.symbol(), "▏");
+        assert!(unsel_rail.cell.modifier.contains(Modifier::DIM));
+        assert_eq!(unsel_rail.cell.bg, Color::Reset);
+
+        // No footer row below the last item (row 3 is blank).
+        assert_eq!(content.buf.len(), 4);
+        assert_eq!(content.get_tagged_cell(3, 0).unwrap().cell.symbol(), " ");
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_slim_scrollbar() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion,
+        };
+        use crate::mouse_state::mouse_state;
+        use crate::settings::Settings;
+
+        let _guard = TEST_MOUSE_LOCK.lock().unwrap();
+        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
+
+        let settings = Settings {
+            num_suggestion_rows: 4,
+            ..Settings::default()
+        };
+        let mut content = Contents::new(40);
+
+        let processed = (1..=10)
+            .map(|i| ProcessedSuggestion::new(format!("item{i}"), "", ""))
+            .collect();
+        let builder = ActiveSuggestionsBuilder {
+            processed,
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: Some(true),
+            should_run_flycomp: false,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            flybuffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true,
+            crate::settings::SuggestionSortOrder::default(),
+            crate::settings::FuzzyMode::default(),
+        );
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            40,
+            20,
+            None,
+            "",
+            0,
+            settings.colour_palette.scrollbar(),
+            20,
+        );
+
+        // Scrollbar renders directly in the left rail column (col 0) across item rows 1..=4,
+        // with no separate right scrollbar column and no footer row.
+        let palette = &settings.colour_palette;
+        let expected_selected_bg = palette.popup_selected().bg.unwrap();
+        let mut scrollbar_symbols = Vec::new();
+        for r in 1..=4usize {
+            let left_cell = &content.buf[r][0];
+            assert!(
+                matches!(
+                    left_cell.tag,
+                    Tag::TabCompletionScrollBar { y_start: 1, .. }
+                ),
+                "row {r} col 0 should hold the integrated left scrollbar"
+            );
+            scrollbar_symbols.push(left_cell.cell.symbol());
+            // Selected row (row 1) preserves selected_bg on col 0; unselected rows stay transparent.
+            let want_bg = if r == 1 {
+                expected_selected_bg
+            } else {
+                Color::Reset
+            };
+            assert_eq!(left_cell.cell.bg, want_bg, "row {r} col 0 bg mismatch");
+            // No scrollbar tag anywhere to the right of col 0.
+            assert!(
+                content.buf[r][1..]
+                    .iter()
+                    .all(|c| !matches!(c.tag, Tag::TabCompletionScrollBar { .. }))
+            );
+        }
+        assert!(
+            scrollbar_symbols.iter().all(|s| matches!(*s, "▎" | "▏")),
+            "expected flush-left scrollbar glyphs, got: {:?}",
+            scrollbar_symbols
+        );
+        assert!(
+            scrollbar_symbols.contains(&"▎"),
+            "expected visible scrollbar thumb `▎`, got: {:?}",
+            scrollbar_symbols
+        );
+        // No footer row below the 4 item rows.
+        assert_eq!(content.buf.len(), 6);
+        assert_eq!(content.get_tagged_cell(5, 0).unwrap().cell.symbol(), " ");
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_narrow_widths_do_not_panic() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
+        };
+        use crate::mouse_state::mouse_state;
+        use crate::settings::Settings;
+
+        let _guard = TEST_MOUSE_LOCK.lock().unwrap();
+        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
+
+        let settings = Settings {
+            num_suggestion_rows: 3,
+            ..Settings::default()
+        };
+        let now = std::time::Instant::now();
+        let wuc = flybuffer::SubString::new("", "").unwrap();
+
+        for width in 1u16..=6 {
+            let mut sug = ProcessedSuggestion::new("verylongsuggestion", "", "");
+            sug.description = SuggestionDescription::Static(vec![Span::raw("long description")]);
+            let builder = ActiveSuggestionsBuilder {
+                processed: vec![
+                    sug,
+                    ProcessedSuggestion::new("two", "", ""),
+                    ProcessedSuggestion::new("three", "", ""),
+                    ProcessedSuggestion::new("four", "", ""),
+                ],
+                unprocessed: std::collections::VecDeque::new(),
+                common_prefix: None,
+                auto_accept_if_solo: false,
+                insert_common_prefix: false,
+                comp_type: crate::tab_completion_context::CompType::FirstWord,
+                nosort: false,
+                compspec_was_useful: Some(true),
+                should_run_flycomp: false,
+            };
+            let mut active = ActiveSuggestions::new(
+                builder,
+                wuc.clone(),
+                std::time::Duration::from_millis(0),
+                true,
+                crate::settings::SuggestionSortOrder::default(),
+                crate::settings::FuzzyMode::default(),
+            );
+            active.selected_coord = Some((0, 0));
+
+            let mut content = Contents::new(width);
+            App::render_auto_suggestions(
+                &settings,
+                &mut active,
+                &mut content,
+                width,
+                20,
+                None,
+                "",
+                0,
+                settings.colour_palette.scrollbar(),
+                20,
+            );
+
+            let mut loading_content = Contents::new(width);
+            App::render_auto_suggestions_loading(
+                &settings,
+                &mut loading_content,
+                width,
+                None,
+                "",
+                0,
+                &wuc,
+                now,
+                now,
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_loading_minimal_rail() {
+        use crate::settings::Settings;
+
+        let settings = Settings::default();
+        let mut content = Contents::new(40);
+        let now = std::time::Instant::now();
+        let wuc = flybuffer::SubString::new("", "").unwrap();
+
+        App::render_auto_suggestions_loading(
+            &settings,
+            &mut content,
+            40,
+            None,
+            "",
+            0,
+            &wuc,
+            now,
+            now,
+        );
+
+        let lines = content.get_buffer_lines();
+        assert_eq!(
+            lines,
+            vec![
+                "                                        ".to_string(),
+                "▎ Loading completions…                  ".to_string(),
+                "                                        ".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_light_theme_popup_palette_has_distinct_styles() {
+        let light = Palette::light();
+        assert!(light.popup_bg().bg.is_none());
+        assert!(light.popup_rail().add_modifier.contains(Modifier::DIM));
+        assert!(light.popup_indicator().fg.is_some());
+        assert!(light.popup_selected().bg.is_some());
+        assert!(
+            light
+                .popup_description()
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(light.secondary_text().add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_wide_emoji_truncation_keeps_full_highlight() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
+        };
+        use crate::mouse_state::mouse_state;
+        use crate::settings::Settings;
+
+        let _guard = TEST_MOUSE_LOCK.lock().unwrap();
+        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
+
+        // num_suggestion_rows = 1 forces single-line truncation on the selected row.
+        let settings = Settings {
+            num_suggestion_rows: 1,
+            ..Settings::default()
+        };
+        let palette = &settings.colour_palette;
+        let mut content = Contents::new(36);
+
+        let mut sug = ProcessedSuggestion::new("sug1", "", "");
+        // Place a 2-column emoji right at the truncation boundary so take_prefix_of_spans
+        // stops 1 column short of the nominal budget.
+        sug.description =
+            SuggestionDescription::Static(vec![Span::raw("0123456789012345678901234🚀tail")]);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![sug],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: Some(true),
+            should_run_flycomp: false,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            flybuffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true,
+            crate::settings::SuggestionSortOrder::default(),
+            crate::settings::FuzzyMode::default(),
+        );
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            36,
+            20,
+            None,
+            "",
+            0,
+            palette.scrollbar(),
+            20,
+        );
+
+        let expected_bg = palette.popup_selected().bg.unwrap();
+        // Item sits on row 1. Every column from col 0 (`▎`) through col 35 (right pad) must carry selected_bg.
+        for col in 0u16..36 {
+            let cell = content.get_tagged_cell(1, col).unwrap();
+            assert_eq!(
+                cell.cell.bg, expected_bg,
+                "wide-char truncation must not leave an unhighlighted hole at col {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_matched_chars_distinct_on_selected_row() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion,
+        };
+        use crate::mouse_state::mouse_state;
+        use crate::settings::Settings;
+
+        let _guard = TEST_MOUSE_LOCK.lock().unwrap();
+        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
+
+        let settings = Settings::default();
+        let mut content = Contents::new(40);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![ProcessedSuggestion::new("checkout", "", "")],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: Some(true),
+            should_run_flycomp: false,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            flybuffer::SubString::new("ch", "ch").unwrap(),
+            std::time::Duration::from_millis(0),
+            true,
+            crate::settings::SuggestionSortOrder::default(),
+            crate::settings::FuzzyMode::default(),
+        );
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            40,
+            20,
+            None,
+            "ch",
+            2,
+            settings.colour_palette.scrollbar(),
+            20,
+        );
+
+        // Col 2 ('c') and col 3 ('h') matched "ch": bold + no underline/reverse.
+        let matched = content.get_tagged_cell(1, 2).unwrap();
+        assert_eq!(matched.cell.symbol(), "c");
+        assert!(matched.cell.modifier.contains(Modifier::BOLD));
+        assert!(!matched.cell.modifier.contains(Modifier::UNDERLINED));
+        assert!(!matched.cell.modifier.contains(Modifier::REVERSED));
+
+        // Col 4 ('e') did not match: regular weight so matched chars stay distinct.
+        let unmatched = content.get_tagged_cell(1, 4).unwrap();
+        assert_eq!(unmatched.cell.symbol(), "e");
+        assert!(!unmatched.cell.modifier.contains(Modifier::BOLD));
+        assert!(!unmatched.cell.modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_long_name_wraps_and_preserves_description() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
+        };
+        use crate::mouse_state::mouse_state;
+        use crate::settings::Settings;
+
+        let _guard = TEST_MOUSE_LOCK.lock().unwrap();
+        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
+
+        let settings = Settings::default();
+        let mut content = Contents::new(30);
+
+        // 30 cols -> inner_width = 27. Name is 31 chars (wraps across 2 rows: 27 + 4),
+        // leaving 23 cols on row 2 for the " 2min" description.
+        let mut sug = ProcessedSuggestion::new("very_long_filename_example_a.rs", "", "");
+        sug.description = SuggestionDescription::Static(vec![Span::raw(" 2min")]);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![sug],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FilenameExpansion,
+            nosort: false,
+            compspec_was_useful: Some(true),
+            should_run_flycomp: false,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            flybuffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true,
+            crate::settings::SuggestionSortOrder::default(),
+            crate::settings::FuzzyMode::default(),
+        );
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            30,
+            20,
+            None,
+            "",
+            0,
+            settings.colour_palette.scrollbar(),
+            20,
+        );
+
+        let lines = content.get_buffer_lines();
+        assert_eq!(
+            lines,
+            vec![
+                "                              ".to_string(),
+                "▎ very_long_filename_example_ ".to_string(),
+                "▎ a.rs                   2min ".to_string(),
+                "                              ".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_render_auto_suggestions_preserves_lscolors_explicit_bg_on_selected_row() {
+        use crate::active_suggestions::{
+            ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion, SuggestionDescription,
+        };
+        use crate::mouse_state::mouse_state;
+        use crate::settings::Settings;
+
+        let _guard = TEST_MOUSE_LOCK.lock().unwrap();
+        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
+
+        let settings = Settings::default();
+        let palette = &settings.colour_palette;
+        let mut content = Contents::new(30);
+
+        // Simulate LS_COLORS `tw=30;42` (black fg on green bg, e.g. `/tmp/`) and a
+        // zero-width description span that must not create a blank 2nd row.
+        let mut sug = ProcessedSuggestion::new("tmp/", "", "");
+        sug.style = Some(Style::default().fg(Color::Black).bg(Color::Green));
+        sug.description = SuggestionDescription::Static(vec![Span::raw("")]);
+
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![sug],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FilenameExpansion,
+            nosort: false,
+            compspec_was_useful: Some(true),
+            should_run_flycomp: false,
+        };
+
+        let mut active = ActiveSuggestions::new(
+            builder,
+            flybuffer::SubString::new("", "").unwrap(),
+            std::time::Duration::from_millis(0),
+            true,
+            crate::settings::SuggestionSortOrder::default(),
+            crate::settings::FuzzyMode::default(),
+        );
+        active.selected_coord = Some((0, 0));
+
+        App::render_auto_suggestions(
+            &settings,
+            &mut active,
+            &mut content,
+            30,
+            20,
+            None,
+            "",
+            0,
+            palette.scrollbar(),
+            20,
+        );
+
+        // Name cells keep their explicit LS_COLORS black-on-green badge so contrast is preserved.
+        let name_cell = content.get_tagged_cell(1, 2).unwrap();
+        assert_eq!(name_cell.cell.symbol(), "t");
+        assert_eq!(name_cell.cell.fg, Color::Black);
+        assert_eq!(name_cell.cell.bg, Color::Green);
+
+        // Rail cell at col 0 still carries the selected highlight background.
+        let rail_cell = content.get_tagged_cell(1, 0).unwrap();
+        assert_eq!(rail_cell.cell.bg, palette.popup_selected().bg.unwrap());
+
+        // Empty-string description must not force an extra blank row (only row 0, item row 1, trailing newline row 2).
+        assert_eq!(content.buf.len(), 3);
     }
 
     /// Regression: a terminal reporting 0 columns (seen transiently right after
@@ -3001,13 +3486,13 @@ mod tests {
             20,               // terminal_height
         );
 
-        // Nothing was drawn: no popup border on a zero-width terminal.
+        // Nothing was drawn: no left rail on a zero-width terminal.
         assert!(
             content
                 .buf
                 .iter()
                 .flat_map(|row| row.iter())
-                .all(|c| c.cell.symbol() != "╭"),
+                .all(|c| !matches!(c.cell.symbol(), "▎" | "▏")),
             "no suggestion popup should be drawn at zero width",
         );
     }
@@ -3041,13 +3526,13 @@ mod tests {
                 .buf
                 .iter()
                 .flat_map(|row| row.iter())
-                .all(|c| c.cell.symbol() != "╭"),
+                .all(|c| !matches!(c.cell.symbol(), "▎" | "▏")),
             "no loading popup should be drawn at zero width",
         );
     }
 
     #[test]
-    fn test_render_auto_suggestions_time_hover_shows_comptype_popup() {
+    fn test_render_auto_suggestions_left_scrollbar_tracks_scroll_position() {
         use crate::active_suggestions::{
             ActiveSuggestions, ActiveSuggestionsBuilder, ProcessedSuggestion,
         };
@@ -3055,14 +3540,18 @@ mod tests {
         use crate::settings::Settings;
 
         let _guard = TEST_MOUSE_LOCK.lock().unwrap();
-        let settings = Settings::default();
-        let mut content = Contents::new(40);
+        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
 
+        let settings = Settings {
+            num_suggestion_rows: 4,
+            ..Settings::default()
+        };
+        let palette = &settings.colour_palette;
+        let processed = (1..=12)
+            .map(|i| ProcessedSuggestion::new(format!("entry{i}"), "", ""))
+            .collect();
         let builder = ActiveSuggestionsBuilder {
-            processed: vec![
-                ProcessedSuggestion::new("sug1", "", ""),
-                ProcessedSuggestion::new("sug2", "", ""),
-            ],
+            processed,
             unprocessed: std::collections::VecDeque::new(),
             common_prefix: None,
             auto_accept_if_solo: false,
@@ -3077,33 +3566,38 @@ mod tests {
             builder,
             flybuffer::SubString::new("", "").unwrap(),
             std::time::Duration::from_millis(0),
-            true, // auto_started
+            true,
             crate::settings::SuggestionSortOrder::default(),
             crate::settings::FuzzyMode::default(),
         );
+        // Move selection to the last item so the viewport scrolls to the bottom.
+        active.selected_coord = Some((0, 11));
 
-        // Simulate hovering over the time info tag
-        mouse_state(|m| m.last_mouse_over_cell_semantic = Some(Tag::AutoCompletionTimeInfo));
-
+        let mut content = Contents::new(30);
         App::render_auto_suggestions(
             &settings,
             &mut active,
             &mut content,
-            40,               // width
-            20,               // rows_left_before_end_of_screen
-            None,             // cursor_pos_maybe
-            "",               // buffer
-            0,                // cursor_byte_pos
-            Style::default(), // scrollbar_style
-            20,               // terminal_height
+            30,
+            20,
+            None,
+            "",
+            0,
+            palette.scrollbar(),
+            20,
         );
 
-        // Reset hover state after test
-        mouse_state(|m| m.last_mouse_over_cell_semantic = None);
+        // At the bottom of the list, the bottom row (row 4) holds the full-brightness thumb `▎`
+        // on selected_bg, while the top row (row 1) holds the DIM track `▏` on transparent bg.
+        let top_rail = content.get_tagged_cell(1, 0).unwrap();
+        assert_eq!(top_rail.cell.symbol(), "▏");
+        assert!(top_rail.cell.modifier.contains(Modifier::DIM));
+        assert_eq!(top_rail.cell.bg, Color::Reset);
 
-        // The popup with "FirstWord" should be drawn below the bottom border!
-        let lines = content.get_buffer_lines();
-        assert!(lines.iter().any(|l| l.contains("FirstWord")));
+        let bottom_rail = content.get_tagged_cell(4, 0).unwrap();
+        assert_eq!(bottom_rail.cell.symbol(), "▎");
+        assert!(!bottom_rail.cell.modifier.contains(Modifier::DIM));
+        assert_eq!(bottom_rail.cell.bg, palette.popup_selected().bg.unwrap());
     }
 
     fn scrollback_contents(lines: &[&str]) -> Contents {

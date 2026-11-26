@@ -4,10 +4,11 @@
 //! by Koichi Murase (@akinomyoga):
 //! <https://github.com/akinomyoga/ble.sh/blob/master/src/util.sh>
 
-use crate::settings::ResizeLogic;
+use crate::palette::TerminalColors;
+use crate::settings::{ColourTheme, ResizeLogic};
 use crate::shell;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Represents known terminal emulators and their capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,24 +397,26 @@ pub struct TermInfo {
     pub emulator: TerminalEmulator,
     pub multiplexer: Option<Multiplexer>,
     pub device_attributes: Option<DeviceAttributes>,
+    pub terminal_colors: TerminalColors,
 }
 
 impl TermInfo {
     /// Create a new `TermInfo` by querying the active terminal via an `EventReader`.
     ///
-    /// Sends DA2 request (`\x1b[>c`) and blocks for up to 300ms to parse device attributes.
-    /// Falls back to environment variable detection for any unresolved fields.
+    /// Sends OSC 10 (fg), OSC 11 (bg), and DA2 (`\x1b[>c`) in a single flush and blocks
+    /// until the DA2 sentinel returns (up to 300ms). Falls back to environment variable
+    /// detection for any unresolved fields.
     pub fn new(reader: &termina::EventReader) -> Self {
         Self::new_with_timeout(reader, Some(Duration::from_millis(300)))
     }
 
     /// Create a new `TermInfo` querying the terminal with a specified timeout.
     pub fn new_with_timeout(reader: &termina::EventReader, timeout: Option<Duration>) -> Self {
-        let da = match query_da_from_reader(reader, timeout) {
-            Ok(da) => da,
+        let (da, terminal_colors) = match query_terminal_from_reader(reader, timeout) {
+            Ok(res) => res,
             Err(e) => {
-                log::warn!("Failed to query device attributes: {}", e);
-                None
+                log::warn!("Failed to query terminal attributes/colours: {}", e);
+                (None, TerminalColors::default())
             }
         };
 
@@ -451,6 +454,7 @@ impl TermInfo {
             emulator,
             multiplexer,
             device_attributes: da,
+            terminal_colors,
         }
     }
 
@@ -476,11 +480,40 @@ impl TermInfo {
             emulator,
             multiplexer,
             device_attributes: None,
+            terminal_colors: TerminalColors::default(),
         }
     }
 }
 
 static STATIC_TERM_INFO: Mutex<Option<TermInfo>> = Mutex::new(None);
+
+/// Returns the cached [`TermInfo`] without triggering any terminal query.
+pub fn cached_term_info() -> Option<TermInfo> {
+    STATIC_TERM_INFO.lock().ok().and_then(|g| g.clone())
+}
+
+/// Merge newly-received OSC 10/11 colours into the cached [`TermInfo`] (if initialized).
+pub fn update_terminal_colors(colors: TerminalColors) {
+    if let Ok(mut guard) = STATIC_TERM_INFO.lock()
+        && let Some(ref mut info) = *guard
+    {
+        if colors.fg.is_some() {
+            info.terminal_colors.fg = colors.fg;
+        }
+        if colors.bg.is_some() {
+            info.terminal_colors.bg = colors.bg;
+        }
+    }
+}
+
+/// Whether this process has a controlling terminal that can be probed safely.
+fn has_controlling_terminal() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
+}
 
 /// Access the static [`TermInfo`].
 ///
@@ -514,15 +547,6 @@ pub fn get_term_info() -> TermInfo {
     info
 }
 
-/// Whether this process has a controlling terminal that the event reader can open.
-fn has_controlling_terminal() -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .is_ok()
-}
-
 /// Returns the cached [`DeviceAttributes`] if device attribute querying has been performed.
 pub fn device_attributes() -> Option<DeviceAttributes> {
     get_term_info().device_attributes
@@ -538,38 +562,98 @@ pub fn multiplexer() -> Option<Multiplexer> {
     get_term_info().multiplexer
 }
 
-/// Helper function to perform DA query on an EventReader.
-fn query_da_from_reader(
+/// Parse `$COLORFGBG` (e.g. `"15;0"` or `"0;default;15"`) into a dark/light hint.
+///
+/// The last semicolon-separated integer is the ANSI background palette index:
+/// indices `0..=6` and `8` indicate a dark background; `7` and `9..=15` indicate light.
+pub fn parse_colorfgbg_theme(val: &str) -> Option<ColourTheme> {
+    let bg_index: u8 = val.rsplit(';').next()?.trim().parse().ok()?;
+    match bg_index {
+        0..=6 | 8 => Some(ColourTheme::Dark),
+        7 | 9..=15 => Some(ColourTheme::Light),
+        _ => None,
+    }
+}
+
+/// Read `$COLORFGBG` from the shell environment as a zero-latency fallback when
+/// OSC 11 background probing is unavailable (e.g. older `tmux` or `screen`).
+pub fn detect_theme_from_colorfgbg() -> Option<ColourTheme> {
+    let val = shell::backend().env_var("COLORFGBG")?;
+    parse_colorfgbg_theme(&val)
+}
+
+/// Query OSC 10 (fg), OSC 11 (bg), and DA2 in a single terminal round-trip.
+///
+/// Because terminals process queries in FIFO order, any supported OSC 10/11
+/// replies arrive before the DA2 response. Stopping as soon as DA2 arrives
+/// avoids waiting out the timeout on terminals that ignore OSC 10/11.
+fn query_terminal_from_reader(
     reader: &termina::EventReader,
     timeout: Option<Duration>,
-) -> std::io::Result<Option<DeviceAttributes>> {
+) -> std::io::Result<(Option<DeviceAttributes>, TerminalColors)> {
     use std::io::Write;
     use termina::Event as TerminaEvent;
     use termina::escape::csi::{Csi, Device as CsiDevice};
+    use termina::escape::osc::{ColorOrQuery, DynamicColorNumber, Osc};
 
-    let req_csi = Csi::Device(CsiDevice::RequestSecondaryDeviceAttributes);
-    let mut stdout = std::io::stdout();
-    write!(stdout, "{req_csi}")?;
-    stdout.flush()?;
+    let osc10 = Osc::ChangeDynamicColors(
+        DynamicColorNumber::TextForegroundColor,
+        vec![ColorOrQuery::Query],
+    );
+    let osc11 = Osc::ChangeDynamicColors(
+        DynamicColorNumber::TextBackgroundColor,
+        vec![ColorOrQuery::Query],
+    );
+    let da2 = Csi::Device(CsiDevice::RequestSecondaryDeviceAttributes);
+
+    // Write directly to `/dev/tty` instead of stdout so piped commands never
+    // receive raw escape sequences on stdout.
+    let mut tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    write!(tty, "{osc10}{osc11}{da2}")?;
+    tty.flush()?;
 
     let timeout = timeout.unwrap_or(Duration::from_millis(300));
+    let deadline = Instant::now() + timeout;
 
-    let is_da_event = |event: &TerminaEvent| {
+    let is_probe_event = |event: &TerminaEvent| {
         matches!(
             event,
             TerminaEvent::Csi(Csi::Device(CsiDevice::DeviceAttributes(_)))
+                | TerminaEvent::Osc(Osc::ChangeDynamicColors(
+                    DynamicColorNumber::TextForegroundColor
+                        | DynamicColorNumber::TextBackgroundColor,
+                    _,
+                ))
         )
     };
 
-    if reader.poll(Some(timeout), is_da_event)?
-        && let TerminaEvent::Csi(Csi::Device(CsiDevice::DeviceAttributes(raw))) =
-            reader.read(is_da_event)?
-    {
-        let da = parse_da_response(&raw);
-        return Ok(Some(da));
+    let mut da = None;
+    let mut colors = TerminalColors::default();
+
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if remaining.is_zero() || !reader.poll(Some(remaining), is_probe_event)? {
+            break;
+        }
+        match reader.read(is_probe_event)? {
+            TerminaEvent::Osc(Osc::ChangeDynamicColors(num, list)) => {
+                if let Some(ColorOrQuery::Color(rgb)) = list.first() {
+                    let tuple = (rgb.red, rgb.green, rgb.blue);
+                    match num {
+                        DynamicColorNumber::TextForegroundColor => colors.fg = Some(tuple),
+                        DynamicColorNumber::TextBackgroundColor => colors.bg = Some(tuple),
+                        _ => {}
+                    }
+                }
+            }
+            TerminaEvent::Csi(Csi::Device(CsiDevice::DeviceAttributes(raw))) => {
+                da = Some(parse_da_response(&raw));
+                break;
+            }
+            _ => {}
+        }
     }
 
-    Ok(None)
+    Ok((da, colors))
 }
 
 /// Helper function checking if a terminal multiplexer is active.
@@ -796,5 +880,18 @@ mod tests {
             },
             ResizeLogic::AutoCleared
         );
+    }
+
+    #[test]
+    fn test_parse_colorfgbg_theme() {
+        assert_eq!(parse_colorfgbg_theme("15;0"), Some(ColourTheme::Dark));
+        assert_eq!(
+            parse_colorfgbg_theme("7;default;0"),
+            Some(ColourTheme::Dark)
+        );
+        assert_eq!(parse_colorfgbg_theme("0;15"), Some(ColourTheme::Light));
+        assert_eq!(parse_colorfgbg_theme("0;7"), Some(ColourTheme::Light));
+        assert_eq!(parse_colorfgbg_theme("invalid"), None);
+        assert_eq!(parse_colorfgbg_theme(""), None);
     }
 }
