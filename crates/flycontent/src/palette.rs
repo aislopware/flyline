@@ -1,6 +1,81 @@
 use clap_complete::CompletionCandidate;
 use ratatui::style::{Color, Modifier, Style};
+use std::collections::HashSet;
 use strum::{EnumIter, EnumMessage, IntoEnumIterator};
+
+/// Terminal default foreground/background RGB colours probed via OSC 10 / OSC 11.
+///
+/// Used to detect whether the host terminal is using a dark or light theme,
+/// harmonize the autocomplete selection pill with the terminal's true canvas
+/// colour, and fade the animated cursor and loading shimmer cleanly into the
+/// terminal background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalColors {
+    /// Default text foreground colour reported by OSC 10, if known.
+    pub fg: Option<(u8, u8, u8)>,
+    /// Default text background colour reported by OSC 11, if known.
+    pub bg: Option<(u8, u8, u8)>,
+}
+
+impl TerminalColors {
+    /// Returns `true` if `rgb` has Rec.709 luma ≥ 128 (i.e. a light colour).
+    pub fn is_light_rgb((r, g, b): (u8, u8, u8)) -> bool {
+        let luma = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+        luma >= 128.0
+    }
+
+    /// Linearly blend two RGB triples by `t` ∈ `[0.0, 1.0]`.
+    pub fn blend_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+        let t = t.clamp(0.0, 1.0);
+        let lerp = |x: u8, y: u8| -> u8 {
+            (f32::from(x) + (f32::from(y) - f32::from(x)) * t)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        (lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
+    }
+
+    /// Infer whether the terminal is dark or light from its reported OSC 11 background.
+    pub fn detected_theme(&self) -> Option<ColourTheme> {
+        self.bg.map(|bg| {
+            if Self::is_light_rgb(bg) {
+                ColourTheme::Light
+            } else {
+                ColourTheme::Dark
+            }
+        })
+    }
+
+    /// Compute a subtle elevated selection-pill background blended directly from
+    /// the terminal's own OSC 11 background toward its OSC 10 foreground, so the
+    /// highlight matches the terminal theme's exact hue and temperature.
+    pub fn popup_selected_bg(&self) -> Option<Color> {
+        let bg = self.bg?;
+        let is_light = Self::is_light_rgb(bg);
+        let target_fg = self
+            .fg
+            .unwrap_or(if is_light { (0, 0, 0) } else { (255, 255, 255) });
+        let factor = if is_light { 0.10 } else { 0.14 };
+        let (r, g, b) = Self::blend_rgb(bg, target_fg, factor);
+        Some(Color::Rgb(r, g, b))
+    }
+
+    /// Effective canvas background RGB (OSC 11 if known, otherwise theme fallback).
+    pub fn effective_bg(&self, theme: ColourTheme) -> (u8, u8, u8) {
+        self.bg.unwrap_or(match theme {
+            ColourTheme::Dark => (0, 0, 0),
+            ColourTheme::Light => (255, 255, 255),
+        })
+    }
+
+    /// Effective text foreground RGB (OSC 10 if known, otherwise theme fallback).
+    pub fn effective_fg(&self, theme: ColourTheme) -> (u8, u8, u8) {
+        self.fg.unwrap_or(match theme {
+            ColourTheme::Dark => (255, 255, 255),
+            ColourTheme::Light => (0, 0, 0),
+        })
+    }
+}
 
 /// Which theme the user has configured for the colour palette.
 #[derive(
@@ -154,7 +229,16 @@ fn parse_color_to_ratatui(c: parse_style::Color) -> ratatui::style::Color {
 /// The kebab-case name of each variant (e.g. `"recognised-command"`) is used
 /// in the `flyline set-style NAME=STYLE` command-line interface.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, EnumIter, EnumMessage, strum::Display, strum::EnumString,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    EnumIter,
+    EnumMessage,
+    strum::Display,
+    strum::EnumString,
 )]
 #[strum(serialize_all = "kebab-case")]
 pub enum PaletteStyleKind {
@@ -202,6 +286,18 @@ pub enum PaletteStyleKind {
     RightClickMenu,
     #[strum(message = "Style for the completion menu scrollbar")]
     Scrollbar,
+    #[strum(message = "Background surface style for the autocomplete popup")]
+    PopupBg,
+    #[strum(message = "Style for the autocomplete popup left rail")]
+    PopupRail,
+    #[strum(message = "Accent style for the selected row indicator in the autocomplete popup")]
+    PopupIndicator,
+    #[strum(message = "Highlight style for the selected row in the autocomplete popup")]
+    PopupSelected,
+    #[strum(message = "Style for unselected item descriptions in the autocomplete popup")]
+    PopupDescription,
+    #[strum(message = "Style for the selected item description in the autocomplete popup")]
+    PopupSelectedDescription,
     #[strum(message = "Rainbow bracket/quote colour for nesting depth 1 (outermost)")]
     RainbowBracket1,
     #[strum(message = "Rainbow bracket/quote colour for nesting depth 2")]
@@ -241,6 +337,12 @@ pub struct Palette {
     bash_reserved: Style,
     right_click_menu: Style,
     scrollbar: Style,
+    popup_bg: Style,
+    popup_rail: Style,
+    popup_indicator: Style,
+    popup_selected: Style,
+    popup_description: Style,
+    popup_selected_description: Style,
     rainbow_brackets: [Style; 4],
 }
 
@@ -335,10 +437,72 @@ impl Palette {
         self.scrollbar
     }
 
+    pub fn popup_bg(&self) -> Style {
+        self.popup_bg
+    }
+
+    pub fn popup_rail(&self) -> Style {
+        self.popup_rail
+    }
+
+    pub fn popup_indicator(&self) -> Style {
+        self.popup_indicator
+    }
+
+    pub fn popup_selected(&self) -> Style {
+        self.popup_selected
+    }
+
+    pub fn popup_description(&self) -> Style {
+        self.popup_description
+    }
+
+    pub fn popup_selected_description(&self) -> Style {
+        self.popup_selected_description
+    }
+
     /// Return the rainbow bracket/quote style for the given nesting `depth`.
     /// Cycles through the 4 palette slots using `depth % 4`.
     pub fn rainbow_bracket(&self, depth: usize) -> Style {
         self.rainbow_brackets[depth % 4]
+    }
+
+    /// Get an individual palette slot by kind.
+    pub fn get(&self, kind: PaletteStyleKind) -> Style {
+        match kind {
+            PaletteStyleKind::RecognisedCommand => self.recognised_command,
+            PaletteStyleKind::UnrecognisedCommand => self.unrecognised_command,
+            PaletteStyleKind::SingleQuotedText => self.single_quoted_text,
+            PaletteStyleKind::DoubleQuotedText => self.double_quoted_text,
+            PaletteStyleKind::SecondaryText => self.secondary_text,
+            PaletteStyleKind::InlineSuggestion => self.inline_suggestion,
+            PaletteStyleKind::TutorialHint => self.tutorial_hint,
+            PaletteStyleKind::MatchingChar => self.matching_char,
+            PaletteStyleKind::OpeningAndClosingPair => self.opening_and_closing_pair,
+            PaletteStyleKind::NormalText => self.normal_text,
+            PaletteStyleKind::Comment => self.comment,
+            PaletteStyleKind::EnvVar => self.env_var,
+            PaletteStyleKind::UnrecognisedEnvVar => self.unrecognised_env_var,
+            PaletteStyleKind::MarkdownHeading1 => self.markdown_heading1,
+            PaletteStyleKind::MarkdownHeading2 => self.markdown_heading2,
+            PaletteStyleKind::MarkdownHeading3 => self.markdown_heading3,
+            PaletteStyleKind::MarkdownCode => self.markdown_code,
+            PaletteStyleKind::KeySequenceStyle => self.key_sequence_style,
+            PaletteStyleKind::SelectedText => self.selected_text,
+            PaletteStyleKind::BashReserved => self.bash_reserved,
+            PaletteStyleKind::RightClickMenu => self.right_click_menu,
+            PaletteStyleKind::Scrollbar => self.scrollbar,
+            PaletteStyleKind::PopupBg => self.popup_bg,
+            PaletteStyleKind::PopupRail => self.popup_rail,
+            PaletteStyleKind::PopupIndicator => self.popup_indicator,
+            PaletteStyleKind::PopupSelected => self.popup_selected,
+            PaletteStyleKind::PopupDescription => self.popup_description,
+            PaletteStyleKind::PopupSelectedDescription => self.popup_selected_description,
+            PaletteStyleKind::RainbowBracket1 => self.rainbow_brackets[0],
+            PaletteStyleKind::RainbowBracket2 => self.rainbow_brackets[1],
+            PaletteStyleKind::RainbowBracket3 => self.rainbow_brackets[2],
+            PaletteStyleKind::RainbowBracket4 => self.rainbow_brackets[3],
+        }
     }
 
     // ── Setter ────────────────────────────────────────────────────────
@@ -368,6 +532,12 @@ impl Palette {
             PaletteStyleKind::BashReserved => self.bash_reserved = style,
             PaletteStyleKind::RightClickMenu => self.right_click_menu = style,
             PaletteStyleKind::Scrollbar => self.scrollbar = style,
+            PaletteStyleKind::PopupBg => self.popup_bg = style,
+            PaletteStyleKind::PopupRail => self.popup_rail = style,
+            PaletteStyleKind::PopupIndicator => self.popup_indicator = style,
+            PaletteStyleKind::PopupSelected => self.popup_selected = style,
+            PaletteStyleKind::PopupDescription => self.popup_description = style,
+            PaletteStyleKind::PopupSelectedDescription => self.popup_selected_description = style,
             PaletteStyleKind::RainbowBracket1 => self.rainbow_brackets[0] = style,
             PaletteStyleKind::RainbowBracket2 => self.rainbow_brackets[1] = style,
             PaletteStyleKind::RainbowBracket3 => self.rainbow_brackets[2] = style,
@@ -417,14 +587,18 @@ impl Palette {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
             right_click_menu: Style::default().fg(Color::Black).bg(Color::Gray),
-            scrollbar: Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(100, 100, 100)),
+            scrollbar: Style::default(),
+            popup_bg: Style::default(),
+            popup_rail: Style::default().add_modifier(Modifier::DIM),
+            popup_indicator: Style::default().fg(Color::Cyan),
+            popup_selected: Style::default().bg(Color::DarkGray),
+            popup_description: Style::default().add_modifier(Modifier::DIM),
+            popup_selected_description: Style::default().add_modifier(Modifier::DIM),
             rainbow_brackets: [
-                Style::default().fg(Color::Rgb(255, 215, 0)),   // gold
-                Style::default().fg(Color::Rgb(255, 100, 100)), // coral
-                Style::default().fg(Color::Rgb(100, 200, 255)), // sky-blue
-                Style::default().fg(Color::Rgb(100, 230, 150)), // mint-green
+                Style::default().fg(Color::Yellow),
+                Style::default().fg(Color::LightRed),
+                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::Green),
             ],
         }
     }
@@ -436,8 +610,8 @@ impl Palette {
             unrecognised_command: Style::default().fg(Color::Red).bold(),
             single_quoted_text: Style::default().fg(Color::Magenta),
             double_quoted_text: Style::default().fg(Color::Magenta),
-            secondary_text: Style::default(),
-            inline_suggestion: Style::default(),
+            secondary_text: Style::default().add_modifier(Modifier::DIM),
+            inline_suggestion: Style::default().add_modifier(Modifier::DIM),
             tutorial_hint: Style::default().add_modifier(Modifier::BOLD),
             matching_char: Style::default()
                 .fg(Color::Blue)
@@ -468,7 +642,13 @@ impl Palette {
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
             right_click_menu: Style::default().fg(Color::Black).bg(Color::Gray),
-            scrollbar: Style::default().fg(Color::Black).bg(Color::Gray),
+            scrollbar: Style::default(),
+            popup_bg: Style::default(),
+            popup_rail: Style::default().add_modifier(Modifier::DIM),
+            popup_indicator: Style::default().fg(Color::Blue),
+            popup_selected: Style::default().bg(Color::Gray),
+            popup_description: Style::default().add_modifier(Modifier::DIM),
+            popup_selected_description: Style::default().add_modifier(Modifier::DIM),
             rainbow_brackets: [
                 Style::default().fg(Color::Yellow),
                 Style::default().fg(Color::Green),
@@ -478,12 +658,31 @@ impl Palette {
         }
     }
 
-    /// Reset all palette slots to the given theme preset.
-    pub fn apply_theme(&mut self, mode: ColourTheme) {
-        *self = match mode {
+    /// Build the preset palette for `mode`.
+    pub fn for_theme(mode: ColourTheme) -> Self {
+        match mode {
             ColourTheme::Dark => Self::dark(),
             ColourTheme::Light => Self::light(),
-        };
+        }
+    }
+
+    /// Reset all palette slots to the given theme preset.
+    pub fn apply_theme(&mut self, mode: ColourTheme) {
+        *self = Self::for_theme(mode);
+    }
+
+    /// Apply a theme preset to all slots except those explicitly listed in `preserved`.
+    pub fn apply_theme_preserving(
+        &mut self,
+        mode: ColourTheme,
+        preserved: &HashSet<PaletteStyleKind>,
+    ) {
+        let preset = Self::for_theme(mode);
+        for kind in PaletteStyleKind::iter() {
+            if !preserved.contains(&kind) {
+                self.set(kind, preset.get(kind));
+            }
+        }
     }
 
     // ── Derived / constant styles ───────────────────────────────────
@@ -585,5 +784,43 @@ mod tests {
         for c in &candidates {
             assert!(c.get_help().is_some());
         }
+    }
+
+    #[test]
+    fn test_terminal_colors_detects_dark_and_light_themes() {
+        // Catppuccin Mocha (dark)
+        let mocha = TerminalColors {
+            fg: Some((205, 214, 244)),
+            bg: Some((30, 30, 46)),
+        };
+        assert_eq!(mocha.detected_theme(), Some(ColourTheme::Dark));
+        assert_eq!(mocha.popup_selected_bg(), Some(Color::Rgb(55, 56, 74)));
+
+        // Solarized Light
+        let solarized_light = TerminalColors {
+            fg: Some((101, 123, 131)),
+            bg: Some((253, 246, 227)),
+        };
+        assert_eq!(solarized_light.detected_theme(), Some(ColourTheme::Light));
+        assert_eq!(
+            solarized_light.popup_selected_bg(),
+            Some(Color::Rgb(238, 234, 217))
+        );
+
+        // Unknown terminal colours
+        assert_eq!(TerminalColors::default().detected_theme(), None);
+        assert_eq!(TerminalColors::default().popup_selected_bg(), None);
+    }
+
+    #[test]
+    fn test_palette_apply_theme_preserving_keeps_customized_slots() {
+        let mut palette = Palette::dark();
+        let custom = Style::default().fg(Color::Magenta).bold();
+        palette.set(PaletteStyleKind::PopupIndicator, custom);
+        let preserved = HashSet::from([PaletteStyleKind::PopupIndicator]);
+
+        palette.apply_theme_preserving(ColourTheme::Light, &preserved);
+        assert_eq!(palette.popup_indicator(), custom);
+        assert_eq!(palette.popup_rail(), Palette::light().popup_rail());
     }
 }

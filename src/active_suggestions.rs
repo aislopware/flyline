@@ -1,6 +1,7 @@
 use crate::content::{
     StatefulSlidingWindow, ansi_string_to_spans, highlight_matching_indices, middle_truncate_spans,
-    take_prefix_of_spans, ts_to_timeago_string_5chars, vec_spans_width,
+    split_line_to_terminal_rows, take_prefix_of_spans, ts_to_timeago_string_5chars,
+    vec_spans_width,
 };
 use crate::palette::Palette;
 use crate::shell;
@@ -265,7 +266,8 @@ impl SuggestionFormatted {
     pub fn render(&self, col_width: usize, is_selected: bool) -> Vec<Span<'static>> {
         // Determine widths available for the main text and description.
         let main_text_width = vec_spans_width(&self.spans);
-        let has_description = !self.description_frame.is_empty();
+        let has_description =
+            !self.description_frame.is_empty() && self.description_frame_width > 0;
         let desc_total_width = if has_description {
             Self::DESCRIPTION_SEPARATOR.len() + self.description_frame_width
         } else {
@@ -361,27 +363,369 @@ impl SuggestionFormatted {
         spans
     }
 
-    /// Render this suggestion without truncation (e.g. for wrapping).
-    pub fn render_untruncated(&self, is_selected: bool) -> Vec<Span<'static>> {
-        let mut spans = self.spans.clone();
+    /// Background fill style for a row in the autocomplete popup.
+    pub fn popup_row_bg_style(is_selected: bool, palette: &Palette) -> Style {
         if is_selected {
-            for span in &mut spans {
-                if span.style != self.base_style {
-                    span.style = span.style.add_modifier(Modifier::BOLD);
+            let sel = palette.popup_selected();
+            let mut s = Style::default();
+            if let Some(bg) = sel.bg.or(palette.popup_bg().bg) {
+                s = s.bg(bg);
+            }
+            if sel.has_modifier(Modifier::REVERSED) {
+                s = s.add_modifier(Modifier::REVERSED);
+            }
+            s
+        } else {
+            palette
+                .popup_bg()
+                .bg
+                .map_or_else(Style::default, |bg| Style::default().bg(bg))
+        }
+    }
+
+    /// Style a main-text span inside the autocomplete popup when selected.
+    /// Preserves semantic foreground colours (e.g. `LS_COLORS` or fuzzy-match
+    /// accents) while applying a unified row highlight background.
+    fn apply_popup_selected_style(span_style: Style, palette: &Palette) -> Style {
+        let sel = palette.popup_selected();
+        let mut out = span_style.remove_modifier(Modifier::UNDERLINED);
+        let has_explicit_bg = out.bg.is_some() && out.bg != Some(Color::Reset);
+        if (out.fg.is_none() || out.fg == Some(Color::Reset))
+            && let Some(fg) = sel.fg
+        {
+            out = out.fg(fg);
+        }
+        // Preserve explicit non-Reset backgrounds (e.g. LS_COLORS `tw=30;42`
+        // black-on-green for `/tmp` or `su=37;41` white-on-red) so their paired
+        // foreground colour never loses contrast against the dark highlight pill.
+        if !has_explicit_bg && let Some(bg) = sel.bg.or(palette.popup_bg().bg) {
+            out = out.bg(bg);
+        }
+        out = out.add_modifier(sel.add_modifier);
+        out = out.remove_modifier(sel.sub_modifier);
+        out
+    }
+
+    /// Style a main-text span inside the autocomplete popup when unselected.
+    fn apply_popup_unselected_style(span_style: Style, palette: &Palette) -> Style {
+        let mut out = span_style.remove_modifier(Modifier::UNDERLINED);
+        if (out.bg.is_none() || out.bg == Some(Color::Reset))
+            && let Some(bg) = palette.popup_bg().bg
+        {
+            out = out.bg(bg);
+        }
+        out
+    }
+
+    /// Resolve a description span style on top of the popup row background.
+    fn apply_popup_desc_style(
+        span_style: Style,
+        is_selected: bool,
+        row_bg_style: Style,
+        palette: &Palette,
+    ) -> Style {
+        let base_desc = if is_selected {
+            palette.popup_selected_description()
+        } else {
+            palette.popup_description()
+        };
+        let mut styled = row_bg_style.patch(base_desc).patch(span_style);
+        let span_has_explicit_bg = span_style.bg.is_some() && span_style.bg != Some(Color::Reset);
+        if !span_has_explicit_bg && let Some(bg) = row_bg_style.bg {
+            styled = styled.bg(bg);
+        }
+        if row_bg_style.has_modifier(Modifier::REVERSED) {
+            styled = styled.add_modifier(Modifier::REVERSED);
+        }
+        styled
+    }
+
+    /// Render this suggestion as a single full-width styled row for the
+    /// autocomplete popup.
+    pub fn render_popup_single_line(
+        &self,
+        col_width: usize,
+        is_selected: bool,
+        palette: &Palette,
+    ) -> Vec<Span<'static>> {
+        let row_bg_style = Self::popup_row_bg_style(is_selected, palette);
+        let main_text_width = vec_spans_width(&self.spans);
+        let has_description =
+            !self.description_frame.is_empty() && self.description_frame_width > 0;
+        let desc_total_width = if has_description {
+            Self::DESCRIPTION_SEPARATOR.len() + self.description_frame_width
+        } else {
+            0
+        };
+
+        let (main_col_width, desc_render_width) =
+            if !has_description || col_width >= main_text_width + desc_total_width {
+                (col_width.min(main_text_width), self.description_frame_width)
+            } else {
+                let space_after_main =
+                    col_width.saturating_sub(main_text_width + Self::DESCRIPTION_SEPARATOR.len());
+                if space_after_main < Self::MIN_DESCRIPTION_WIDTH {
+                    (col_width.min(main_text_width), 0)
+                } else {
+                    (
+                        main_text_width,
+                        space_after_main.min(self.description_frame_width),
+                    )
                 }
-                span.style = Palette::convert_to_highlighted(span.style);
+            };
+
+        let raw_main: Vec<Span<'static>> = if main_col_width < main_text_width {
+            middle_truncate_spans(&self.spans, main_col_width)
+        } else {
+            self.spans.clone()
+        };
+
+        let mut spans: Vec<Span<'static>> = raw_main
+            .into_iter()
+            .map(|span| {
+                let style = if is_selected {
+                    Self::apply_popup_selected_style(span.style, palette)
+                } else {
+                    Self::apply_popup_unselected_style(span.style, palette)
+                };
+                Span::styled(span.content, style)
+            })
+            .collect();
+
+        let rendered_main_len = vec_spans_width(&spans);
+
+        // Pre-build description spans so `gap` uses their *actual* rendered width
+        // (wide graphemes at truncation boundaries can make `take_prefix_of_spans`
+        // 1 column narrower than `text_width`, which would otherwise leave a
+        // 1-cell unhighlighted hole at the right end of a selected pill).
+        let mut desc_spans: Vec<Span<'static>> = Vec::new();
+        if desc_render_width > 0 {
+            let base_desc_style =
+                Self::apply_popup_desc_style(Style::default(), is_selected, row_bg_style, palette);
+            if desc_render_width < self.description_frame_width {
+                let text_width = desc_render_width.saturating_sub(1);
+                let truncated = take_prefix_of_spans(&self.description_frame, text_width);
+                desc_spans.extend(truncated.into_iter().map(|span| {
+                    Span::styled(
+                        span.content,
+                        Self::apply_popup_desc_style(
+                            span.style,
+                            is_selected,
+                            row_bg_style,
+                            palette,
+                        ),
+                    )
+                }));
+                desc_spans.push(Span::styled("…", base_desc_style));
+            } else {
+                let truncated = take_prefix_of_spans(&self.description_frame, desc_render_width);
+                desc_spans.extend(truncated.into_iter().map(|span| {
+                    Span::styled(
+                        span.content,
+                        Self::apply_popup_desc_style(
+                            span.style,
+                            is_selected,
+                            row_bg_style,
+                            palette,
+                        ),
+                    )
+                }));
             }
         }
-        if !self.description_frame.is_empty() {
-            spans.push(Span::raw(Self::DESCRIPTION_SEPARATOR));
-            let desc_style = self.description_style;
-            spans.extend(
-                self.description_frame
-                    .iter()
-                    .map(|span| Span::styled(span.content.clone(), desc_style.patch(span.style))),
-            );
+
+        let actual_desc_len = vec_spans_width(&desc_spans);
+        let desc_total_render_width = if actual_desc_len > 0 {
+            Self::DESCRIPTION_SEPARATOR.len() + actual_desc_len
+        } else {
+            0
+        };
+        let rendered_total = rendered_main_len + desc_total_render_width;
+        let gap = col_width.saturating_sub(rendered_total);
+        if gap > 0 {
+            spans.push(Span::styled(" ".repeat(gap), row_bg_style));
         }
+
+        if actual_desc_len > 0 {
+            spans.push(Span::styled(Self::DESCRIPTION_SEPARATOR, row_bg_style));
+            spans.extend(desc_spans);
+        }
+
         spans
+    }
+
+    /// Render this suggestion into 1 or 2 full-width rows for the autocomplete
+    /// popup. When selected and too wide for a single row (with `max_rows >= 2`),
+    /// expands cleanly: either putting the suggestion name on row 1 and an
+    /// indented description on row 2, or wrapping a long suggestion name across
+    /// two rows.
+    pub fn render_popup_rows(
+        &self,
+        col_width: usize,
+        max_rows: usize,
+        is_selected: bool,
+        palette: &Palette,
+    ) -> Vec<Vec<Span<'static>>> {
+        if col_width == 0 || max_rows == 0 {
+            return vec![];
+        }
+
+        if !is_selected || max_rows == 1 {
+            return vec![self.render_popup_single_line(col_width, is_selected, palette)];
+        }
+
+        let main_text_width = vec_spans_width(&self.spans);
+        let has_description =
+            !self.description_frame.is_empty() && self.description_frame_width > 0;
+        let desc_total_width = if has_description {
+            Self::DESCRIPTION_SEPARATOR.len() + self.description_frame_width
+        } else {
+            0
+        };
+
+        if main_text_width + desc_total_width <= col_width {
+            return vec![self.render_popup_single_line(col_width, true, palette)];
+        }
+
+        let row_bg_style = Self::popup_row_bg_style(true, palette);
+
+        if main_text_width <= col_width && has_description {
+            // Row 1: full suggestion name on the highlight pill.
+            let mut row1: Vec<Span<'static>> = self
+                .spans
+                .iter()
+                .map(|span| {
+                    Span::styled(
+                        span.content.clone(),
+                        Self::apply_popup_selected_style(span.style, palette),
+                    )
+                })
+                .collect();
+            let row1_pad = col_width.saturating_sub(main_text_width);
+            if row1_pad > 0 {
+                row1.push(Span::styled(" ".repeat(row1_pad), row_bg_style));
+            }
+
+            // Row 2: indented description on the same highlight pill.
+            let indent = if col_width >= 6 { 2 } else { 0 };
+            let desc_avail = col_width.saturating_sub(indent);
+            let mut row2: Vec<Span<'static>> = Vec::new();
+            if indent > 0 {
+                row2.push(Span::styled(" ".repeat(indent), row_bg_style));
+            }
+            let base_desc_style =
+                Self::apply_popup_desc_style(Style::default(), true, row_bg_style, palette);
+            if self.description_frame_width > desc_avail {
+                let text_width = desc_avail.saturating_sub(1);
+                let truncated = take_prefix_of_spans(&self.description_frame, text_width);
+                row2.extend(truncated.into_iter().map(|span| {
+                    Span::styled(
+                        span.content,
+                        Self::apply_popup_desc_style(span.style, true, row_bg_style, palette),
+                    )
+                }));
+                if desc_avail > 0 {
+                    row2.push(Span::styled("…", base_desc_style));
+                }
+            } else {
+                row2.extend(self.description_frame.iter().map(|span| {
+                    Span::styled(
+                        span.content.clone(),
+                        Self::apply_popup_desc_style(span.style, true, row_bg_style, palette),
+                    )
+                }));
+            }
+            let row2_w = vec_spans_width(&row2);
+            if row2_w < col_width {
+                row2.push(Span::styled(" ".repeat(col_width - row2_w), row_bg_style));
+            }
+
+            return vec![row1, row2];
+        }
+
+        // Suggestion name itself exceeds `col_width`: wrap across up to 2 rows.
+        let styled_main: Vec<Span<'static>> = self
+            .spans
+            .iter()
+            .map(|span| {
+                Span::styled(
+                    span.content.clone(),
+                    Self::apply_popup_selected_style(span.style, palette),
+                )
+            })
+            .collect();
+        let wrapped = split_line_to_terminal_rows(&Line::from(styled_main), col_width as u16);
+        let limit = max_rows.min(2);
+        let truncated = wrapped.len() > limit;
+
+        let mut rows: Vec<Vec<Span<'static>>> = wrapped
+            .into_iter()
+            .take(limit)
+            .map(|line| line.spans)
+            .collect();
+
+        if truncated && let Some(last_row) = rows.last_mut() {
+            let keep = col_width.saturating_sub(1);
+            *last_row = take_prefix_of_spans(last_row, keep);
+            last_row.push(Span::styled(
+                "…",
+                Self::apply_popup_selected_style(Style::default(), palette),
+            ));
+        } else if !truncated
+            && has_description
+            && let Some(last_row) = rows.last_mut()
+        {
+            // Keep the description visible on the trailing wrapped row if it fits
+            // or if enough room remains for a readable truncated description.
+            let last_w = vec_spans_width(last_row);
+            let space_after = col_width.saturating_sub(last_w + Self::DESCRIPTION_SEPARATOR.len());
+            if space_after > 0
+                && (space_after >= self.description_frame_width
+                    || space_after >= Self::MIN_DESCRIPTION_WIDTH)
+            {
+                let base_desc_style =
+                    Self::apply_popup_desc_style(Style::default(), true, row_bg_style, palette);
+                let mut desc_spans: Vec<Span<'static>> = Vec::new();
+                if self.description_frame_width > space_after {
+                    let truncated_desc = take_prefix_of_spans(
+                        &self.description_frame,
+                        space_after.saturating_sub(1),
+                    );
+                    desc_spans.extend(truncated_desc.into_iter().map(|span| {
+                        Span::styled(
+                            span.content,
+                            Self::apply_popup_desc_style(span.style, true, row_bg_style, palette),
+                        )
+                    }));
+                    desc_spans.push(Span::styled("…", base_desc_style));
+                } else {
+                    desc_spans.extend(self.description_frame.iter().map(|span| {
+                        Span::styled(
+                            span.content.clone(),
+                            Self::apply_popup_desc_style(span.style, true, row_bg_style, palette),
+                        )
+                    }));
+                }
+                let actual_desc_w = vec_spans_width(&desc_spans);
+                if actual_desc_w > 0 {
+                    let gap = col_width
+                        .saturating_sub(last_w + Self::DESCRIPTION_SEPARATOR.len() + actual_desc_w);
+                    if gap > 0 {
+                        last_row.push(Span::styled(" ".repeat(gap), row_bg_style));
+                    }
+                    last_row.push(Span::styled(Self::DESCRIPTION_SEPARATOR, row_bg_style));
+                    last_row.extend(desc_spans);
+                }
+            }
+        }
+
+        for row in &mut rows {
+            let w = vec_spans_width(row);
+            if w < col_width {
+                row.push(Span::styled(" ".repeat(col_width - w), row_bg_style));
+            }
+        }
+
+        rows
     }
 }
 

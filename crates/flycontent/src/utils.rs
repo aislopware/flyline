@@ -29,6 +29,19 @@ pub fn gaussian_wave_animated(
     now: std::time::Instant,
     start_time: std::time::Instant,
 ) -> Line<'static> {
+    gaussian_wave_animated_with_colors(text, now, start_time, (255, 255, 255), (0, 0, 0))
+}
+
+/// Like [`gaussian_wave_animated`], but blends between the terminal's real
+/// foreground (`fg`) and background (`bg`) RGB colours so the shimmer stays
+/// readable and theme-consistent on both dark and light terminals.
+pub fn gaussian_wave_animated_with_colors(
+    text: &str,
+    now: std::time::Instant,
+    start_time: std::time::Instant,
+    fg: (u8, u8, u8),
+    bg: (u8, u8, u8),
+) -> Line<'static> {
     let len = text.chars().count() as f32;
     let start_pos = -12.0_f32;
     let active_width = len + 24.0_f32; // peak moves from -12.0 to len + 12.0
@@ -47,8 +60,10 @@ pub fn gaussian_wave_animated(
             // Gaussian falloff: sigma ≈ 2.82  →  2σ² = 16
             let dist = (i as f32 - peak_pos).abs();
             let intensity = (-dist * dist / 16.0_f32).exp();
-            let brightness = (100.0 + 155.0 * intensity).min(255.0) as u8;
-            let style = Style::default().fg(Color::Rgb(brightness, brightness, brightness));
+            // Blend from 38% toward fg (quiet trough) up to 100% fg (bright peak).
+            let t = 0.38 + 0.62 * intensity;
+            let (r, g, b) = crate::TerminalColors::blend_rgb(bg, fg, t);
+            let style = Style::default().fg(Color::Rgb(r, g, b));
             Span::styled(ch.to_string(), style)
         })
         .collect();

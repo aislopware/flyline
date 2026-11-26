@@ -76,7 +76,14 @@ pub fn generate_welcome_action_line(now: std::time::Instant, width: u16) -> (u16
     const TEXT: &str = "Press Enter to start the tutorial";
     static START_TIME: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
-    let line = content::gaussian_wave_animated(TEXT, now, *START_TIME);
+    let s = crate::settings();
+    let line = content::gaussian_wave_animated_with_colors(
+        TEXT,
+        now,
+        *START_TIME,
+        s.terminal_colors.effective_fg(s.colour_theme),
+        s.terminal_colors.effective_bg(s.colour_theme),
+    );
     let offset = (width + 32).saturating_sub(TEXT.len() as u16) / 2;
 
     (offset, line)

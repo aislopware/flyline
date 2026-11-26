@@ -113,6 +113,7 @@ fn drain_shutdown_events(timeout: Duration) {
                 | TerminaEvent::FocusOut
                 | TerminaEvent::Csi(Csi::Cursor(CsiCursor::ActivePositionReport { .. }))
                 | TerminaEvent::Csi(Csi::Device(CsiDevice::DeviceAttributes(_)))
+                | TerminaEvent::Osc(termina::escape::osc::Osc::ChangeDynamicColors(..))
         )
     };
 
@@ -835,7 +836,9 @@ impl<'a> App<'a> {
                 }
             }
 
-            self.handle_delayed_startup();
+            if self.handle_delayed_startup() {
+                redraw = true;
+            }
 
             if self.poll_agent() {
                 redraw = true;
@@ -1168,6 +1171,31 @@ impl<'a> App<'a> {
                             self.buffer.insert_str(&pasted);
                             self.on_possible_buffer_change();
                             true
+                        }
+                        TerminaEvent::Osc(termina::escape::osc::Osc::ChangeDynamicColors(
+                            num,
+                            colors,
+                        )) => {
+                            use termina::escape::osc::{ColorOrQuery, DynamicColorNumber};
+                            if let Some(ColorOrQuery::Color(rgb)) = colors.first() {
+                                let mut tc = crate::palette::TerminalColors::default();
+                                match num {
+                                    DynamicColorNumber::TextForegroundColor => {
+                                        tc.fg = Some((rgb.red, rgb.green, rgb.blue));
+                                    }
+                                    DynamicColorNumber::TextBackgroundColor => {
+                                        tc.bg = Some((rgb.red, rgb.green, rgb.blue));
+                                    }
+                                    _ => {}
+                                }
+                                crate::term_info::update_terminal_colors(tc);
+                                crate::settings().apply_detected_terminal_colors(
+                                    tc,
+                                    crate::term_info::detect_theme_from_colorfgbg(),
+                                )
+                            } else {
+                                false
+                            }
                         }
                         _ => false,
                     }
@@ -1955,9 +1983,9 @@ impl<'a> App<'a> {
         false
     }
 
-    fn handle_delayed_startup(&mut self) {
+    fn handle_delayed_startup(&mut self) -> bool {
         if self.has_run_delayed_startup.is_some() {
-            return;
+            return false;
         }
 
         let delayed_startup_duration =
@@ -1965,13 +1993,25 @@ impl<'a> App<'a> {
         let long_enough_since_startup = self.app_start_time.elapsed() >= delayed_startup_duration;
 
         if !long_enough_since_startup {
-            return;
+            return false;
         }
 
         self.has_run_delayed_startup = Some(std::time::Instant::now());
         log::debug!("Running delayed startup initialization");
+        let colors_changed;
         time_it!("delayed startup", {
-            let _ = crate::term_info::get_term_info();
+            let info = crate::term_info::get_term_info();
+            let colorfgbg_theme = crate::term_info::detect_theme_from_colorfgbg();
+            colors_changed = crate::settings()
+                .apply_detected_terminal_colors(info.terminal_colors, colorfgbg_theme);
+            if info.terminal_colors.fg.is_some() || info.terminal_colors.bg.is_some() {
+                log::info!(
+                    "Detected terminal colours: fg={:?}, bg={:?}, theme={:?}",
+                    info.terminal_colors.fg,
+                    info.terminal_colors.bg,
+                    crate::settings().colour_theme,
+                );
+            }
             self.sync_viewport_top_from_cpr();
 
             if self.terminal.viewport_top().is_none() {
@@ -1981,6 +2021,7 @@ impl<'a> App<'a> {
             let set_mode = |code| Csi::Mode(DecMode::SetDecPrivateMode(DecPrivateMode::Code(code)));
             let _ = crate::flush_stdout!("{}", set_mode(DecPrivateModeCode::FocusTracking));
         });
+        colors_changed
     }
 
     pub(crate) fn run_flycomp(&mut self, command_word: String, word_under_cursor: String) {

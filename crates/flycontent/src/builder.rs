@@ -4,12 +4,11 @@ use crate::palette::{ButtonState, Palette};
 use rand::prelude::*;
 use ratatui::buffer::Cell;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, StyledGrapheme};
 use ratatui::widgets::Widget;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tui_scrollbar::{ScrollBar, ScrollBarArrows, ScrollLengths};
+use tui_scrollbar::{GlyphSet, ScrollBar, ScrollBarArrows, ScrollLengths};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -1149,6 +1148,7 @@ impl<T: Clone + Copy + PartialEq + Eq + std::hash::Hash + Default> Contents<T> {
         visible: usize,
         start: usize,
         thumb_style: ratatui::style::Style,
+        track_style: ratatui::style::Style,
         mut tag_factory: F,
     ) where
         F: FnMut(usize, usize, u16) -> T,
@@ -1162,20 +1162,18 @@ impl<T: Clone + Copy + PartialEq + Eq + std::hash::Hash + Default> Contents<T> {
             viewport_len: visible,
         };
 
-        use ratatui::style::{Color, Style};
-
-        let thumb_bg = thumb_style.bg.unwrap_or(Color::Reset);
-        let thumb_fg = thumb_style.fg.unwrap_or(Color::Reset);
-
-        let track_style = if thumb_style.has_modifier(Modifier::REVERSED) {
-            Style::default().fg(thumb_fg).bg(thumb_fg)
-        } else {
-            Style::default().fg(thumb_bg).bg(thumb_bg)
-        };
+        // Flush-left block scrollbar glyphs aligned to column pixel 0:
+        // thin hairline track (`▏`) and crisp 1/4-cell thumb (`▎`), with a
+        // tapered hairline tip (`▏`) on light partial fills.
+        let mut glyphs = GlyphSet::unicode();
+        glyphs.track_vertical = '▏';
+        glyphs.thumb_vertical_lower = ['▏', '▏', '▏', '▎', '▎', '▎', '▎', '▎'];
+        glyphs.thumb_vertical_upper = ['▏', '▏', '▏', '▎', '▎', '▎', '▎', '▎'];
 
         let scrollbar = ScrollBar::vertical(lengths)
             .offset(start)
             .arrows(ScrollBarArrows::None)
+            .glyph_set(glyphs)
             .thumb_style(thumb_style)
             .track_style(track_style);
 
@@ -1184,13 +1182,31 @@ impl<T: Clone + Copy + PartialEq + Eq + std::hash::Hash + Default> Contents<T> {
         Widget::render(&scrollbar, area, &mut tmp_buf);
 
         for i in 0..length as usize {
-            let row_y = y_start + i as u16;
+            let row_y = y_start.saturating_add(i as u16);
 
             if let Some(rendered_cell) = tmp_buf.cell((0, i as u16))
                 && let Some(row) = self.buf.get_mut(row_y as usize)
                 && let Some(tagged_cell) = row.get_mut(x as usize)
             {
+                // Preserve each row's existing background (e.g. selected highlight
+                // pill vs card surface) whenever the scrollbar style leaves bg unset.
+                let prev_bg = tagged_cell.cell.bg;
+                let prev_reversed = tagged_cell
+                    .cell
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED);
                 tagged_cell.cell = rendered_cell.clone();
+                if tagged_cell.cell.bg == ratatui::style::Color::Reset
+                    && prev_bg != ratatui::style::Color::Reset
+                {
+                    tagged_cell.cell.set_bg(prev_bg);
+                }
+                if prev_reversed {
+                    tagged_cell
+                        .cell
+                        .modifier
+                        .insert(ratatui::style::Modifier::REVERSED);
+                }
                 tagged_cell.tag = tag_factory(i, length.saturating_sub(1) as usize, y_start);
             }
         }

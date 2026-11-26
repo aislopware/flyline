@@ -1,5 +1,6 @@
 use crate::active_suggestions::ANIMATION_FRAME_FPS;
 use crate::content::Coord;
+use crate::palette::TerminalColors;
 use crate::settings::ColourTheme;
 use crate::term_info;
 use clap::ValueEnum;
@@ -227,7 +228,8 @@ impl Cursor {
         }
     }
 
-    /// Return the cursor style based on the config, focus state, and colour theme.
+    /// Return the cursor style based on the config, focus state, colour theme,
+    /// and probed terminal colours.
     ///
     /// Returns `None` if the cursor should be hidden (e.g. blink off-phase).
     /// When `focused` is false the cursor is rendered at a steady dim level.
@@ -238,6 +240,7 @@ impl Cursor {
         selection_bg: Option<Color>,
         selection_active: bool,
         theme: ColourTheme,
+        terminal_colors: TerminalColors,
     ) -> Option<Style> {
         let intensity = if selection_active {
             1.0
@@ -249,6 +252,7 @@ impl Cursor {
             &config.style,
             selection_bg,
             theme,
+            terminal_colors,
         ))
     }
 
@@ -259,8 +263,15 @@ impl Cursor {
         intensity: u8,
         style_config: &CursorStyleConfig,
         theme: ColourTheme,
+        terminal_colors: TerminalColors,
     ) -> Style {
-        Self::build_style(intensity as f32 / 255.0, style_config, None, theme)
+        Self::build_style(
+            intensity as f32 / 255.0,
+            style_config,
+            None,
+            theme,
+            terminal_colors,
+        )
     }
 
     /// Compute a normalised intensity ∈ [0, 1] for the current effect phase.
@@ -296,24 +307,21 @@ impl Cursor {
         style_config: &CursorStyleConfig,
         selection_bg: Option<Color>,
         theme: ColourTheme,
+        terminal_colors: TerminalColors,
     ) -> Style {
         let selection_rgb = match selection_bg {
             Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
             _ => None,
         };
-        let fade_bg = theme_fade_bg(theme);
+        let fade_bg = terminal_colors.effective_bg(theme);
+        let default_cursor = terminal_colors.effective_fg(theme);
 
         match style_config {
             CursorStyleConfig::Default => {
                 if let Some((sr, sg, sb)) = selection_rgb {
-                    let cursor = theme_default_cursor_rgb(theme);
-                    Style::new().bg(lerp_rgb((sr, sg, sb), cursor, intensity))
+                    Style::new().bg(lerp_rgb((sr, sg, sb), default_cursor, intensity))
                 } else {
-                    Style::new().bg(lerp_rgb(
-                        fade_bg,
-                        theme_default_cursor_rgb(theme),
-                        intensity,
-                    ))
+                    Style::new().bg(lerp_rgb(fade_bg, default_cursor, intensity))
                 }
             }
             CursorStyleConfig::Reverse => Style::new().add_modifier(Modifier::REVERSED),
@@ -347,34 +355,55 @@ mod tests {
 
     #[test]
     fn dark_default_full_intensity_is_white() {
-        let style = Cursor::static_style(255, &CursorStyleConfig::Default, ColourTheme::Dark);
+        let style = Cursor::static_style(
+            255,
+            &CursorStyleConfig::Default,
+            ColourTheme::Dark,
+            TerminalColors::default(),
+        );
         assert_eq!(bg_rgb(style), (255, 255, 255));
     }
 
     #[test]
     fn dark_default_dim_is_near_black() {
         // 51/255 ≈ 0.2, the fade floor
-        let style = Cursor::static_style(51, &CursorStyleConfig::Default, ColourTheme::Dark);
+        let style = Cursor::static_style(
+            51,
+            &CursorStyleConfig::Default,
+            ColourTheme::Dark,
+            TerminalColors::default(),
+        );
         assert_eq!(bg_rgb(style), (51, 51, 51));
     }
 
     #[test]
     fn light_default_full_intensity_is_black() {
-        let style = Cursor::static_style(255, &CursorStyleConfig::Default, ColourTheme::Light);
+        let style = Cursor::static_style(
+            255,
+            &CursorStyleConfig::Default,
+            ColourTheme::Light,
+            TerminalColors::default(),
+        );
         assert_eq!(bg_rgb(style), (0, 0, 0));
     }
 
     #[test]
     fn light_default_dim_is_near_white() {
         // 51/255 ≈ 0.2 → lerp(white, black, 0.2) ≈ (204, 204, 204)
-        let style = Cursor::static_style(51, &CursorStyleConfig::Default, ColourTheme::Light);
+        let style = Cursor::static_style(
+            51,
+            &CursorStyleConfig::Default,
+            ColourTheme::Light,
+            TerminalColors::default(),
+        );
         assert_eq!(bg_rgb(style), (204, 204, 204));
     }
 
     #[test]
     fn light_custom_rgb_dim_washes_toward_white() {
         let custom = CursorStyleConfig::Custom(Style::new().bg(Color::Rgb(0, 100, 200)));
-        let style = Cursor::static_style(51, &custom, ColourTheme::Light);
+        let style =
+            Cursor::static_style(51, &custom, ColourTheme::Light, TerminalColors::default());
         // lerp((255,255,255), (0,100,200), 51/255) — washed toward white, not black
         let (r, g, b) = bg_rgb(style);
         assert!(r > 200, "red should wash toward white, got {r}");
@@ -387,7 +416,21 @@ mod tests {
     #[test]
     fn light_custom_rgb_full_keeps_color() {
         let custom = CursorStyleConfig::Custom(Style::new().bg(Color::Rgb(0, 100, 200)));
-        let style = Cursor::static_style(255, &custom, ColourTheme::Light);
+        let style =
+            Cursor::static_style(255, &custom, ColourTheme::Light, TerminalColors::default());
         assert_eq!(bg_rgb(style), (0, 100, 200));
+    }
+
+    #[test]
+    fn osc_terminal_colors_drive_cursor_fade_endpoints() {
+        let mocha = TerminalColors {
+            fg: Some((205, 214, 244)),
+            bg: Some((30, 30, 46)),
+        };
+        let full = Cursor::static_style(255, &CursorStyleConfig::Default, ColourTheme::Dark, mocha);
+        assert_eq!(bg_rgb(full), (205, 214, 244));
+
+        let dim = Cursor::static_style(0, &CursorStyleConfig::Default, ColourTheme::Dark, mocha);
+        assert_eq!(bg_rgb(dim), (30, 30, 46));
     }
 }
