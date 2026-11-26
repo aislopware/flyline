@@ -3000,8 +3000,9 @@ mod tests {
         let palette = &settings.colour_palette;
         let expected_selected_bg = palette.popup_selected().bg.unwrap();
         let mut scrollbar_symbols = Vec::new();
-        for r in 1..=4usize {
-            let left_cell = &content.buf[r][0];
+        for (idx, row) in content.buf[1..=4].iter().enumerate() {
+            let r = idx + 1;
+            let left_cell = &row[0];
             assert!(
                 matches!(
                     left_cell.tag,
@@ -3019,7 +3020,7 @@ mod tests {
             assert_eq!(left_cell.cell.bg, want_bg, "row {r} col 0 bg mismatch");
             // No scrollbar tag anywhere to the right of col 0.
             assert!(
-                content.buf[r][1..]
+                row[1..]
                     .iter()
                     .all(|c| !matches!(c.tag, Tag::TabCompletionScrollBar { .. }))
             );
