@@ -751,29 +751,7 @@ pub fn get_cwd() -> String {
 }
 
 pub fn expand_filename(filename: &str) -> String {
-    let _guard = super::symbols::BASH_LOCK.lock();
-    unsafe {
-        // expand_string_to_string returns an allocated string via string_list (using xmalloc)
-        // (see mirror-bash/subst.c:3859 / 3869). We must free it with locked_xfree.
-        let expanded_string = bash_symbols::expand_string_to_string(
-            std::ffi::CString::new(filename).unwrap().as_ptr(),
-            0,
-        );
-
-        if expanded_string.is_null() {
-            return filename.to_string();
-        }
-
-        let c_str = std::ffi::CStr::from_ptr(expanded_string);
-        let res = c_str
-            .to_str()
-            .ok()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| filename.to_string());
-
-        bash_symbols::locked_xfree(expanded_string as *mut libc::c_void);
-        res
-    }
+    crate::shell::expand_shell_filename(filename, get_envvar_value)
 }
 
 pub fn fully_expand_path(p: &str) -> String {

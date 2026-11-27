@@ -2805,5 +2805,62 @@ mod tab_completion_tests {
             active_escaped.accept_selected_filtered_item(&mut buf_escaped);
             assert_eq!(buf_escaped.buffer(), "mycmd file\\ with\\ spaces.txt ");
         }
+
+        #[test]
+        fn backtick_filenames_complete_without_hanging() {
+            let dir = std::env::temp_dir().join(format!(
+                "flyline_backtick_test_{}",
+                rand::random::<u32>()
+            ));
+            std::fs::create_dir_all(dir.join("sub`dir")).unwrap();
+            std::fs::write(dir.join("a`b.txt"), "").unwrap();
+            std::fs::write(dir.join("sub`dir/inner.txt"), "").unwrap();
+            std::env::set_current_dir(&dir).unwrap();
+
+            // Programmable completion (`cat` in TestBackend returns raw unquoted filenames,
+            // exercising `should_infer_filename_completion` + `into_processed` -> `resolve_completion_path`).
+            let cat_res = run_completion("cat ");
+            let cat_formatted: Vec<String> = cat_res.iter().map(|s| s.formatted()).collect();
+            assert!(
+                cat_formatted.contains(&"a\\`b.txt ".to_string()),
+                "cat completion should escape backtick filename: {:?}",
+                cat_formatted
+            );
+            assert!(
+                cat_formatted.contains(&"sub\\`dir/".to_string()),
+                "cat completion should escape backtick directory: {:?}",
+                cat_formatted
+            );
+
+            // FilenameExpansion fallback (`ls` has no compspec in TestBackend).
+            let ls_res = run_completion("ls ");
+            let ls_formatted: Vec<String> = ls_res.iter().map(|s| s.formatted()).collect();
+            assert!(
+                ls_formatted.contains(&"a\\`b.txt ".to_string()),
+                "ls completion should escape backtick filename: {:?}",
+                ls_formatted
+            );
+
+            // Completing inside a directory whose name contains a backtick.
+            for input in [r"ls sub\`dir/", "ls 'sub`dir'/", r#"ls "sub\`dir"/"#] {
+                let inner = run_completion(input);
+                assert_eq!(
+                    inner.iter().map(|s| s.s.as_str()).collect::<Vec<_>>(),
+                    vec!["inner.txt"],
+                    "input: {input}"
+                );
+            }
+
+            // Completing with single-quoted and double-quoted partial backtick filename.
+            let sq = run_completion("ls 'a`b");
+            assert_eq!(sq.len(), 1);
+            assert_eq!(sq[0].formatted(), "'a`b.txt");
+
+            let dq = run_completion(r#"ls "a\`b"#);
+            assert_eq!(dq.len(), 1);
+            assert_eq!(dq[0].formatted(), r#""a\`b.txt"#);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

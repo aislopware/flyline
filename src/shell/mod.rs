@@ -157,6 +157,26 @@ pub trait ShellBackend: Sync {
     /// Expand a shell word into a filename (quote removal, tilde and variable expansion).
     fn expand_filename(&self, filename: &str) -> String;
 
+    /// Resolve a completion candidate string to a filesystem path.
+    ///
+    /// Programmable completions (e.g. `compgen -f` / `_filedir`) return raw,
+    /// unquoted filenames that may contain quotes, backslashes, backticks, or `$`
+    /// (such as ``a`b.txt`` or `it's.txt`). Check whether the literal path exists
+    /// before falling back to shell word expansion (for `~/...` or `$HOME/...`).
+    fn resolve_completion_path(&self, candidate: &str) -> PathBuf {
+        if !candidate.is_empty() {
+            let literal = if std::path::Path::new(candidate).is_absolute() {
+                PathBuf::from(candidate)
+            } else {
+                PathBuf::from(self.cwd()).join(candidate)
+            };
+            if literal.symlink_metadata().is_ok() {
+                return literal;
+            }
+        }
+        PathBuf::from(self.expand_path(candidate))
+    }
+
     /// Expand prompt escape sequences (`\u`, `\h`, `\w`, etc.).
     fn decode_prompt(&self, raw: &str, is_prompt: bool) -> Option<String>;
 
@@ -296,6 +316,162 @@ fn init_backend() -> &'static dyn ShellBackend {
     &*test_backend::TEST_BACKEND
 }
 
+/// Expand a shell word into a literal filename safely in Rust without invoking
+/// Bash's `expand_string_to_string`.
+///
+/// Supports:
+/// - Leading unquoted tilde expansion (`~`, `~/...`, `~+`, `~-`, `~user`, `~user/...`)
+/// - Shell parameter expansion (`$NAME`, `${NAME}`) in unquoted and double-quoted text
+/// - Quote removal (`'...'`, `"..."`, and backslash escapes following Bash rules)
+///
+/// Deliberately does **not** perform command substitution (`` `...` ``, `$(...)`),
+/// arithmetic expansion, or process substitution. Calling Bash's
+/// `expand_string_to_string` on an unclosed backtick (e.g. a filename like
+/// ``a`b.txt``) triggers `jump_to_top_level` (`siglongjmp`), which unwinds out of
+/// the completion subshell and deadlocks on `FLYLINE_INSTANCE_PTR` (#1074); and
+/// paired backticks / `$(...)` in filenames would execute arbitrary commands on Tab.
+pub fn expand_shell_filename<F>(filename: &str, lookup_env: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut result = String::with_capacity(filename.len());
+    let mut rest = filename;
+
+    // Leading unquoted tilde expansion: up to the first `/` (or end of word),
+    // provided the tilde prefix itself contains no quoting or escapes.
+    if let Some(after_tilde) = rest.strip_prefix('~') {
+        let prefix_end = after_tilde.find('/').unwrap_or(after_tilde.len());
+        let tilde_prefix = &after_tilde[..prefix_end];
+        let has_quote_or_escape = tilde_prefix
+            .chars()
+            .any(|c| matches!(c, '\'' | '"' | '\\' | '$'));
+        if !has_quote_or_escape {
+            let expanded_tilde = match tilde_prefix {
+                "" => lookup_env("HOME"),
+                "+" => lookup_env("PWD"),
+                "-" => lookup_env("OLDPWD"),
+                user => crate::users::get_all_users()
+                    .iter()
+                    .find(|u| u.username == user)
+                    .map(|u| u.home_dir.clone()),
+            };
+            if let Some(dir) = expanded_tilde {
+                result.push_str(&dir);
+                rest = &after_tilde[prefix_end..];
+            }
+        }
+    }
+
+    let mut chars = rest.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    result.push(c);
+                }
+            }
+            Some('"') => match c {
+                '"' => quote = None,
+                '\\' => match chars.peek() {
+                    // Inside double quotes, backslash only escapes these characters;
+                    // backslash-newline is a line continuation (both removed).
+                    Some('\n') => {
+                        chars.next();
+                    }
+                    Some('$' | '`' | '"' | '\\') => {
+                        result.push(chars.next().unwrap());
+                    }
+                    _ => result.push('\\'),
+                },
+                '$' => expand_shell_var(&mut chars, &lookup_env, &mut result),
+                _ => result.push(c),
+            },
+            Some(_) => unreachable!(),
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => match chars.next() {
+                    Some('\n') | None => {}
+                    Some(escaped) => result.push(escaped),
+                },
+                '$' => expand_shell_var(&mut chars, &lookup_env, &mut result),
+                _ => result.push(c),
+            },
+        }
+    }
+
+    result
+}
+
+/// Expand `$NAME` or `${NAME}` into `out`. Unknown names expand to empty.
+/// Unrecognised `$` forms (like `$`, `$(...)`, `$1`, `${invalid}`) are left literal
+/// without executing anything.
+fn expand_shell_var<F>(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    lookup_env: &F,
+    out: &mut String,
+) where
+    F: Fn(&str) -> Option<String>,
+{
+    if chars.peek() == Some(&'{') {
+        // Peek ahead by cloning the iterator so an unclosed or non-plain `${...}`
+        // (such as `${a` or `${foo:-bar}`) does not swallow the rest of the path.
+        let mut probe = chars.clone();
+        probe.next(); // consume '{'
+        let mut name = String::new();
+        let mut closed = false;
+        let mut valid = true;
+        for vc in probe.by_ref() {
+            if vc == '}' {
+                closed = true;
+                break;
+            }
+            let ok = if name.is_empty() {
+                vc.is_ascii_alphabetic() || vc == '_'
+            } else {
+                vc.is_ascii_alphanumeric() || vc == '_'
+            };
+            if !ok {
+                valid = false;
+                break;
+            }
+            name.push(vc);
+        }
+        if closed && valid && !name.is_empty() {
+            *chars = probe;
+            if let Some(val) = lookup_env(&name) {
+                out.push_str(&val);
+            }
+            return;
+        }
+        out.push('$');
+        return;
+    }
+
+    if chars
+        .peek()
+        .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
+    {
+        let mut name = String::new();
+        while let Some(&vc) = chars.peek() {
+            if vc.is_ascii_alphanumeric() || vc == '_' {
+                name.push(vc);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if let Some(val) = lookup_env(&name) {
+            out.push_str(&val);
+        }
+    } else {
+        out.push('$');
+    }
+}
+
 /// The active host shell backend. Defaults to `BashBackend`.
 pub fn backend() -> &'static dyn ShellBackend {
     *ACTIVE.get_or_init(init_backend)
@@ -367,6 +543,51 @@ mod tests {
         assert_eq!(tb.expand_filename("'~'"), "~");
         assert_eq!(tb.expand_filename("\\~"), "~");
         assert_eq!(tb.expand_path("'$X'"), format!("{}/$X", tb.cwd()));
+    }
+
+    #[test]
+    fn expand_shell_filename_backticks_and_cmdsubst_are_literal() {
+        let tb = TestBackend::new();
+        tb.set_env("HOME", "/home/test");
+        tb.set_env("PWD", "/work");
+        tb.set_env("OLDPWD", "/prev");
+
+        // Unclosed and paired backticks must stay literal (never execute or longjmp).
+        assert_eq!(tb.expand_filename("a`b.txt"), "a`b.txt");
+        assert_eq!(tb.expand_filename("a\\`b.txt"), "a`b.txt");
+        assert_eq!(tb.expand_filename("\"a\\`b.txt\""), "a`b.txt");
+        assert_eq!(tb.expand_filename("'a`b.txt'"), "a`b.txt");
+        assert_eq!(tb.expand_filename("a`echo pwned`b.txt"), "a`echo pwned`b.txt");
+
+        // Command substitutions and unclosed braces must also stay literal.
+        assert_eq!(tb.expand_filename("$(echo hi).txt"), "$(echo hi).txt");
+        assert_eq!(tb.expand_filename("${unclosed"), "${unclosed");
+        assert_eq!(tb.expand_filename("${X:-default}"), "${X:-default}");
+
+        // Tilde ~+ and ~- expansion.
+        assert_eq!(tb.expand_filename("~+/sub"), format!("{}/sub", tb.cwd()));
+        assert_eq!(tb.expand_filename("~-/sub"), "/prev/sub");
+    }
+
+    #[test]
+    fn resolve_completion_path_prefers_existing_literal_filename() {
+        let dir = std::env::temp_dir().join(format!(
+            "flyline_resolve_literal_{}",
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a`b.txt", "it's.txt", "a\\b.txt", "$HOME.txt"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+
+        let tb = TestBackend::new();
+        for name in ["a`b.txt", "it's.txt", "a\\b.txt", "$HOME.txt"] {
+            let abs = dir.join(name);
+            let resolved = tb.resolve_completion_path(abs.to_str().unwrap());
+            assert_eq!(resolved, abs, "literal path should win for {name}");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

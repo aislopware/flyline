@@ -81,42 +81,6 @@ impl TestBackend {
         self.autocd
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
-
-    /// Expand `$NAME` or `${NAME}`, pushing the value to `out`. Unknown names
-    /// expand to nothing.
-    fn expand_var(&self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
-        if chars.peek() == Some(&'{') {
-            chars.next();
-            let mut name = String::new();
-            while let Some(&vc) = chars.peek() {
-                if vc == '}' {
-                    chars.next();
-                    break;
-                }
-                name.push(vc);
-                chars.next();
-            }
-            if let Some(val) = self.env_var(&name) {
-                out.push_str(&val);
-            }
-            return;
-        }
-
-        let mut name = String::new();
-        while let Some(&vc) = chars.peek() {
-            if vc.is_ascii_alphanumeric() || vc == '_' {
-                name.push(vc);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        if name.is_empty() {
-            out.push('$');
-        } else if let Some(val) = self.env_var(&name) {
-            out.push_str(&val);
-        }
-    }
 }
 
 #[derive(Parser, Debug)]
@@ -280,65 +244,8 @@ impl ShellBackend for TestBackend {
         }
     }
 
-    /// Test-only filename expansion. Supports a tiny subset of bash expansion:
-    ///   * quote removal, respecting `'...'`, `"..."` and backslash escapes
-    ///   * `$PWD` / `$HOME` (also `${NAME}`) in unquoted or double-quoted text
-    ///   * a leading unquoted `~/` expanded via `HOME`
-    ///   * `./` and `../` are left in place (resolved by the OS as relative paths)
-    ///
-    /// Quoted or escaped `~` and `$` stay literal, mirroring what bash's
-    /// `expand_string_to_string` does with an unquoted shell word.
     fn expand_filename(&self, filename: &str) -> String {
-        let mut result = String::new();
-        let mut chars = filename.chars().peekable();
-
-        // Tilde expansion only applies to an unquoted `~` at the word start.
-        if let Some(rest) = filename.strip_prefix('~')
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            chars.next();
-            let home = self
-                .env_var("HOME")
-                .unwrap_or_else(|| "/home/john".to_string());
-            result.push_str(&home);
-        }
-
-        let mut quote: Option<char> = None;
-        while let Some(c) = chars.next() {
-            match quote {
-                Some('\'') => {
-                    if c == '\'' {
-                        quote = None;
-                    } else {
-                        result.push(c);
-                    }
-                }
-                Some('"') => match c {
-                    '"' => quote = None,
-                    '\\' => match chars.peek() {
-                        // Backslash only escapes these inside double quotes.
-                        Some('$' | '`' | '"' | '\\' | '\n') => {
-                            result.push(chars.next().unwrap());
-                        }
-                        _ => result.push('\\'),
-                    },
-                    '$' => self.expand_var(&mut chars, &mut result),
-                    _ => result.push(c),
-                },
-                Some(_) => unreachable!(),
-                None => match c {
-                    '\'' | '"' => quote = Some(c),
-                    '\\' => {
-                        if let Some(escaped) = chars.next() {
-                            result.push(escaped);
-                        }
-                    }
-                    '$' => self.expand_var(&mut chars, &mut result),
-                    _ => result.push(c),
-                },
-            }
-        }
-        result
+        expand_shell_filename(filename, |name| self.env_var(name))
     }
 
     fn decode_prompt(&self, raw: &str, _is_prompt: bool) -> Option<String> {
