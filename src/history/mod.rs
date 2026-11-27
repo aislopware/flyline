@@ -80,11 +80,13 @@ impl TimestampNanos {
         } else {
             let ts_secs = self.as_seconds() as i64;
             let ts_nanos = self.fractional_ns();
-            chrono::DateTime::from_timestamp(ts_secs, ts_nanos).map(|dt| {
-                dt.with_timezone(&chrono::Local)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-            })
+            jiff::Timestamp::new(ts_secs, ts_nanos as i32)
+                .ok()
+                .map(|ts| {
+                    ts.to_zoned_datetime(jiff::tz::TimeZone::system())
+                        .strftime("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
         }
     }
 }

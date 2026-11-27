@@ -193,7 +193,7 @@ RPS1='\e[01;34m\@\e[0m'
 
 ### Custom time format with `\D{format}`
 
-Use `\D{format}` with any [Chrono format string](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) to display the time exactly how you want it. This is similar to `\D{format}` in the [Bash prompt documentation](https://www.gnu.org/software/bash/manual/html_node/Controlling-the-Prompt.html), but the format string is interpreted by Chrono rather than strftime.
+Use `\D{format}` with any [strftime format string](https://docs.rs/jiff/latest/jiff/fmt/strtime/index.html) to display the time exactly how you want it, as in the [Bash prompt documentation](https://www.gnu.org/software/bash/manual/html_node/Controlling-the-Prompt.html). flyline formats it with jiff: the locale-dependent `%c`, `%x`, `%X` and `%r` print what C `strftime` prints in the C locale, and an empty `\D{}` is `%T`. A format jiff cannot read is shown as written.
 
 ```bash
 # Show date and time

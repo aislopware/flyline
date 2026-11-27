@@ -62,16 +62,18 @@ crate-type = ["cdylib"]
 [dependencies]
 ansi-to-tui.workspace = true
 anyhow.workspace = true
-chrono = "0.4"
 clap.workspace = true
 clap_complete.workspace = true
 dirs = "7.0"
 # Only `parse` is used; the default features pull in chrono, time and serde.
 duration-str = { version = "0.21", default-features = false }
 flybuffer.workspace = true
-flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "34e8e6e798fa35b4daa3d4c5586241e95d2dbacf" }
+flycomp = { path = "vendor/flycomp" }
 flycontent.workspace = true
 itertools.workspace = true
+# Time zones from the system tzdb (also Android's concatenated tzdata);
+# replaces the unmaintained chrono.
+jiff = "1.0"
 libc = "0.2"
 log.workspace = true
 lscolors.workspace = true
@@ -106,8 +108,6 @@ overflow-checks = true
 lto = true
 codegen-units = 1
 
-[build-dependencies]
-chrono = "0.4"
 
 # cross-rs configurations
 [package.metadata.cross.target.aarch64-linux-android]

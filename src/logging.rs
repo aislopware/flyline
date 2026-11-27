@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use chrono::Local;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -61,7 +60,7 @@ impl Log for MemoryLogger {
             return;
         }
 
-        let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%.6f").to_string();
+        let timestamp = log_timestamp(&jiff::ZonedDateTime::now().datetime());
         let file = record.file().unwrap_or("?");
         let line = record
             .line()
@@ -239,6 +238,11 @@ pub fn stream_logs(dest: &str) -> Result<()> {
     Ok(())
 }
 
+/// The local wall-clock time at the start of every log entry, with microseconds.
+fn log_timestamp(dt: &jiff::civil::DateTime) -> String {
+    dt.strftime("%Y-%m-%dT%H:%M:%S%.6f").to_string()
+}
+
 /// Retrieve all in-memory logs, optionally filtered to the last duration (e.g. "5s", "10m").
 pub fn get_filtered_logs(last_str: Option<&str>) -> Result<Vec<String>> {
     let logger = LOGGER
@@ -249,22 +253,21 @@ pub fn get_filtered_logs(last_str: Option<&str>) -> Result<Vec<String>> {
     if let Some(last_str) = last_str {
         let std_dur =
             duration_str::parse(last_str).map_err(|e| anyhow!("Invalid duration: {}", e))?;
-        let chrono_dur =
-            chrono::Duration::from_std(std_dur).map_err(|e| anyhow!("Duration overflow: {}", e))?;
-
-        let now = chrono::Local::now().naive_local();
-        let cutoff = now - chrono_dur;
+        let since = jiff::SignedDuration::try_from(std_dur)
+            .map_err(|e| anyhow!("Duration overflow: {}", e))?;
+        let cutoff = jiff::ZonedDateTime::now()
+            .datetime()
+            .checked_sub(since)
+            .map_err(|e| anyhow!("Duration overflow: {}", e))?;
 
         let filtered: Vec<String> = entries
             .into_iter()
             .filter(|entry| {
-                if let Some(first_word) = entry.split_whitespace().next()
-                    && let Ok(dt) =
-                        chrono::NaiveDateTime::parse_from_str(first_word, "%Y-%m-%dT%H:%M:%S%.6f")
-                {
-                    return dt >= cutoff;
-                }
-                false
+                entry
+                    .split_whitespace()
+                    .next()
+                    .and_then(|first_word| first_word.parse::<jiff::civil::DateTime>().ok())
+                    .is_some_and(|dt| dt >= cutoff)
             })
             .collect();
         Ok(filtered)
@@ -282,17 +285,17 @@ mod tests {
         let _ = init();
         log_raw_entry(format!(
             "{} [INFO] (pid=123) src/logging.rs:99: Test entry",
-            Local::now().format("%Y-%m-%dT%H:%M:%S%.6f")
+            log_timestamp(&jiff::ZonedDateTime::now().datetime())
         ));
 
         let logs = get_filtered_logs(Some("5s")).unwrap();
         assert!(!logs.is_empty());
         assert!(logs.iter().any(|l| l.contains("Test entry")));
 
-        let old_time = Local::now() - chrono::Duration::seconds(10);
+        let old_time = jiff::ZonedDateTime::now().datetime() - jiff::SignedDuration::from_secs(10);
         log_raw_entry(format!(
             "{} [INFO] (pid=123) src/logging.rs:99: Old entry",
-            old_time.format("%Y-%m-%dT%H:%M:%S%.6f")
+            log_timestamp(&old_time)
         ));
 
         let filtered_logs = get_filtered_logs(Some("5s")).unwrap();

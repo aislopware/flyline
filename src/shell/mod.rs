@@ -228,8 +228,8 @@ pub trait ShellBackend: Sync {
             std::fs::create_dir_all(parent)?;
         }
         if write_path.exists() {
-            let now = chrono::Local::now();
-            let datetime_str = now.format("%Y%m%d_%H%M%S").to_string();
+            let now = jiff::ZonedDateTime::now();
+            let datetime_str = now.strftime("%Y%m%d_%H%M%S").to_string();
             let file_name = write_path
                 .file_name()
                 .and_then(|f| f.to_str())

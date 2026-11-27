@@ -89,6 +89,7 @@ jobs:
             .
             vendor/ratatui
             vendor/termina
+            vendor/flycomp
 
       - uses: taiki-e/install-action@v2
         with:
@@ -98,13 +99,14 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo nextest run --workspace --lib --locked
 
-      - name: Vendored ratatui and termina tests
+      - name: Vendored ratatui, termina and flycomp tests
         # vendor/ratatui pins `stable`; build with the same pinned toolchain.
         env:
           RUSTUP_TOOLCHAIN: "1.100.0"
         run: |
           (cd vendor/ratatui && cargo nextest run -p ratatui-core -p ratatui-termina --lib --locked)
           (cd vendor/termina && cargo nextest run --lib --locked)
+          (cd vendor/flycomp && cargo nextest run --lib --locked)
 
   msrv:
     name: Check MSRV (1.91)

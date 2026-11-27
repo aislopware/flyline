@@ -4,13 +4,7 @@
 
 [advisories]
 yanked = "deny"
-ignore = [
-    # chrono is unmaintained (no fix exists). flyline's prompt `\D{format}`
-    # strings and `flyline` time formatting are chrono strftime by contract,
-    # and flycomp (build script) uses it too, so swapping to jiff or time is
-    # its own change. Not a vulnerability.
-    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration tracked separately" },
-]
+ignore = []
 
 [licenses]
 # Exactly the licences the dependency tree needs; cargo-deny warns when one
@@ -39,9 +33,6 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# flycomp is HalFrgrd's own crate with no crates.io release. The ratatui,
-# termina and skim forks are vendored under vendor/. Nothing else may come
-# from git.
-allow-git = [
-    "https://github.com/HalFrgrd/flycomp.git",
-]
+# The ratatui, termina, skim and flycomp forks are vendored under vendor/.
+# Nothing may come from git.
+allow-git = []

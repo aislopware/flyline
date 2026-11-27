@@ -113,7 +113,7 @@ enum PromptSegment {
     /// A fully-resolved span (text + style) with no further substitution needed.
     Static(Span<'static>),
     /// A bash time escape sequence (`\t`, `\T`, `\@`, `\A`, `\D{…}`).
-    /// Rendered by formatting the current time with the stored chrono
+    /// Rendered by formatting the current time with the stored strftime
     /// format string and applying the span's style.
     DynamicTime {
         strftime: String,
@@ -201,7 +201,7 @@ pub struct PromptManager {
     /// Time captured at construction; used when animations are disabled so
     /// that time-based prompt fields show the session-start time rather than
     /// updating on every render.
-    construction_time: chrono::DateTime<chrono::Local>,
+    construction_time: jiff::ZonedDateTime,
     /// The current working directory at the time the prompt was constructed.
     /// Used by `PromptCwdEdit` mode to compute the path for a given CWD segment index.
     cwd: String,
@@ -286,7 +286,7 @@ pub(crate) fn osc_title(decoded: &str) -> Option<String> {
 }
 
 /// Builds expanded prompt segment lines from raw bash prompt strings while
-/// accumulating a shared map of time-placeholder identifiers to chrono format
+/// accumulating a shared map of time-placeholder identifiers to strftime format
 /// strings and holding pre-processed animation data.
 ///
 /// A single `PromptStringBuilder` should be used for all prompt variables
@@ -295,7 +295,7 @@ pub(crate) fn osc_title(decoded: &str) -> Option<String> {
 struct PromptStringBuilder<'a> {
     /// Monotonically increasing counter used to generate unique placeholder IDs.
     counter: u32,
-    /// Accumulated map of placeholder → chrono format string.
+    /// Accumulated map of placeholder → strftime format string.
     /// Used during `expand_prompt_string` to recognise which spans contain
     /// time placeholders and convert them into [`PromptSegment::DynamicTime`].
     time_map: HashMap<String, String>,
@@ -356,13 +356,13 @@ impl<'a> PromptStringBuilder<'a> {
     /// Recognised bash time escape sequences (see
     /// <https://www.gnu.org/software/bash/manual/html_node/Controlling-the-Prompt.html>):
     ///
-    /// | Sequence     | Meaning                        | Chrono format |
+    /// | Sequence     | Meaning                        | strftime      |
     /// |--------------|--------------------------------|---------------|
     /// | `\t`         | 24-hour HH:MM:SS               | `%H:%M:%S`    |
     /// | `\T`         | 12-hour HH:MM:SS               | `%I:%M:%S`    |
     /// | `\@`         | 12-hour am/pm                  | `%I:%M %p`    |
     /// | `\A`         | 24-hour HH:MM                  | `%H:%M`       |
-    /// | `\D{format}` | chrono format string (custom)  | `format`      |
+    /// | `\D{format}` | strftime format (custom)  | `format`      |
     fn extract_time_codes(&mut self, s: &str) -> String {
         let mut result = String::with_capacity(s.len());
         let mut chars = s.chars().peekable();
@@ -418,15 +418,15 @@ impl<'a> PromptStringBuilder<'a> {
                         }
                         // An empty \D{} falls back to 24-hour HH:MM:SS (%T).
                         // Bash would use strftime with the locale's time format here,
-                        // but chrono does not expose a locale-aware equivalent, so %T
-                        // is used as a reasonable default.
-                        let chrono_fmt = if fmt.is_empty() {
+                        // but jiff has no locale support, so %T is used as a
+                        // reasonable default.
+                        let time_fmt = if fmt.is_empty() {
                             "%T".to_string()
                         } else {
                             fmt
                         };
                         let id = self.next_id();
-                        self.time_map.insert(id.clone(), chrono_fmt);
+                        self.time_map.insert(id.clone(), time_fmt);
                         result.push_str(&id);
                     } else {
                         // Not \D{...} — pass through unchanged.
@@ -1113,7 +1113,7 @@ pub(crate) struct Ps2Context {
 /// that this function can take an immutable slice.
 fn format_prompt_line(
     segments: &[PromptSegment],
-    now: &chrono::DateTime<chrono::Local>,
+    now: &jiff::ZonedDateTime,
     mouse_enabled: bool,
     leader_active: bool,
     ps2_ctx: Option<Ps2Context>,
@@ -1148,7 +1148,7 @@ fn format_prompt_line(
                 }
                 PromptSegment::DynamicTime { strftime, style } => {
                     vec![TaggedSpan::new(
-                        Span::styled(now.format(strftime).to_string(), *style),
+                        Span::styled(crate::strftime::format(strftime, now), *style),
                         Tag::PromptDynamicTime,
                     )]
                 }
@@ -1226,7 +1226,7 @@ fn format_prompt_line(
 /// wrapping around.
 fn get_frame_spans<'a>(
     anim: &'a ProcessedAnimation,
-    now: &chrono::DateTime<chrono::Local>,
+    now: &jiff::ZonedDateTime,
 ) -> &'a [Span<'static>] {
     if anim.frames.is_empty() {
         return &[];
@@ -1234,7 +1234,7 @@ fn get_frame_spans<'a>(
     if anim.fps <= 0.0 {
         return &anim.frames[0];
     }
-    let ms = now.timestamp_millis();
+    let ms = now.timestamp().as_millisecond();
     let frame_duration_ms = (1000.0 / anim.fps) as i64;
     let tick = if frame_duration_ms > 0 {
         (ms / frame_duration_ms) as usize
@@ -1411,7 +1411,7 @@ impl PromptManager {
                 fill_span_final: None,
                 prompt_ruler: PromptRuler::None,
                 prompt_ruler_final: None,
-                construction_time: chrono::Local::now(),
+                construction_time: jiff::ZonedDateTime::now(),
                 cwd: String::new(),
                 title: None,
             }
@@ -1581,7 +1581,7 @@ impl PromptManager {
                 fill_span_final,
                 prompt_ruler,
                 prompt_ruler_final,
-                construction_time: chrono::Local::now(),
+                construction_time: jiff::ZonedDateTime::now(),
                 cwd,
                 title,
             }
@@ -1605,11 +1605,10 @@ impl PromptManager {
         TaggedLine<'static>,
         Option<FormattedPromptRuler>,
     ) {
-        use chrono::Local;
         let now = if show_animations {
-            Local::now()
+            jiff::ZonedDateTime::now()
         } else {
-            self.construction_time
+            self.construction_time.clone()
         };
 
         let prompt_src = if is_running {
@@ -1709,9 +1708,9 @@ impl PromptManager {
         show_animations: bool,
     ) -> Vec<TaggedSpan<'static>> {
         let now = if show_animations {
-            chrono::Local::now()
+            jiff::ZonedDateTime::now()
         } else {
-            self.construction_time
+            self.construction_time.clone()
         };
         let ctx = Ps2Context {
             line_num,
@@ -1791,10 +1790,10 @@ mod tests {
         assert_eq!(builder.title, None);
     }
     use crate::settings::PromptWidgetCustom;
-    use chrono::TimeZone;
-
-    fn fixed_time(ms: i64) -> chrono::DateTime<chrono::Local> {
-        chrono::Local.timestamp_millis_opt(ms).unwrap()
+    fn fixed_time(ms: i64) -> jiff::ZonedDateTime {
+        jiff::Timestamp::from_millisecond(ms)
+            .unwrap()
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
     }
 
     /// Build a `ProcessedAnimation` where each frame is a single span,
@@ -2042,7 +2041,7 @@ mod tests {
         // HH:MM:SS value is timezone-dependent, so we compute the expected value
         // with the same `now` and format string rather than hard-coding a literal.
         let now = fixed_time(0);
-        let formatted_time = now.format("%H:%M:%S").to_string();
+        let formatted_time = now.strftime("%H:%M:%S").to_string();
 
         let segments = vec![
             PromptSegment::Static(Span::raw("[")),
@@ -2535,7 +2534,7 @@ mod tests {
             fill_span_final: None,
             prompt_ruler: PromptRuler::None,
             prompt_ruler_final: None,
-            construction_time: chrono::Local::now(),
+            construction_time: jiff::ZonedDateTime::now(),
             cwd: cwd.to_string(),
             title: None,
         }
@@ -2553,7 +2552,7 @@ mod tests {
             fill_span_final: None,
             prompt_ruler: PromptRuler::None,
             prompt_ruler_final: None,
-            construction_time: chrono::Local::now(),
+            construction_time: jiff::ZonedDateTime::now(),
             cwd: String::new(),
             title: None,
         };
@@ -3081,7 +3080,7 @@ mod tests {
             fill_span_final: None,
             prompt_ruler: PromptRuler::EmptyLine,
             prompt_ruler_final: None,
-            construction_time: chrono::Local::now(),
+            construction_time: jiff::ZonedDateTime::now(),
             cwd: String::new(),
             title: None,
         };
@@ -3102,7 +3101,7 @@ mod tests {
             fill_span_final: None,
             prompt_ruler: PromptRuler::Pattern(vec![PromptSegment::Static(Span::raw("─"))]),
             prompt_ruler_final: None,
-            construction_time: chrono::Local::now(),
+            construction_time: jiff::ZonedDateTime::now(),
             cwd: String::new(),
             title: None,
         };
@@ -3129,7 +3128,7 @@ mod tests {
             fill_span_final: None,
             prompt_ruler: PromptRuler::Pattern(vec![PromptSegment::Static(Span::raw("─"))]),
             prompt_ruler_final: Some(PromptRuler::EmptyLine),
-            construction_time: chrono::Local::now(),
+            construction_time: jiff::ZonedDateTime::now(),
             cwd: String::new(),
             title: None,
         };
