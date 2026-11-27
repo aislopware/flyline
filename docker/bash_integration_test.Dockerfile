@@ -13,7 +13,9 @@ RUN /bin/bash --version
 COPY --from=built-artifact /libflyline.so /
 COPY tests/focus_report_handoff.py /
 COPY tests/resize_no_delete_line.py /
+COPY tests/idle_redraw_bytes.py /
 
 RUN script -q -c "/bin/bash -i -c \"flyline --version && echo 'SUCCESS: Test completed'\"" /dev/null
 RUN python3 /focus_report_handoff.py --bash /bin/bash --flyline /libflyline.so
 RUN python3 /resize_no_delete_line.py --bash /bin/bash --flyline /libflyline.so
+RUN python3 /idle_redraw_bytes.py --bash /bin/bash --flyline /libflyline.so

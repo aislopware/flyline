@@ -40,7 +40,7 @@ struct TrailingState {
 }
 
 /// Modifiers that are visually apparent on a blank (space) cell.
-const VISIBLE_ON_BLANK: Modifier = Modifier::REVERSED
+pub(crate) const VISIBLE_ON_BLANK: Modifier = Modifier::REVERSED
     .union(Modifier::ALL_UNDERLINES)
     .union(Modifier::SLOW_BLINK)
     .union(Modifier::RAPID_BLINK)
