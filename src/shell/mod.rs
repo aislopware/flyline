@@ -289,6 +289,12 @@ pub trait ShellBackend: Sync {
         false
     }
 
+    /// True if the shell has `shopt -s dotglob` enabled.
+    fn is_dotglob_enabled(&self) -> bool {
+        self.env_var("BASHOPTS")
+            .is_some_and(|opts| opts.split(':').any(|opt| opt == "dotglob"))
+    }
+
     /// Called when the line editor UI enters and prepares terminal mode.
     fn prep_terminal(&self) {}
 

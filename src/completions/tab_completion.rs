@@ -2862,5 +2862,53 @@ mod tab_completion_tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        #[test]
+        fn dotglob_includes_dotfiles_in_filename_and_glob_completion() {
+            let dir = std::env::temp_dir().join(format!(
+                "flyline_dotglob_test_{}",
+                rand::random::<u32>()
+            ));
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join(".bashrc"), "").unwrap();
+            std::fs::write(dir.join("visible.txt"), "").unwrap();
+            std::fs::write(dir.join("sub/.secret"), "").unwrap();
+            std::fs::write(dir.join("sub/public.txt"), "").unwrap();
+            std::env::set_current_dir(&dir).unwrap();
+
+            // Default (dotglob off): hidden files are skipped unless prefix starts with `.`.
+            let _ = shell::backend().unset_env_var("BASHOPTS");
+            let off_ls: Vec<String> = run_completion("ls ").into_iter().map(|s| s.s).collect();
+            assert!(!off_ls.contains(&".bashrc".to_string()), "got {:?}", off_ls);
+            assert!(off_ls.contains(&"visible.txt".to_string()));
+
+            let off_sub: Vec<String> = run_completion("ls sub/").into_iter().map(|s| s.s).collect();
+            assert!(!off_sub.contains(&".secret".to_string()), "got {:?}", off_sub);
+            assert!(off_sub.contains(&"public.txt".to_string()));
+
+            // With `shopt -s dotglob`: hidden files are included (`.` and `..` remain excluded).
+            shell::backend()
+                .export_env_var("BASHOPTS", "checkwinsize:dotglob:force_fignore")
+                .unwrap();
+
+            let on_ls: Vec<String> = run_completion("ls ").into_iter().map(|s| s.s).collect();
+            assert!(on_ls.contains(&".bashrc".to_string()), "got {:?}", on_ls);
+            assert!(on_ls.contains(&"visible.txt".to_string()));
+            assert!(!on_ls.contains(&".".to_string()));
+            assert!(!on_ls.contains(&"..".to_string()));
+
+            let on_sub: Vec<String> = run_completion("ls sub/").into_iter().map(|s| s.s).collect();
+            assert!(on_sub.contains(&".secret".to_string()), "got {:?}", on_sub);
+            assert!(on_sub.contains(&"public.txt".to_string()));
+
+            let on_glob: Vec<String> = run_auto_start_completion("ls *")
+                .into_iter()
+                .map(|s| s.s)
+                .collect();
+            assert!(on_glob.contains(&".bashrc".to_string()), "got {:?}", on_glob);
+
+            let _ = shell::backend().unset_env_var("BASHOPTS");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
