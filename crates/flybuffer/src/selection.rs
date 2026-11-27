@@ -21,14 +21,9 @@ impl TextBuffer {
         self.selection_byte
     }
 
-    /// Set the selection anchor byte position (bounded to UTF-8 character boundary).
+    /// Set the selection anchor byte position (bounded to a grapheme boundary).
     pub fn set_selection_anchor(&mut self, pos: usize) {
-        let clamped = pos.min(self.buf.len());
-        let mut valid_pos = clamped;
-        while valid_pos > 0 && !self.buf.is_char_boundary(valid_pos) {
-            valid_pos -= 1;
-        }
-        self.selection_byte = Some(valid_pos);
+        self.selection_byte = Some(Self::snap_to_grapheme_boundary_left(&self.buf, pos));
     }
 
     /// Returns the byte range of the current selection, sorted so that
@@ -51,12 +46,14 @@ impl TextBuffer {
     }
 
     pub fn set_selection_range(&mut self, range: std::ops::Range<usize>, cursor_is_left: bool) {
+        let start = Self::snap_to_grapheme_boundary_left(&self.buf, range.start);
+        let end = Self::snap_to_grapheme_boundary_left(&self.buf, range.end);
         if cursor_is_left {
-            self.selection_byte = Some(range.end);
-            self.cursor_byte = range.start;
+            self.selection_byte = Some(end);
+            self.cursor_byte = start;
         } else {
-            self.selection_byte = Some(range.start);
-            self.cursor_byte = range.end;
+            self.selection_byte = Some(start);
+            self.cursor_byte = end;
         }
     }
 
@@ -77,7 +74,7 @@ impl TextBuffer {
         };
         self.push_snapshot(false);
         self.buf.drain(range.clone());
-        self.cursor_byte = range.start;
+        self.cursor_byte = Self::snap_to_grapheme_boundary_left(&self.buf, range.start);
         self.selection_byte = None;
         true
     }
@@ -95,8 +92,12 @@ impl TextBuffer {
         // Insert the closing char first so that `range.start` stays valid.
         self.buf.insert(range.end, close);
         self.buf.insert(range.start, open);
-        self.cursor_byte = range.end + open.len_utf8();
-        self.selection_byte = Some(range.start + open.len_utf8());
+        self.cursor_byte =
+            Self::snap_to_grapheme_boundary_right(&self.buf, range.end + open.len_utf8());
+        self.selection_byte = Some(Self::snap_to_grapheme_boundary_right(
+            &self.buf,
+            range.start + open.len_utf8(),
+        ));
         true
     }
 
@@ -114,19 +115,27 @@ impl TextBuffer {
     }
 
     pub fn select_line_using_mouse(&mut self) -> std::ops::Range<usize> {
+        use unicode_segmentation::UnicodeSegmentation;
+
         let line_start = self
             .buf
-            .char_indices()
+            .grapheme_indices(true)
             .rev()
             .skip_while(|(i, _)| *i >= self.cursor_byte)
-            .find_map(|(i, c)| if c == '\n' { Some(i + 1) } else { None })
+            .find_map(|(i, g)| {
+                if g.contains('\n') {
+                    Some(i + g.len())
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0);
 
         let line_end = self
             .buf
-            .char_indices()
+            .grapheme_indices(true)
             .skip_while(|(i, _)| *i < self.cursor_byte)
-            .find_map(|(i, c)| if c == '\n' { Some(i) } else { None })
+            .find_map(|(i, g)| if g.contains('\n') { Some(i) } else { None })
             .unwrap_or(self.buf.len());
 
         self.selection_byte = Some(line_start);

@@ -2,6 +2,8 @@ mod accessors;
 mod editing_advanced;
 mod editing_primitives;
 mod movement;
+#[cfg(test)]
+mod proptests;
 mod selection;
 mod substring;
 mod undo_redo;
@@ -65,6 +67,30 @@ impl TextBuffer {
             selection_byte: None,
             undo_redo: SnapshotManager::new(),
         }
+    }
+
+    /// Return the largest extended-grapheme boundary `<= byte_pos.min(s.len())`.
+    pub(crate) fn snap_to_grapheme_boundary_left(s: &str, byte_pos: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let clamped = byte_pos.min(s.len());
+        if clamped == s.len() {
+            return clamped;
+        }
+        s.grapheme_indices(true)
+            .take_while(|(i, _)| *i <= clamped)
+            .last()
+            .map_or(0, |(i, _)| i)
+    }
+
+    /// Return the smallest extended-grapheme boundary `>= byte_pos.min(s.len())`.
+    pub(crate) fn snap_to_grapheme_boundary_right(s: &str, byte_pos: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let clamped = byte_pos.min(s.len());
+        s.grapheme_indices(true)
+            .find(|(i, _)| *i >= clamped)
+            .map_or(s.len(), |(i, _)| i)
     }
 }
 
