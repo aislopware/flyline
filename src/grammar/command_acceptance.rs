@@ -627,6 +627,9 @@ pub(super) mod tests {
         assert!(!will_bash_accept_buffer("! coproc myproc (echo hi"));
     }
 
+    /// A bash new enough to compare against: flyline supports bash 5.1 and later.
+    /// macOS ships bash 3.2 as `/bin/bash`, which has no `coproc` and parses
+    /// several constructs differently, so it is skipped.
     pub(crate) fn find_system_bash() -> Option<String> {
         for candidate in [
             "/opt/homebrew/bin/bash",
@@ -634,13 +637,20 @@ pub(super) mod tests {
             "/bin/bash",
             "bash",
         ] {
-            if std::process::Command::new(candidate)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
+            let major = std::process::Command::new(candidate)
+                .args(["-c", "echo ${BASH_VERSINFO[0]}"])
+                .env("HISTFILE", "/dev/null")
                 .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-            {
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                });
+            if major.is_some_and(|major| major >= 5) {
                 return Some(candidate.to_string());
             }
         }

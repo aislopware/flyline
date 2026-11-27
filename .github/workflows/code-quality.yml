@@ -95,6 +95,14 @@ jobs:
         with:
           tool: cargo-nextest@0.9.150
 
+      - name: Install bash 5 for the bash -n differential tests
+        # /bin/bash on macOS is 3.2; the tests skip a bash older than 5.
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install bash
+
       - name: flyline lib tests
         if: runner.os == 'macOS'
         run: cargo nextest run --workspace --lib --locked
