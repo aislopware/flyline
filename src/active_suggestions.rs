@@ -2945,6 +2945,11 @@ impl ActiveSuggestions {
         self.formatted_cache = vec![None; self.filtered_suggestions.len()];
     }
 
+    /// Forget the styled rows so they are rebuilt with the current palette.
+    pub fn invalidate_formatting(&mut self) {
+        self.formatted_cache = vec![None; self.filtered_suggestions.len()];
+    }
+
     #[allow(dead_code)]
     pub fn max_filtered_width(&self) -> usize {
         self.filtered_suggestions

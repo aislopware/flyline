@@ -149,6 +149,19 @@ fn drain_shutdown_events(timeout: Duration) {
     }
 }
 
+/// Ask the terminal for focus reports and, with DEC mode 2031, for a report when it
+/// switches between dark and light (`CSI ? 997 ; 1|2 n`: macOS appearance, a theme
+/// toggle), so the palette follows without restarting the shell. Terminals without
+/// these modes ignore them. [`restore_terminal`] turns both off again.
+fn enable_terminal_reports() {
+    let set_mode = |code| Csi::Mode(DecMode::SetDecPrivateMode(DecPrivateMode::Code(code)));
+    let _ = crate::flush_stdout!(
+        "{}{}",
+        set_mode(DecPrivateModeCode::FocusTracking),
+        set_mode(DecPrivateModeCode::Theme)
+    );
+}
+
 fn configure_terminal(extended_key_codes: bool, mouse_mode: &crate::settings::MouseMode) {
     let set_mode = |code| Csi::Mode(DecMode::SetDecPrivateMode(DecPrivateMode::Code(code)));
 
@@ -398,6 +411,8 @@ pub(crate) struct App<'a> {
     pub(super) leader_key_active_at: Option<std::time::Instant>,
     pub(super) app_start_time: std::time::Instant,
     pub(super) has_run_delayed_startup: Option<std::time::Instant>,
+    /// When a theme report made flyline ask for the terminal colours (OSC 10/11).
+    color_query_sent_at: Option<std::time::Instant>,
     pub(super) last_resize_time: Option<std::time::Instant>,
     pub(super) path_warming_subshell: Option<SubshellHandle<shell::PathScanPayload>>,
     pub(super) git_warming_subshell: Option<SubshellHandle<Option<crate::git::GitRepoPayload>>>,
@@ -549,6 +564,7 @@ impl<'a> App<'a> {
             leader_key_active_at: None,
             app_start_time: std::time::Instant::now(),
             has_run_delayed_startup: None,
+            color_query_sent_at: None,
             last_resize_time: None,
             path_warming_subshell,
             git_warming_subshell,
@@ -839,6 +855,7 @@ impl<'a> App<'a> {
             }
 
             if self.handle_delayed_startup() {
+                self.on_palette_changed();
                 redraw = true;
             }
 
@@ -1182,6 +1199,7 @@ impl<'a> App<'a> {
                             // OSC 10/11 replies, which the arm below applies.
                             log::debug!("Terminal theme changed to {:?}", mode);
                             crate::term_info::request_terminal_colors();
+                            self.color_query_sent_at = Some(std::time::Instant::now());
                             false
                         }
                         TerminaEvent::Osc(termina::escape::osc::Osc::ChangeDynamicColors(
@@ -1201,10 +1219,14 @@ impl<'a> App<'a> {
                                     _ => {}
                                 }
                                 crate::term_info::update_terminal_colors(tc);
-                                crate::settings().apply_detected_terminal_colors(
+                                let changed = crate::settings().apply_detected_terminal_colors(
                                     tc,
                                     crate::term_info::detect_theme_from_colorfgbg(),
-                                )
+                                );
+                                if changed {
+                                    self.on_palette_changed();
+                                }
+                                changed
                             } else {
                                 false
                             }
@@ -1256,7 +1278,13 @@ impl<'a> App<'a> {
         let had_recent_started_focus_tracking = self
             .has_run_delayed_startup
             .is_some_and(|t| t.elapsed() < Duration::from_millis(100));
-        let should_drain = had_recent_mouse || had_recent_started_focus_tracking;
+        // A theme switch just before Enter: the OSC 10/11 replies may still be on
+        // their way, and must not reach the command's input.
+        let had_recent_color_query = self
+            .color_query_sent_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1));
+        let should_drain =
+            had_recent_mouse || had_recent_started_focus_tracking || had_recent_color_query;
 
         let exit_state = match self.mode {
             AppRunningState::Exiting(ExitState::WithCommand(cmd)) => {
@@ -1291,7 +1319,13 @@ impl<'a> App<'a> {
         // Stop terminal-generated events and consume trailing reports before self is dropped and releases raw mode.
         restore_terminal(&mut std::io::stdout());
         if should_drain {
-            drain_shutdown_events(Duration::from_millis(150));
+            let timeout = if had_recent_color_query {
+                // Covers the reply's round trip over a slow ssh link.
+                Duration::from_millis(400)
+            } else {
+                Duration::from_millis(150)
+            };
+            drain_shutdown_events(timeout);
         }
 
         exit_state
@@ -1340,6 +1374,10 @@ impl<'a> App<'a> {
         );
         if mouse_enabled {
             mouse_state(|m| m.enable());
+        }
+        if self.has_run_delayed_startup.is_some() {
+            // restore_terminal() turned these off; delayed startup turned them on.
+            enable_terminal_reports();
         }
 
         self.sync_viewport_top_from_cpr();
@@ -2030,15 +2068,7 @@ impl<'a> App<'a> {
                 log::warn!("[Startup] CPR returned None for viewport_top");
             }
 
-            let set_mode = |code| Csi::Mode(DecMode::SetDecPrivateMode(DecPrivateMode::Code(code)));
-            // Mode 2031: the terminal reports `CSI ? 997 ; 1|2 n` when it switches between
-            // dark and light (macOS appearance, a theme toggle), so the palette can follow
-            // without restarting the shell. Terminals without it ignore the mode.
-            let _ = crate::flush_stdout!(
-                "{}{}",
-                set_mode(DecPrivateModeCode::FocusTracking),
-                set_mode(DecPrivateModeCode::Theme)
-            );
+            enable_terminal_reports();
         });
         colors_changed
     }
@@ -2232,6 +2262,50 @@ impl<'a> App<'a> {
                 AppRunningState::Exiting(ExitState::WithCommand(self.buffer.buffer().to_string()));
         } else {
             self.buffer.insert_newline();
+        }
+    }
+
+    /// Re-style the command line with the current palette.
+    fn reformat_buffer(&mut self) {
+        self.formatted_buffer_cache = if matches!(
+            self.content_mode,
+            ContentMode::FuzzyHistorySearch(FuzzyHistorySource::AgentPrompts)
+                | ContentMode::AgentError { .. }
+                | ContentMode::AgentOutputSelection { .. }
+                | ContentMode::AgentModeWaiting { .. }
+        ) {
+            format_agent_buffer(
+                &self.dparser_tokens_cache,
+                self.buffer.cursor_byte_pos(),
+                self.buffer.selection_byte(),
+                self.buffer.buffer().len(),
+                &crate::settings().colour_palette,
+                crate::settings().enable_easter_eggs,
+            )
+        } else {
+            format_buffer(
+                &self.dparser_tokens_cache,
+                self.buffer.cursor_byte_pos(),
+                self.buffer.selection_byte(),
+                self.buffer.buffer().len(),
+                self.mode.is_running(),
+                &crate::settings().colour_palette,
+                crate::settings().enable_easter_eggs,
+            )
+        };
+    }
+
+    /// The palette changed (a new terminal background or theme): drop every style
+    /// that was baked from the old one.
+    fn on_palette_changed(&mut self) {
+        self.reformat_buffer();
+        match &mut self.content_mode {
+            ContentMode::TabCompletion(active)
+            | ContentMode::TabCompletionWaiting {
+                last_active_suggestions: Some(active),
+                ..
+            } => active.invalidate_formatting(),
+            _ => {}
         }
     }
 
@@ -2612,32 +2686,7 @@ impl<'a> App<'a> {
             })
         })();
 
-        self.formatted_buffer_cache = if matches!(
-            self.content_mode,
-            ContentMode::FuzzyHistorySearch(FuzzyHistorySource::AgentPrompts)
-                | ContentMode::AgentError { .. }
-                | ContentMode::AgentOutputSelection { .. }
-                | ContentMode::AgentModeWaiting { .. }
-        ) {
-            format_agent_buffer(
-                &self.dparser_tokens_cache,
-                self.buffer.cursor_byte_pos(),
-                self.buffer.selection_byte(),
-                self.buffer.buffer().len(),
-                &crate::settings().colour_palette,
-                crate::settings().enable_easter_eggs,
-            )
-        } else {
-            format_buffer(
-                &self.dparser_tokens_cache,
-                self.buffer.cursor_byte_pos(),
-                self.buffer.selection_byte(),
-                self.buffer.buffer().len(),
-                self.mode.is_running(),
-                &crate::settings().colour_palette,
-                crate::settings().enable_easter_eggs,
-            )
-        };
+        self.reformat_buffer();
 
         let cursor_byte_pos = self.buffer.cursor_byte_pos();
         self.tooltip = self

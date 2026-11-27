@@ -14,6 +14,7 @@ import fcntl
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shlex
 import signal
@@ -31,6 +32,8 @@ THEME_MODE_ON = b"\x1b[?2031h"
 THEME_MODE_OFF = b"\x1b[?2031l"
 LIGHT_THEME_REPORT = b"\x1b[?997;2n"
 BACKGROUND_QUERY = b"\x1b]11;?"
+LIGHT_COLOURS = b"\x1b]10;rgb:0000/0000/0000\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x1b\\"
+SGR = re.compile(rb"\x1b\[[0-9;:]*m")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -58,6 +61,15 @@ def pump(terminal_fd: int, output: bytearray, seconds: float) -> None:
             os.write(terminal_fd, CURSOR_POSITION_RESPONSE)
         if any(query in data for query in DEVICE_ATTRIBUTES_QUERIES):
             os.write(terminal_fd, DEVICE_ATTRIBUTES_RESPONSE)
+
+
+def style_before_command_word(output: bytes) -> bytes | None:
+    """The last SGR sequence written before the last `echo` drawn."""
+    end = output.rfind(b"echo")
+    if end < 0:
+        return None
+    styles = SGR.findall(output, 0, end)
+    return styles[-1] if styles else b""
 
 
 def main() -> int:
@@ -95,6 +107,12 @@ def main() -> int:
                 print("FAIL: flyline never enabled theme reports (mode 2031)", file=sys.stderr)
                 return 1
 
+            for character in "echo hi":
+                os.write(terminal_fd, character.encode())
+                pump(terminal_fd, output, 0.05)
+            pump(terminal_fd, output, 0.5)
+            dark_style = style_before_command_word(bytes(output))
+
             output.clear()
             os.write(terminal_fd, LIGHT_THEME_REPORT)
             pump(terminal_fd, output, 1.0)
@@ -104,14 +122,37 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 1
-            os.write(terminal_fd, b"\x1b]10;rgb:0000/0000/0000\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x1b\\")
-            pump(terminal_fd, output, 0.5)
-
             output.clear()
-            os.write(terminal_fd, b"true\r")
+            os.write(terminal_fd, LIGHT_COLOURS)
             pump(terminal_fd, output, 1.0)
+            light_style = style_before_command_word(bytes(output))
+            if light_style is None or light_style == dark_style:
+                print(
+                    "FAIL: the command line kept its old colours after the theme switch "
+                    f"(before {dark_style!r}, after {light_style!r})",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Clear the line, then switch the theme right before Enter: the colour
+            # replies arrive after the command started and must not become its input.
+            os.write(terminal_fd, b"\x15")
+            pump(terminal_fd, output, 0.3)
+            os.write(terminal_fd, b'read -t 1 -r -N 100 x; echo "GOT[${#x}]"')
+            pump(terminal_fd, output, 0.5)
+            output.clear()
+            os.write(terminal_fd, LIGHT_THEME_REPORT + b"\r")
+            time.sleep(0.05)
+            os.write(terminal_fd, LIGHT_COLOURS)
+            pump(terminal_fd, output, 2.0)
             if THEME_MODE_OFF not in output:
                 print("FAIL: mode 2031 stayed on while a command ran", file=sys.stderr)
+                return 1
+            if b"GOT[0]" not in output:
+                print(
+                    f"FAIL: colour replies leaked into the command's input: {bytes(output)[-300:]!r}",
+                    file=sys.stderr,
+                )
                 return 1
         finally:
             try:
@@ -121,7 +162,9 @@ def main() -> int:
             os.close(terminal_fd)
             os.waitpid(child_pid, 0)
 
-    print("PASS: a theme report re-queries the colours, and mode 2031 is off while commands run")
+    print(
+        "PASS: a theme switch restyles the command line, and its replies never reach a command"
+    )
     return 0
 
 
