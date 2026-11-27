@@ -68,7 +68,6 @@ clap_complete.workspace = true
 dirs = "7.0"
 # Only `parse` is used; the default features pull in chrono, time and serde.
 duration-str = { version = "0.21", default-features = false }
-easing-function.workspace = true
 flybuffer.workspace = true
 flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "34e8e6e798fa35b4daa3d4c5586241e95d2dbacf" }
 flycontent.workspace = true
@@ -83,7 +82,6 @@ nix = { version = "0.32", features = ["fs", "poll", "process", "signal", "user"]
 # that every shell loads, and raises the MSRV to 1.95. Its gain is contended
 # lock throughput, which a line editor does not hit. Move when termina does.
 parking_lot = "0.12"
-parse-style.workspace = true
 pulldown-cmark.workspace = true
 rand.workspace = true
 ratatui.workspace = true

@@ -54,6 +54,55 @@ jobs:
           RUSTDOCFLAGS="-D warnings" \
           cargo doc    --workspace --locked --quiet --no-deps --document-private-items
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-shear@1.14.0
+
+      - name: Check for unused dependencies
+        run: cargo shear
+
+  unit-tests:
+    # Linux runs flyline's lib tests in Docker (ci.yml, glibc floor); this job
+    # adds macOS, where the Homebrew build runs, and the vendored forks' own
+    # tests, which no other job runs.
+    name: Unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: unit-tests
+          workspaces: |
+            .
+            vendor/ratatui
+            vendor/termina
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: flyline lib tests
+        if: runner.os == 'macOS'
+        run: cargo nextest run --workspace --lib --locked
+
+      - name: Vendored ratatui and termina tests
+        run: |
+          (cd vendor/ratatui && cargo nextest run -p ratatui-core -p ratatui-termina --lib --locked)
+          (cd vendor/termina && cargo nextest run --lib --locked)
+
   msrv:
     name: Check MSRV (1.91)
     runs-on: ubuntu-latest
