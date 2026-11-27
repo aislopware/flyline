@@ -161,7 +161,7 @@ fn is_unclosed_block(tokens: &[&Token], open: TokenKind, close: TokenKind) -> bo
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -568,7 +568,12 @@ mod tests {
     }
 
     pub(crate) fn find_system_bash() -> Option<String> {
-        for candidate in ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash", "bash"] {
+        for candidate in [
+            "/opt/homebrew/bin/bash",
+            "/usr/local/bin/bash",
+            "/bin/bash",
+            "bash",
+        ] {
             if std::process::Command::new(candidate)
                 .arg("--version")
                 .stdout(std::process::Stdio::null())

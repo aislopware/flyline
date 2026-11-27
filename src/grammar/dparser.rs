@@ -234,9 +234,7 @@ impl DParser {
                 matches!(
                     innermost_non_lparen,
                     Some(
-                        TokenKind::ArithSubst
-                            | TokenKind::ArithCommand
-                            | TokenKind::DoubleLBracket
+                        TokenKind::ArithSubst | TokenKind::ArithCommand | TokenKind::DoubleLBracket
                     )
                 )
             }
@@ -388,7 +386,10 @@ impl DParser {
             && prev.token.value.ends_with('=')
             && prev.token.byte_range().end == self.tokens[idx].token.byte_range().start
             && let Some(range) = &self.current_command_range
-            && let Some(cmd_word) = self.tokens[*range.start()].annotations.command_word.as_deref()
+            && let Some(cmd_word) = self.tokens[*range.start()]
+                .annotations
+                .command_word
+                .as_deref()
             && matches!(
                 cmd_word,
                 "declare" | "typeset" | "local" | "export" | "readonly"
@@ -582,13 +583,12 @@ impl DParser {
                 | TokenKind::Until
                 | TokenKind::Select => in_plain_word_context,
                 TokenKind::In => !Self::is_in_header_context(&self.tokens, &nestings, idx),
-                TokenKind::Fi | TokenKind::Done | TokenKind::Esac => {
-                    !self.nested_closing_satisfied(
+                TokenKind::Fi | TokenKind::Done | TokenKind::Esac => !self
+                    .nested_closing_satisfied(
                         &self.tokens[idx].token,
                         &nestings,
                         self.current_command_range.is_none(),
-                    )
-                }
+                    ),
                 _ => Self::is_builtin_like_reserved_word(&self.tokens[idx].token.kind),
             };
 
@@ -706,8 +706,7 @@ impl DParser {
 
                     let is_lbracket_command =
                         token.kind == TokenKind::LBracket && self.current_command_range.is_none();
-                    let is_lbrace_command =
-                        token.kind == TokenKind::LBrace && is_compound_cmd_pos;
+                    let is_lbrace_command = token.kind == TokenKind::LBrace && is_compound_cmd_pos;
 
                     if is_lbracket_command || is_lbrace_command {
                         self.tokens[idx].annotations.command_word =
@@ -774,8 +773,7 @@ impl DParser {
                     ) =>
                 {
                     let (opening_idx, _opening_kind) = nestings.pop().unwrap();
-                    let is_scope_isolating_nesting =
-                        nesting_isolates_scope.pop().unwrap_or(false);
+                    let is_scope_isolating_nesting = nesting_isolates_scope.pop().unwrap_or(false);
                     let depth = nestings.len();
                     self.tokens[idx].annotations.closing = Some(ClosingAnnotation {
                         opening_idx,
@@ -1240,7 +1238,8 @@ impl DParser {
                     | TokenKind::ExtGlob(_)
             ) && let Some(opening) = &ann.opening
             {
-                let is_word_like = !matches!(kind, TokenKind::ArithCommand | TokenKind::DoubleLBracket);
+                let is_word_like =
+                    !matches!(kind, TokenKind::ArithCommand | TokenKind::DoubleLBracket);
                 prev_state = if is_word_like || prev_state != PrevState::RedirNeedsTarget {
                     PrevState::Normal
                 } else {
@@ -1315,7 +1314,8 @@ impl DParser {
                 kind,
                 TokenKind::Pipe | TokenKind::PipeAnd | TokenKind::Or | TokenKind::And
             );
-            let is_control_terminator = matches!(kind, TokenKind::Semicolon | TokenKind::Background);
+            let is_control_terminator =
+                matches!(kind, TokenKind::Semicolon | TokenKind::Background);
             let is_case_terminator = matches!(
                 kind,
                 TokenKind::DoubleSemicolon | TokenKind::SemiAnd | TokenKind::DoubleSemiAnd

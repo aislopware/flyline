@@ -26,10 +26,10 @@ impl QuoteType {
     }
 }
 
-pub const DOUBLE_QUOTE_SPECIAL_CHARS: &[char] = &['$', '`', '"', '\\', '!', '\n'];
+pub const DOUBLE_QUOTE_SPECIAL_CHARS: &[char] = &['$', '`', '"', '\\'];
 pub const BACKSLASH_SPECIAL_CHARS: &[char] = &[
-    ' ', '\t', '\n', '\\', '"', '\'', '!', '$', '&', '(', ')', '*', ';', '<', '>', '?', '[', ']',
-    '^', '`', '{', '|', '}',
+    ' ', '\t', '\\', '"', '\'', '!', '$', '&', '(', ')', '*', ';', '<', '>', '?', '[', ']', '^',
+    '`', '{', '|', '}', '#', '~',
 ];
 
 /* Quote a filename using double quotes, single quotes, or backslashes
@@ -58,16 +58,23 @@ pub fn quoting_function_rust(
             quoted
         }
         QuoteType::DoubleQuote => {
-            let escaped: String = s
-                .chars()
-                .map(|c| {
-                    if DOUBLE_QUOTE_SPECIAL_CHARS.contains(&c) {
-                        format!("\\{}", c)
-                    } else {
-                        c.to_string()
-                    }
-                })
-                .collect();
+            let mut escaped = String::with_capacity(s.len());
+            for c in s.chars() {
+                if DOUBLE_QUOTE_SPECIAL_CHARS.contains(&c) {
+                    escaped.push('\\');
+                    escaped.push(c);
+                } else if c == '!' {
+                    // In Bash, `"\!"` retains the literal backslash under `set +H`,
+                    // while unescaped `"!"` triggers history expansion under `set -H`.
+                    // Closing the double quote, backslash-escaping `!`, and reopening
+                    // evaluates to literal `!` under both modes.
+                    escaped.push_str("\"\\!\"");
+                } else {
+                    // Literal newlines inside double quotes stay intact in Bash
+                    // (whereas `\<newline>` would be deleted as a line continuation).
+                    escaped.push(c);
+                }
+            }
 
             let mut quoted = if opening_quote {
                 format!("\"{}", escaped)
@@ -79,16 +86,23 @@ pub fn quoting_function_rust(
             }
             quoted
         }
-        QuoteType::Backslash => s
-            .chars()
-            .map(|c| {
-                if c.is_whitespace() || BACKSLASH_SPECIAL_CHARS.contains(&c) {
-                    format!("\\{}", c)
+        QuoteType::Backslash => {
+            let mut quoted = String::with_capacity(s.len());
+            for c in s.chars() {
+                if c == '\n' {
+                    // `\<newline>` is a Bash line continuation (drops the newline);
+                    // single-quoting the newline preserves it literally, matching
+                    // GNU Bash's `bash_quote_filename`.
+                    quoted.push_str("'\n'");
+                } else if c.is_whitespace() || BACKSLASH_SPECIAL_CHARS.contains(&c) {
+                    quoted.push('\\');
+                    quoted.push(c);
                 } else {
-                    c.to_string()
+                    quoted.push(c);
                 }
-            })
-            .collect(),
+            }
+            quoted
+        }
     }
 }
 
@@ -103,7 +117,9 @@ pub fn dequoting_function_rust(s: &str) -> String {
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
-                if let Some(next_char) = chars.next() {
+                if let Some(next_char) = chars.next()
+                    && next_char != '\n'
+                {
                     res.push(next_char);
                 }
             }
@@ -121,8 +137,16 @@ pub fn dequoting_function_rust(s: &str) -> String {
                         break;
                     }
                     if next_char == '\\' {
-                        if let Some(escaped_char) = chars.next() {
-                            res.push(escaped_char);
+                        match chars.next() {
+                            Some('\n') => {}
+                            Some(escaped) if DOUBLE_QUOTE_SPECIAL_CHARS.contains(&escaped) => {
+                                res.push(escaped);
+                            }
+                            Some(other) => {
+                                res.push('\\');
+                                res.push(other);
+                            }
+                            None => res.push('\\'),
                         }
                     } else {
                         res.push(next_char);
@@ -244,6 +268,56 @@ mod tests {
         assert_eq!(dequoting_function_rust(r#"qwe\"asdf"#), r#"qwe"asdf"#);
         assert_eq!(dequoting_function_rust(r#""qwe\"asdf""#), r#"qwe"asdf"#);
         assert_eq!(dequoting_function_rust(r#""""#), r#""#);
+        // Inside double quotes, backslash only escapes $, `, ", \ (and line-continuation \n).
+        assert_eq!(dequoting_function_rust(r#""a\nb""#), r#"a\nb"#);
+        assert_eq!(dequoting_function_rust("\"a\\\nb\""), "ab");
+    }
+
+    #[test]
+    fn test_quote_newline_bang_hash_and_tilde_match_bash() {
+        // Double quotes: literal newline (not `\<newline>` line continuation),
+        // and `"\!"` escape for `!` so it works under both `set -H` and `set +H`.
+        assert_eq!(
+            quoting_function_rust("a\nb", QuoteType::DoubleQuote, true, true),
+            "\"a\nb\""
+        );
+        assert_eq!(
+            quoting_function_rust("a!b", QuoteType::DoubleQuote, true, true),
+            "\"a\"\\!\"b\""
+        );
+        assert_eq!(
+            dequoting_function_rust(&quoting_function_rust(
+                "a!b\nc",
+                QuoteType::DoubleQuote,
+                true,
+                true
+            )),
+            "a!b\nc"
+        );
+
+        // Backslash quoting: single-quote newline (not `\<newline>` line continuation),
+        // and escape `#` and `~`.
+        assert_eq!(
+            quoting_function_rust("a\nb", QuoteType::Backslash, true, true),
+            "a'\n'b"
+        );
+        assert_eq!(
+            quoting_function_rust("#foo", QuoteType::Backslash, true, true),
+            "\\#foo"
+        );
+        assert_eq!(
+            quoting_function_rust("~foo", QuoteType::Backslash, true, true),
+            "\\~foo"
+        );
+        assert_eq!(
+            dequoting_function_rust(&quoting_function_rust(
+                "#a~b\nc",
+                QuoteType::Backslash,
+                true,
+                true
+            )),
+            "#a~b\nc"
+        );
     }
 
     #[test]

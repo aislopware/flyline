@@ -1302,26 +1302,24 @@ fn spawn_widget_child(command: &[String]) -> Result<std::process::Child, WidgetF
         args
     );
     let mut cmd = std::process::Command::new(prog);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
     cmd.spawn().map_err(|e| {
-            log::error!(
-                "Custom prompt widget: failed to spawn command {:?}: {}",
-                command,
-                e
-            );
-            WidgetFailure {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: e.to_string(),
-            }
-        })
+        log::error!(
+            "Custom prompt widget: failed to spawn command {:?}: {}",
+            command,
+            e
+        );
+        WidgetFailure {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        }
+    })
 }
 
 /// Read remaining output from a child that has already exited (after
