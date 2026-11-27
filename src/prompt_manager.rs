@@ -1430,7 +1430,7 @@ impl PromptManager {
                 fill_span_final: None,
                 prompt_ruler: PromptRuler::None,
                 prompt_ruler_final: None,
-                construction_time: jiff::ZonedDateTime::now(),
+                construction_time: crate::strftime::local_now(),
                 cwd: String::new(),
                 title: None,
             }
@@ -1601,7 +1601,7 @@ impl PromptManager {
                 fill_span_final,
                 prompt_ruler,
                 prompt_ruler_final,
-                construction_time: jiff::ZonedDateTime::now(),
+                construction_time: crate::strftime::local_now(),
                 cwd,
                 title,
             }
@@ -1625,19 +1625,15 @@ impl PromptManager {
         TaggedLine<'static>,
         Option<FormattedPromptRuler>,
     ) {
-        let anim_now = if show_animations {
-            jiff::ZonedDateTime::now()
-        } else {
-            self.construction_time.clone()
+        let now = (show_animations || !is_running).then(crate::strftime::local_now);
+        let anim_now = match &now {
+            Some(now) if show_animations => now.clone(),
+            _ => self.construction_time.clone(),
         };
         // On final submit render (`!is_running`), always evaluate dynamic time
         // escapes (`\t`, `\T`, `\@`, `\A`, `\D{...}`) against the actual
         // submission timestamp even when `show_animations` is disabled.
-        let time_now = if show_animations || !is_running {
-            jiff::ZonedDateTime::now()
-        } else {
-            self.construction_time.clone()
-        };
+        let time_now = now.unwrap_or_else(|| self.construction_time.clone());
 
         let prompt_src = if is_running {
             &mut self.prompt
@@ -1763,7 +1759,7 @@ impl PromptManager {
         show_animations: bool,
     ) -> Vec<TaggedSpan<'static>> {
         let now = if show_animations {
-            jiff::ZonedDateTime::now()
+            crate::strftime::local_now()
         } else {
             self.construction_time.clone()
         };

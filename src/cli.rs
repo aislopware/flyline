@@ -1714,7 +1714,7 @@ pub(crate) fn call(words: *const bash_symbols::WordList) -> c_int {
                         let c_locale = crate::strftime::c_locale_format(&fmt);
                         match jiff::fmt::strtime::format(
                             c_locale.as_ref(),
-                            &jiff::ZonedDateTime::now(),
+                            &crate::strftime::local_now(),
                         ) {
                             Ok(formatted) => println!("{formatted}"),
                             Err(e) => {
