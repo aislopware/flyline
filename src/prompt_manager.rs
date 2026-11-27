@@ -3218,8 +3218,12 @@ mod tests {
         let _ = shell::backend().unset_env_var("PROMPT_RULER");
     }
 
+    /// The right-prompt tests set the same shell variables; tests run in parallel.
+    static RIGHT_PROMPT_VARS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_rps1_final_expands_dynamic_time_on_submit_without_animations() {
+        let _vars = RIGHT_PROMPT_VARS.lock().unwrap_or_else(|e| e.into_inner());
         let _ = shell::backend().export_env_var("RPS1", r"\t");
         let _ = shell::backend().export_env_var("RPS1_FINAL", r"\t \D{%H:%M:%S}");
 
@@ -3262,6 +3266,7 @@ mod tests {
 
     #[test]
     fn test_rprompt_final_fallback_and_invalid_strftime_no_panic() {
+        let _vars = RIGHT_PROMPT_VARS.lock().unwrap_or_else(|e| e.into_inner());
         let _ = shell::backend().unset_env_var("RPS1_FINAL");
         let _ = shell::backend().export_env_var("RPROMPT_FINAL", r"\D{bad %}");
 
