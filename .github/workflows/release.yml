@@ -178,8 +178,9 @@ jobs:
             --repo "${{ github.repository }}" --prerelease=false --latest
 
   # ── Homebrew tap ────────────────────────────────────────────────────────────────────────────
-  # Points aislopware/homebrew-tap's Formula/flyline.rb at the new tag's source archive, which
-  # the formula builds from. The tap token lives in the better-update vault (org Jmango Vietnam,
+  # Writes aislopware/homebrew-tap's Formula/flyline.rb from packaging/homebrew/flyline.rb.in, so
+  # `brew install` fetches this release's prebuilt library (Intel Macs build from source). Runs
+  # after promote-release: assets of a draft release cannot be downloaded. The tap token lives in the better-update vault (org Jmango Vietnam,
   # project `flyline`, environment `production`, key HOMEBREW_TAP_TOKEN); the only GitHub secret
   # is BETTER_UPDATE_ROBOT, the robot token that opens it. Same arrangement as aislopware/slop-shot.
   #
@@ -198,7 +199,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Pull the tap token from the vault and push the bump
+      - name: Render the formula, then pull the tap token from the vault and push it
         env:
           BETTER_UPDATE_ROBOT: ${{ secrets.BETTER_UPDATE_ROBOT }}
           TAG: ${{ needs.create-release.outputs.version }}
@@ -209,6 +210,11 @@ jobs:
             echo "::error::secret BETTER_UPDATE_ROBOT is not set; see the comment above this job"
             exit 1
           fi
+
+          # Before any secret is in the environment: it only reads public release assets.
+          formula="${RUNNER_TEMP}/flyline.rb"
+          FLYLINE_REPO="${GITHUB_REPOSITORY}" packaging/homebrew/render.sh "${TAG}" > "${formula}"
+          ruby -c "${formula}"
 
           # A standalone binary; with no BETTER_UPDATE_VERSION it installs the latest release.
           curl -fsSL https://raw.githubusercontent.com/aislopware/better-update/main/install.sh | sh
@@ -229,19 +235,9 @@ jobs:
           rm -f "${vault}"
           token="${HOMEBREW_TAP_TOKEN:?HOMEBREW_TAP_TOKEN is not in the better-update vault}"
 
-          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
-          sha="$(curl -fsSL --retry 3 "${url}" | sha256sum | cut -d' ' -f1)"
-          [ "${#sha}" -eq 64 ] || { echo "::error::could not hash ${url}"; exit 1; }
-
           git clone --depth 1 "https://x-access-token:${token}@github.com/aislopware/homebrew-tap.git" tap
           cd tap
-          sed -i -E "s|^  url \".*\"|  url \"${url}\"|; s|^  sha256 \".*\"|  sha256 \"${sha}\"|" Formula/flyline.rb
-          # A sed that matches nothing still succeeds: read the result back.
-          if ! grep -qxF "  url \"${url}\"" Formula/flyline.rb \
-            || ! grep -qxF "  sha256 \"${sha}\"" Formula/flyline.rb; then
-            echo "::error::Formula/flyline.rb no longer has one-line url/sha256 entries"
-            exit 1
-          fi
+          cp "${formula}" Formula/flyline.rb
           git config user.name "flyline-release"
           git config user.email "release@flyline.invalid"
           # Re-running for the same tag leaves the file unchanged: nothing to push is success.

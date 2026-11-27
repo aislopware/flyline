@@ -7,5 +7,5 @@
 - Tag the commit.
 - Push all so the tag and commit are on the remote master.
 - Wait for all actions to have finished.
-- Once the release action has finished, the new release will be marked as pre-release. Manually change it from pre-release to release.
+- The release action publishes the release as Latest once the install tests pass, then its `homebrew-tap` job writes `Formula/flyline.rb` in aislopware/homebrew-tap from `packaging/homebrew/flyline.rb.in`. Check that a `flyline X.Y.Z` commit landed there.
 - If it fails, delete the tag, fix the problem, retag and repeat.
