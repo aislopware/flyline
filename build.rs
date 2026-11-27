@@ -48,6 +48,15 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,--as-needed");
     }
 
+    // Never unmap the library on `enable -d flyline`: termina's SIGWINCH handler
+    // and Rust's thread-local destructors stay registered after bash dlcloses
+    // it, and Bionic (Termux) really unmaps it, so the next call into it
+    // crashed bash (HalFrgrd/flyline#1040). glibc and Bionic both honour
+    // DF_1_NODELETE; macOS dyld does not unload a dylib with thread-locals.
+    if build_target.contains("linux") || build_target.contains("android") {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-z,nodelete");
+    }
+
     // Re-run when the reproducible-build timestamp changes.
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     // Re-run when HEAD changes (branch switch or detached-HEAD commit)
