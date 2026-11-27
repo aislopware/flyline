@@ -319,6 +319,7 @@ where
 
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
+            crate::logging::enter_forked_child();
             close_fd(payload_rx);
             close_fd(log_rx);
 

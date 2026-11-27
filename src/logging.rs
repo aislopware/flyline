@@ -60,7 +60,11 @@ impl Log for MemoryLogger {
             return;
         }
 
-        let timestamp = log_timestamp(&jiff::ZonedDateTime::now().datetime());
+        let timestamp = log_timestamp(
+            &jiff::Timestamp::now()
+                .to_zoned_datetime(log_time_zone().clone())
+                .datetime(),
+        );
         let file = record.file().unwrap_or("?");
         let line = record
             .line()
@@ -75,6 +79,13 @@ impl Log for MemoryLogger {
             line,
             record.args()
         );
+        if IN_FORKED_CHILD.load(Ordering::Relaxed) {
+            // The parent collects these over the IPC pipe. The buffer and stream
+            // mutexes may have been held by another thread at fork time and would
+            // never be released in this process.
+            write_subshell_ipc_log(&entry);
+            return;
+        }
         self.write_stream_entry(&entry);
         write_subshell_ipc_log(&entry);
         self.push(entry);
@@ -86,10 +97,25 @@ impl Log for MemoryLogger {
 static LOGGER: OnceLock<MemoryLogger> = OnceLock::new();
 static TERMINAL_STREAMING: AtomicBool = AtomicBool::new(false);
 static SUBSHELL_IPC_FD: AtomicI32 = AtomicI32::new(-1);
+static IN_FORKED_CHILD: AtomicBool = AtomicBool::new(false);
+static LOG_TIME_ZONE: OnceLock<jiff::tz::TimeZone> = OnceLock::new();
+
+/// The zone log timestamps use, resolved once: jiff's system zone sits behind a
+/// lock that a forked child may find held forever.
+fn log_time_zone() -> &'static jiff::tz::TimeZone {
+    LOG_TIME_ZONE.get_or_init(jiff::tz::TimeZone::system)
+}
+
+/// Call first thing in a child created by `fork()`: from then on logging takes no
+/// lock that another thread of the parent could have been holding.
+pub fn enter_forked_child() {
+    IN_FORKED_CHILD.store(true, Ordering::SeqCst);
+}
 #[cfg(test)]
 static TEST_LOG_INIT: Once = Once::new();
 
 pub fn init() -> Result<()> {
+    let _ = log_time_zone();
     let logger = LOGGER.get_or_init(MemoryLogger::new);
     match log::set_logger(logger) {
         Ok(()) => {
