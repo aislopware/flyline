@@ -12,7 +12,6 @@ ignore = []
 # satisfied by one of these, so their other options need no entry.
 allow = [
     "Apache-2.0",
-    "BSL-1.0",     # ryu
     "MIT",
     "MPL-2.0",     # termina, option-ext (dirs)
     "Unicode-3.0", # unicode-ident
