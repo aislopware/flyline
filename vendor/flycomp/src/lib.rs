@@ -4,7 +4,6 @@
 //! the text comes from (clap, Python argparse, or an unknown generic format)
 //! and dispatches to the appropriate sub-parser.
 use anyhow::Context;
-use chrono::{SecondsFormat, Utc};
 use regex_lite as regex;
 use strum::IntoStaticStr;
 
@@ -2035,7 +2034,7 @@ fn render_json_output(
             flycomp_version: env!("CARGO_PKG_VERSION"),
             git_hash: env!("GIT_HASH"),
             build_time: env!("BUILD_TIME"),
-            generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            generated_at: rfc3339_now(),
             output_format: "json",
             requested_strategy: requested_strategy.into(),
             strategy_used: strategy_used.into(),
@@ -2721,7 +2720,7 @@ pub fn generate_completion_output(
             version = env!("CARGO_PKG_VERSION"),
             git_hash = env!("GIT_HASH"),
             build_time = env!("BUILD_TIME"),
-            generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            generated_at = rfc3339_now(),
             output_format = output_format_str,
             requested_strategy = Into::<&'static str>::into(strategy),
             strategy_used = Into::<&'static str>::into(outcome.strategy_used),
@@ -2907,6 +2906,13 @@ pub mod test_helpers {
             );
         }
     }
+}
+
+/// The current UTC time as RFC 3339 with whole seconds, e.g. `2026-11-27T10:00:00Z`.
+fn rfc3339_now() -> String {
+    jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
 #[cfg(test)]
