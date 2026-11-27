@@ -336,7 +336,8 @@ fn init_backend() -> &'static dyn ShellBackend {
 /// Supports:
 /// - Leading unquoted tilde expansion (`~`, `~/...`, `~+`, `~-`, `~user`, `~user/...`)
 /// - Shell parameter expansion (`$NAME`, `${NAME}`) in unquoted and double-quoted text
-/// - Quote removal (`'...'`, `"..."`, and backslash escapes following Bash rules)
+/// - Quote removal (`'...'`, `"..."`, `$'...'` ANSI-C quoting, `$"..."` locale quoting,
+///   and backslash escapes following Bash rules)
 ///
 /// Deliberately does **not** perform command substitution (`` `...` ``, `$(...)`),
 /// arithmetic expansion, or process substitution. Calling Bash's
@@ -411,13 +412,184 @@ where
                     Some('\n') | None => {}
                     Some(escaped) => result.push(escaped),
                 },
-                '$' => expand_shell_var(&mut chars, &lookup_env, &mut result),
+                '$' => match chars.peek() {
+                    Some('\'') => {
+                        chars.next();
+                        decode_ansi_c_quote(&mut chars, &mut result);
+                    }
+                    Some('"') => {
+                        chars.next();
+                        quote = Some('"');
+                    }
+                    _ => expand_shell_var(&mut chars, &lookup_env, &mut result),
+                },
                 _ => result.push(c),
             },
         }
     }
 
     result
+}
+
+/// Decode the body of a Bash ANSI-C quoted string (`$'...'`) after the opening
+/// `$'` has been consumed, stopping at the matching unescaped `'` or end of
+/// input without panicking.
+///
+/// Handles `\a`, `\b`, `\e`/`\E`, `\f`, `\n`, `\r`, `\t`, `\v`, `\\`, `\'`,
+/// `\"`, `\?`, `\nnn` (1-3 octal digits), `\xHH` (1-2 hex digits), `\uHHHH` /
+/// `\UHHHHHHHH` (Unicode code points), and `\cX` (control characters), and
+/// never runs command substitution or variable expansion.
+fn decode_ansi_c_quote(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
+    let mut pending_bytes: Vec<u8> = Vec::new();
+    let flush_bytes = |bytes: &mut Vec<u8>, out: &mut String| {
+        if !bytes.is_empty() {
+            out.push_str(&String::from_utf8_lossy(bytes));
+            bytes.clear();
+        }
+    };
+
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            break;
+        }
+        if c != '\\' {
+            flush_bytes(&mut pending_bytes, out);
+            out.push(c);
+            continue;
+        }
+
+        let Some(esc) = chars.next() else {
+            flush_bytes(&mut pending_bytes, out);
+            out.push('\\');
+            break;
+        };
+
+        match esc {
+            'a' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x07');
+            }
+            'b' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x08');
+            }
+            'e' | 'E' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x1b');
+            }
+            'f' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x0c');
+            }
+            'n' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\n');
+            }
+            'r' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\r');
+            }
+            't' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\t');
+            }
+            'v' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x0b');
+            }
+            '\\' | '\'' | '"' | '?' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push(esc);
+            }
+            '0'..='7' => {
+                let mut val = (esc as u32) - ('0' as u32);
+                for _ in 0..2 {
+                    if let Some(&next) = chars.peek()
+                        && matches!(next, '0'..='7')
+                    {
+                        val = (val << 3) | ((next as u32) - ('0' as u32));
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                pending_bytes.push((val & 0xff) as u8);
+            }
+            'x' => {
+                let mut val: u32 = 0;
+                let mut digits = 0;
+                while digits < 2 {
+                    if let Some(&next) = chars.peek()
+                        && let Some(d) = next.to_digit(16)
+                    {
+                        val = (val << 4) | d;
+                        digits += 1;
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if digits > 0 {
+                    pending_bytes.push((val & 0xff) as u8);
+                } else {
+                    flush_bytes(&mut pending_bytes, out);
+                    out.push('\\');
+                    out.push('x');
+                }
+            }
+            'u' | 'U' => {
+                let max_digits = if esc == 'u' { 4 } else { 8 };
+                let mut val: u32 = 0;
+                let mut digits = 0;
+                while digits < max_digits {
+                    if let Some(&next) = chars.peek()
+                        && let Some(d) = next.to_digit(16)
+                    {
+                        val = (val << 4) | d;
+                        digits += 1;
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                flush_bytes(&mut pending_bytes, out);
+                if digits > 0 {
+                    out.push(char::from_u32(val).unwrap_or('\u{FFFD}'));
+                } else {
+                    out.push('\\');
+                    out.push(esc);
+                }
+            }
+            'c' => {
+                if let Some(ctrl) = chars.next() {
+                    if ctrl == '\\' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                    }
+                    if ctrl == '?' {
+                        pending_bytes.push(0x7f);
+                    } else if ctrl.is_ascii() {
+                        pending_bytes.push((ctrl as u8).to_ascii_uppercase() & 0x1f);
+                    } else {
+                        flush_bytes(&mut pending_bytes, out);
+                        out.push('\\');
+                        out.push('c');
+                        out.push(ctrl);
+                    }
+                } else {
+                    flush_bytes(&mut pending_bytes, out);
+                    out.push('\\');
+                    out.push('c');
+                }
+            }
+            other => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+
+    flush_bytes(&mut pending_bytes, out);
 }
 
 /// Expand `$NAME` or `${NAME}` into `out`. Unknown names expand to empty.
@@ -776,6 +948,57 @@ mod tests {
         // Tilde ~+ and ~- expansion.
         assert_eq!(tb.expand_filename("~+/sub"), format!("{}/sub", tb.cwd()));
         assert_eq!(tb.expand_filename("~-/sub"), "/prev/sub");
+    }
+
+    #[test]
+    fn expand_shell_filename_ansi_c_and_locale_quoting() {
+        let tb = TestBackend::new();
+        tb.set_env("HOME", "/home/test");
+        tb.set_env("X", "val");
+
+        // ANSI-C quoting ($'...')
+        assert_eq!(tb.expand_filename("$'my dir'"), "my dir");
+        assert_eq!(tb.expand_filename("$'my dir'/"), "my dir/");
+        assert_eq!(tb.expand_filename("$'it\\'s'"), "it's");
+        assert_eq!(tb.expand_filename("$'it\\'s'/file"), "it's/file");
+        assert_eq!(tb.expand_filename("$'a\\tb'"), "a\tb");
+        assert_eq!(tb.expand_filename("$'a\\nb'"), "a\nb");
+        assert_eq!(tb.expand_filename("$'a\\\\b'"), "a\\b");
+        assert_eq!(tb.expand_filename("$'a\\eb\\Ec'"), "a\x1bb\x1bc");
+        assert_eq!(
+            tb.expand_filename("$'\\a\\b\\f\\r\\v\\\"\\?'"),
+            "\x07\x08\x0c\r\x0b\"?"
+        );
+        assert_eq!(tb.expand_filename("$'\\x41\\x42'"), "AB");
+        assert_eq!(tb.expand_filename("$'\\xc3\\xa9'"), "é");
+        assert_eq!(tb.expand_filename("$'\\101'"), "A");
+        assert_eq!(tb.expand_filename("$'\\u00e9\\U0001f600'"), "é😀");
+        assert_eq!(tb.expand_filename("$'\\cA\\c?'"), "\x01\x7f");
+        assert_eq!(tb.expand_filename("$'\\xz\\z'"), "\\xz\\z");
+        // No variable expansion or command substitution inside $'...'
+        assert_eq!(tb.expand_filename("$'$X'"), "$X");
+        assert_eq!(tb.expand_filename("$'$(echo pwned)'"), "$(echo pwned)");
+        assert_eq!(tb.expand_filename("$'`echo pwned`'"), "`echo pwned`");
+        // Quoted tilde is not expanded; unquoted tilde before / still expands.
+        assert_eq!(tb.expand_filename("$'~'/dir"), "~/dir");
+        assert_eq!(tb.expand_filename("~/$'my dir'"), "/home/test/my dir");
+
+        // Locale double-quoting ($"...") behaves like double quotes without cmdsubst.
+        assert_eq!(tb.expand_filename("$\"x y\""), "x y");
+        assert_eq!(tb.expand_filename("$\"$X/sub\""), "val/sub");
+        assert_eq!(tb.expand_filename("$\"a\\\"b\\\\c\""), "a\"b\\c");
+        assert_eq!(tb.expand_filename("$\"$(echo pwned)\""), "$(echo pwned)");
+        assert_eq!(tb.expand_filename("$\"`echo pwned`\""), "`echo pwned`");
+        // Inside double quotes, `$` before `"` closes the double quote rather than starting $"...".
+        assert_eq!(tb.expand_filename("\"$\"foo\"\""), "$foo");
+
+        // Lone `$` and unterminated `$'` / `$"` stay sane without panicking.
+        assert_eq!(tb.expand_filename("$"), "$");
+        assert_eq!(tb.expand_filename("$'"), "");
+        assert_eq!(tb.expand_filename("$'unterminated"), "unterminated");
+        assert_eq!(tb.expand_filename("$'trailing\\"), "trailing\\");
+        assert_eq!(tb.expand_filename("$\""), "");
+        assert_eq!(tb.expand_filename("$\"unterminated"), "unterminated");
     }
 
     #[test]
