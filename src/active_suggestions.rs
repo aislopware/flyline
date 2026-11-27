@@ -1015,6 +1015,35 @@ mod description_tests {
     }
 
     #[test]
+    fn multi_word_completion_values_are_inserted_as_one_word() {
+        let process = |raw: &str, word: &str| {
+            UnprocessedSuggestion {
+                raw_text: raw.to_string(),
+                full_path: None,
+                flags: shell::CompletionFlags::default(),
+                word_under_cursor: word.to_string(),
+                is_git_command: false,
+                custom_prefix: None,
+            }
+            .into_processed()
+            .formatted()
+        };
+
+        assert_eq!(process("background noise", "back"), "'background noise' ");
+        assert_eq!(process("it's loud", "it"), "'it'\\''s loud' ");
+        // Already quoted by the completion function: inserted as given.
+        assert_eq!(process("'background noise'", "back"), "'background noise' ");
+        assert_eq!(process("background\\ noise", "back"), "background\\ noise ");
+        assert_eq!(process("a;b", "a"), "'a;b' ");
+        assert_eq!(process("$HOME dir", "$H"), "$HOME dir ");
+        // Single words and trailing-space values are unchanged.
+        assert_eq!(process("minimal", "mi"), "minimal ");
+        // Inside a quote the user opened, the value continues that quote.
+        assert_eq!(process("background noise", "'back"), "'background noise");
+        assert_eq!(process("background noise", "\"back"), "\"background noise");
+    }
+
+    #[test]
     fn test_into_processed_quoting_and_prefixes() {
         let fn_flags = shell::CompletionFlags {
             filename_quoting_desired: true,
@@ -1957,6 +1986,19 @@ impl UnprocessedSuggestion {
             };
 
             (prefix_to_use, s)
+        } else if let Some(qc) = quote_char
+            && !had_closing_quote
+            && word_under_cursor.starts_with(qc)
+        {
+            // The user opened a quote: continue inside it, as for filenames.
+            let s = shell::quoting_function_rust(sug_core, effective_quote_type, false, false);
+            (qc.to_string(), s)
+        } else if quote_char.is_none() && is_unquoted_multi_word(&sug) {
+            // A value like `background noise` would be split into two words; insert it
+            // as one (HalFrgrd/flyline#959). Values the completion already quoted
+            // (`printf %q`, `${x@Q}`) contain a quote or backslash and are left alone.
+            let s = shell::quoting_function_rust(&sug, shell::QuoteType::SingleQuote, true, true);
+            (String::new(), s)
         } else {
             (String::new(), sug.clone())
         };
@@ -2013,6 +2055,34 @@ impl UnprocessedSuggestion {
             None => suggestion,
         }
     }
+}
+
+/// Whether a non-filename completion would not survive as one literal word if
+/// inserted verbatim: it has unquoted whitespace or shell metacharacters, or an
+/// unbalanced quote (`it's loud`).
+///
+/// Values the completion function already quoted (`printf %q`, `${x@Q}`) scan as
+/// one word and are left alone, as are values with `$` or a backquote, which may
+/// be meant as expansions. Leading or trailing whitespace is left alone too:
+/// completions use a trailing space to mean "this word is finished".
+fn is_unquoted_multi_word(s: &str) -> bool {
+    if s != s.trim() || s.contains(['$', '`']) {
+        return false;
+    }
+    let mut chars = s.chars();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\\') | (Some('"'), '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_whitespace() || ";&|<>()".contains(c) => return true,
+            _ => {}
+        }
+    }
+    quote.is_some()
 }
 
 const CHUNK_PROCESSING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
