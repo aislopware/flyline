@@ -231,7 +231,17 @@ pub struct SubshellHandle<T> {
 
 impl<T> Drop for SubshellHandle<T> {
     fn drop(&mut self) {
-        let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL);
+        // The child calls `setsid()` right after `fork()`, placing itself and
+        // all of its descendants in process group `self.pid`. Kill the whole
+        // process group first so grandchildren (e.g. `uv generate-shell-completion`)
+        // are terminated alongside the subshell rather than orphaned (#1071).
+        // If `drop` races ahead of `setsid()`, `killpg` returns `ESRCH`; fall
+        // back to killing `self.pid` directly and re-signalling the group
+        // before reaping.
+        if nix::sys::signal::killpg(self.pid, nix::sys::signal::Signal::SIGKILL).is_err() {
+            let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::signal::killpg(self.pid, nix::sys::signal::Signal::SIGKILL);
+        }
         let _ = nix::sys::wait::waitpid(self.pid, None);
         close_fd(self.receiver.payload_fd());
         close_fd(self.receiver.log_fd());
@@ -358,4 +368,65 @@ where
 pub fn close_fd(fd: RawFd) {
     log::trace!("SubshellIPC: closing fd {}", fd);
     let _ = nix::unistd::close(fd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn wait_for_process_exit(pid: Pid, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match nix::sys::signal::kill(pid, None) {
+                Err(nix::errno::Errno::ESRCH) => return true,
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        matches!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        )
+    }
+
+    #[test]
+    fn dropping_subshell_handle_kills_descendant_processes() {
+        let (notify_rx, notify_tx) = create_pipe().expect("create notify pipe");
+
+        let handle: SubshellHandle<()> = spawn_subshell(move || {
+            close_fd(notify_rx);
+            let mut grandchild = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn grandchild sleep");
+            let grandchild_pid = grandchild.id() as i32;
+            let _ = write_all_fd(notify_tx, &grandchild_pid.to_ne_bytes());
+            close_fd(notify_tx);
+            let _ = grandchild.wait();
+            None
+        })
+        .expect("spawn_subshell");
+
+        close_fd(notify_tx);
+        let mut pid_bytes = [0u8; 4];
+        read_exact_fd(notify_rx, &mut pid_bytes).expect("read grandchild pid");
+        close_fd(notify_rx);
+
+        let grandchild_pid = Pid::from_raw(i32::from_ne_bytes(pid_bytes));
+        assert!(
+            nix::sys::signal::kill(grandchild_pid, None).is_ok(),
+            "grandchild {grandchild_pid} should be alive before drop"
+        );
+
+        drop(handle);
+
+        let dead = wait_for_process_exit(grandchild_pid, Duration::from_secs(2));
+        if !dead {
+            let _ = nix::sys::signal::kill(grandchild_pid, nix::sys::signal::Signal::SIGKILL);
+        }
+        assert!(
+            dead,
+            "grandchild process {grandchild_pid} should be killed when SubshellHandle is dropped"
+        );
+    }
 }

@@ -1118,6 +1118,17 @@ fn format_prompt_line(
     leader_active: bool,
     ps2_ctx: Option<Ps2Context>,
 ) -> TaggedLine<'static> {
+    format_prompt_line_with_times(segments, now, now, mouse_enabled, leader_active, ps2_ctx)
+}
+
+fn format_prompt_line_with_times(
+    segments: &[PromptSegment],
+    time_now: &jiff::ZonedDateTime,
+    anim_now: &jiff::ZonedDateTime,
+    mouse_enabled: bool,
+    leader_active: bool,
+    ps2_ctx: Option<Ps2Context>,
+) -> TaggedLine<'static> {
     let tagged_spans: Vec<TaggedSpan<'static>> = segments
         .iter()
         .flat_map(|segment| -> Vec<TaggedSpan<'static>> {
@@ -1148,11 +1159,11 @@ fn format_prompt_line(
                 }
                 PromptSegment::DynamicTime { strftime, style } => {
                     vec![TaggedSpan::new(
-                        Span::styled(crate::strftime::format(strftime, now), *style),
+                        Span::styled(crate::strftime::format(strftime, time_now), *style),
                         Tag::PromptDynamicTime,
                     )]
                 }
-                PromptSegment::Animation(anim) => get_frame_spans(anim, now)
+                PromptSegment::Animation(anim) => get_frame_spans(anim, anim_now)
                     .iter()
                     .map(|span| TaggedSpan::new(span.clone(), Tag::PromptAnimation))
                     .collect(),
@@ -1285,23 +1296,25 @@ fn spawn_widget_child(command: &[String]) -> Result<std::process::Child, WidgetF
         prog,
         args
     );
-    std::process::Command::new(prog)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            log::error!(
-                "Custom prompt widget: failed to spawn command {:?}: {}",
-                command,
-                e
-            );
-            WidgetFailure {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: e.to_string(),
-            }
-        })
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn().map_err(|e| {
+        log::error!(
+            "Custom prompt widget: failed to spawn command {:?}: {}",
+            command,
+            e
+        );
+        WidgetFailure {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: e.to_string(),
+        }
+    })
 }
 
 /// Read remaining output from a child that has already exited (after
@@ -1549,6 +1562,7 @@ impl PromptManager {
 
             let rps1_final = shell::backend()
                 .env_var("RPS1_FINAL")
+                .or_else(|| shell::backend().env_var("RPROMPT_FINAL"))
                 .and_then(|raw| builder.expand_prompt_string(raw));
 
             let fill_span_final = shell::backend().env_var("PS1_FILL_FINAL").map(|raw| {
@@ -1605,7 +1619,15 @@ impl PromptManager {
         TaggedLine<'static>,
         Option<FormattedPromptRuler>,
     ) {
-        let now = if show_animations {
+        let anim_now = if show_animations {
+            jiff::ZonedDateTime::now()
+        } else {
+            self.construction_time.clone()
+        };
+        // On final submit render (`!is_running`), always evaluate dynamic time
+        // escapes (`\t`, `\T`, `\@`, `\A`, `\D{...}`) against the actual
+        // submission timestamp even when `show_animations` is disabled.
+        let time_now = if show_animations || !is_running {
             jiff::ZonedDateTime::now()
         } else {
             self.construction_time.clone()
@@ -1641,7 +1663,14 @@ impl PromptManager {
             .iter_mut()
             .map(|line| {
                 advance_pending_widgets(line);
-                format_prompt_line(line, &now, mouse_enabled, leader_active, None)
+                format_prompt_line_with_times(
+                    line,
+                    &time_now,
+                    &anim_now,
+                    mouse_enabled,
+                    leader_active,
+                    None,
+                )
             })
             .collect();
 
@@ -1649,20 +1678,40 @@ impl PromptManager {
             .iter_mut()
             .map(|line| {
                 advance_pending_widgets(line);
-                format_prompt_line(line, &now, mouse_enabled, leader_active, None)
+                format_prompt_line_with_times(
+                    line,
+                    &time_now,
+                    &anim_now,
+                    mouse_enabled,
+                    leader_active,
+                    None,
+                )
             })
             .collect();
 
         advance_pending_widgets(fill_span_src);
-        let formatted_fill =
-            format_prompt_line(fill_span_src, &now, mouse_enabled, leader_active, None);
+        let formatted_fill = format_prompt_line_with_times(
+            fill_span_src,
+            &time_now,
+            &anim_now,
+            mouse_enabled,
+            leader_active,
+            None,
+        );
 
         let formatted_ruler = match prompt_ruler_src {
             PromptRuler::None => None,
             PromptRuler::EmptyLine => Some(FormattedPromptRuler::EmptyLine),
             PromptRuler::Pattern(segments) => {
                 advance_pending_widgets(segments);
-                let line = format_prompt_line(segments, &now, mouse_enabled, leader_active, None);
+                let line = format_prompt_line_with_times(
+                    segments,
+                    &time_now,
+                    &anim_now,
+                    mouse_enabled,
+                    leader_active,
+                    None,
+                );
                 Some(FormattedPromptRuler::Line(line))
             }
         };
@@ -3161,5 +3210,64 @@ mod tests {
         ));
 
         let _ = shell::backend().unset_env_var("PROMPT_RULER");
+    }
+
+    #[test]
+    fn test_rps1_final_expands_dynamic_time_on_submit_without_animations() {
+        let _ = shell::backend().export_env_var("RPS1", r"\t");
+        let _ = shell::backend().export_env_var("RPS1_FINAL", r"\t \D{%H:%M:%S}");
+
+        let mut pm = PromptManager::new(false, &[], &[], None);
+        // Simulate a prompt that has been sitting open for 2 minutes before submit.
+        let past = jiff::ZonedDateTime::now() - jiff::SignedDuration::from_secs(120);
+        let past_str = past.strftime("%H:%M:%S").to_string();
+        pm.construction_time = past;
+
+        // While running with show_animations=false, RPS1 stays pinned to construction_time.
+        let (_, rprompt_running, _, _) = pm.get_ps1_lines(false, false, false, true);
+        let running_text: String = rprompt_running
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.span.content.as_ref())
+            .collect();
+        assert_eq!(running_text, past_str);
+
+        // On submit (`is_running=false`), RPS1_FINAL expands `\t` and `\D{...}` to
+        // current submit time even when `show_animations=false`.
+        let (_, rprompt_final, _, _) = pm.get_ps1_lines(false, false, false, false);
+        let final_text: String = rprompt_final
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.span.content.as_ref())
+            .collect();
+        assert_ne!(
+            final_text,
+            format!("{past_str} {past_str}"),
+            "RPS1_FINAL should reflect submit time rather than construction_time"
+        );
+        let parts: Vec<&str> = final_text.split(' ').collect();
+        assert_eq!(parts.len(), 2, "got {final_text:?}");
+        assert_eq!(parts[0], parts[1], "\\t and \\D{{%H:%M:%S}} should match");
+        assert_eq!(parts[0].len(), 8);
+
+        let _ = shell::backend().unset_env_var("RPS1");
+        let _ = shell::backend().unset_env_var("RPS1_FINAL");
+    }
+
+    #[test]
+    fn test_rprompt_final_fallback_and_invalid_strftime_no_panic() {
+        let _ = shell::backend().unset_env_var("RPS1_FINAL");
+        let _ = shell::backend().export_env_var("RPROMPT_FINAL", r"\D{bad %}");
+
+        let mut pm = PromptManager::new(false, &[], &[], None);
+        let (_, rprompt_final, _, _) = pm.get_ps1_lines(false, false, false, false);
+        let final_text: String = rprompt_final
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.span.content.as_ref())
+            .collect();
+        assert_eq!(final_text, "bad %");
+
+        let _ = shell::backend().unset_env_var("RPROMPT_FINAL");
     }
 }

@@ -19,8 +19,11 @@ pub enum TokenKind {
     Whitespace(String),
     Assignment,                                      // =
     Pipe,                                            // |
+    PipeAnd,                                         // |&
     Semicolon,                                       // ;
     DoubleSemicolon,                                 // ;;
+    SemiAnd,                                         // ;&
+    DoubleSemiAnd,                                   // ;;&
     Newline,                                         // \n
     And,                                             // &&
     Background,                                      // & (add this new token)
@@ -33,6 +36,8 @@ pub enum TokenKind {
     Less,                                            // <
     Great,                                           // >
     DGreat,                                          // >>
+    AndGreat,                                        // &>
+    AndDGreat,                                       // &>>
     InputDup,                                        // <&
     OutputDup,                                       // >&
     ReadWrite,                                       // <>
@@ -576,6 +581,13 @@ impl Lexer {
                         value: "||".to_string(),
                         position: current_position,
                     }
+                } else if self.peek_char() == '&' {
+                    self.read_char();
+                    Token {
+                        kind: TokenKind::PipeAnd,
+                        value: "|&".to_string(),
+                        position: current_position,
+                    }
                 } else {
                     Token {
                         kind: TokenKind::Pipe,
@@ -587,9 +599,25 @@ impl Lexer {
             ';' => {
                 if self.peek_char() == ';' {
                     self.read_char();
+                    if self.peek_char() == '&' {
+                        self.read_char();
+                        Token {
+                            kind: TokenKind::DoubleSemiAnd,
+                            value: ";;&".to_string(),
+                            position: current_position,
+                        }
+                    } else {
+                        Token {
+                            kind: TokenKind::DoubleSemicolon,
+                            value: ";;".to_string(),
+                            position: current_position,
+                        }
+                    }
+                } else if self.peek_char() == '&' {
+                    self.read_char();
                     Token {
-                        kind: TokenKind::DoubleSemicolon,
-                        value: ";;".to_string(),
+                        kind: TokenKind::SemiAnd,
+                        value: ";&".to_string(),
                         position: current_position,
                     }
                 } else {
@@ -607,6 +635,22 @@ impl Lexer {
                         kind: TokenKind::And,
                         value: "&&".to_string(),
                         position: current_position,
+                    }
+                } else if self.peek_char() == '>' {
+                    self.read_char();
+                    if self.peek_char() == '>' {
+                        self.read_char();
+                        Token {
+                            kind: TokenKind::AndDGreat,
+                            value: "&>>".to_string(),
+                            position: current_position,
+                        }
+                    } else {
+                        Token {
+                            kind: TokenKind::AndGreat,
+                            value: "&>".to_string(),
+                            position: current_position,
+                        }
                     }
                 } else {
                     Token {
@@ -1966,6 +2010,9 @@ impl Lexer {
 
         while !self.ch.is_whitespace() && self.ch != '\0' {
             match self.ch {
+                // Unquoted shell metacharacters always terminate a heredoc
+                // delimiter word (e.g. `cat <<EOF|sort`, `cat << | sort`).
+                '|' | '&' | ';' | '(' | ')' | '<' | '>' => break,
                 // Quoted segment: only enter if a matching close quote
                 // exists on the same word, otherwise leave the opening
                 // quote for the outer lexer to emit as an unclosed

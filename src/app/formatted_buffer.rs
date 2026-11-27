@@ -119,17 +119,23 @@ fn is_bash_reserved_token_kind(kind: &TokenKind) -> bool {
             | TokenKind::And        // &&
             | TokenKind::Or         // ||
             | TokenKind::Pipe       // |
+            | TokenKind::PipeAnd    // |&
             | TokenKind::Semicolon  // ;
             | TokenKind::DoubleSemicolon // ;;
+            | TokenKind::SemiAnd    // ;&
+            | TokenKind::DoubleSemiAnd // ;;&
             | TokenKind::Assignment // =
             | TokenKind::Background // &
             | TokenKind::Less       // <
             | TokenKind::Great      // >
             | TokenKind::DGreat     // >>
+            | TokenKind::AndGreat   // &>
+            | TokenKind::AndDGreat  // &>>
             | TokenKind::InputDup   // <&
             | TokenKind::OutputDup  // >&
             | TokenKind::ReadWrite  // <>
             | TokenKind::Clobber    // >|
+            | TokenKind::HereString // <<<
             // History expansion token and complete builtin (explicitly requested)
             | TokenKind::History    // ! - history expansion
             | TokenKind::Complete // complete - tab completion builtin
@@ -156,6 +162,10 @@ fn token_to_style(
             return palette.unrecognised_env_var();
         }
         return palette.env_var();
+    }
+
+    if token.annotations.is_invalid {
+        return palette.unrecognised_command();
     }
 
     // Rainbow-colour all opening and closing delimiter tokens by nesting depth.
@@ -1006,5 +1016,58 @@ mod tests {
         assert_eq!(info.tooltip, Some(dir_path.to_string()));
 
         shell::set_test_autocd(false);
+    }
+
+    #[test]
+    fn test_invalid_vs_valid_redirection_operator_styling() {
+        let palette = Palette::dark();
+
+        // Valid `|&` and `&>` are styled as bash reserved operators.
+        let valid_pipe_and = FormattedBuffer::from("echo a |& cat", 13, None);
+        let pipe_and_parts = parts_with_value(&valid_pipe_and, "|&");
+        assert_eq!(pipe_and_parts.len(), 1);
+        assert_eq!(
+            pipe_and_parts[0].normal_span().style,
+            palette.bash_reserved()
+        );
+
+        let valid_and_great = FormattedBuffer::from("echo a &> out", 13, None);
+        let and_great_parts = parts_with_value(&valid_and_great, "&>");
+        assert_eq!(and_great_parts.len(), 1);
+        assert_eq!(
+            and_great_parts[0].normal_span().style,
+            palette.bash_reserved()
+        );
+        let out_parts = parts_with_value(&valid_and_great, "out");
+        assert_eq!(out_parts[0].normal_span().style, palette.normal_text());
+
+        // Invalid `&|` and `>>&` are styled with the error/unrecognised style.
+        let invalid_amp_pipe = FormattedBuffer::from("echo a &| cat", 13, None);
+        assert_eq!(
+            parts_with_value(&invalid_amp_pipe, "&")[0]
+                .normal_span()
+                .style,
+            palette.unrecognised_command()
+        );
+        assert_eq!(
+            parts_with_value(&invalid_amp_pipe, "|")[0]
+                .normal_span()
+                .style,
+            palette.unrecognised_command()
+        );
+
+        let invalid_dgreat_amp = FormattedBuffer::from("echo a >>& out", 14, None);
+        assert_eq!(
+            parts_with_value(&invalid_dgreat_amp, ">>")[0]
+                .normal_span()
+                .style,
+            palette.unrecognised_command()
+        );
+        assert_eq!(
+            parts_with_value(&invalid_dgreat_amp, "&")[0]
+                .normal_span()
+                .style,
+            palette.unrecognised_command()
+        );
     }
 }

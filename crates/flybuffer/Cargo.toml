@@ -19,3 +19,6 @@ log.workspace = true
 serde.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+
+[dev-dependencies]
+proptest = "1"

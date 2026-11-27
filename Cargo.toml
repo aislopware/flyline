@@ -100,6 +100,7 @@ unicode-width.workspace = true
 uuid = { version = "1.29", features = ["v7"] }
 
 [dev-dependencies]
+proptest = "1"
 rusty-fork = "0.3.1"
 
 [profile.release]

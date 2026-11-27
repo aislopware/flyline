@@ -53,21 +53,26 @@ impl TextBuffer {
         self.cursor_byte = self.right_move_pos();
     }
 
+    fn grapheme_is_word_boundary(delim: WordDelim, g: &str) -> bool {
+        g.chars().next().is_some_and(|c| delim.is_word_boundary(c))
+    }
+
     pub(crate) fn move_one_word_left_pos(&self, delim: WordDelim) -> usize {
-        if let Some("\n\n") = self
-            .buf
-            .get(self.cursor_byte.saturating_sub(2)..self.cursor_byte)
+        if self.cursor_byte >= 2
+            && let Some("\n\n") = self.buf.get(self.cursor_byte - 2..self.cursor_byte)
         {
-            return self.cursor_byte - 1;
+            return Self::snap_to_grapheme_boundary_left(&self.buf, self.cursor_byte - 1);
         }
         self.buf
-            .char_indices()
+            .grapheme_indices(true)
             .rev()
             .skip_while(|(i, _)| *i >= self.cursor_byte)
-            .skip_while(|(_, c)| delim.is_word_boundary(*c))
+            .skip_while(|(_, g)| Self::grapheme_is_word_boundary(delim, g))
             .tuple_windows()
-            .find_map(|((i, c), (_, next_c))| {
-                if !delim.is_word_boundary(c) && delim.is_word_boundary(next_c) {
+            .find_map(|((i, g), (_, next_g))| {
+                if !Self::grapheme_is_word_boundary(delim, g)
+                    && Self::grapheme_is_word_boundary(delim, next_g)
+                {
                     Some(i)
                 } else {
                     None
@@ -82,14 +87,14 @@ impl TextBuffer {
 
     pub(crate) fn move_one_word_right_pos(&self, delim: WordDelim) -> usize {
         if let Some("\n\n") = self.buf.get(self.cursor_byte..self.cursor_byte + 2) {
-            return self.cursor_byte + 1;
+            return Self::snap_to_grapheme_boundary_right(&self.buf, self.cursor_byte + 1);
         }
 
         self.buf
-            .char_indices()
+            .grapheme_indices(true)
             .skip_while(|(i, _)| *i < self.cursor_byte)
-            .skip_while(|(_, c)| delim.is_word_boundary(*c))
-            .find(|(_, c)| delim.is_word_boundary(*c))
+            .skip_while(|(_, g)| Self::grapheme_is_word_boundary(delim, g))
+            .find(|(_, g)| Self::grapheme_is_word_boundary(delim, g))
             .map_or(self.buf.len(), |(i, _)| i)
     }
 
@@ -113,8 +118,8 @@ impl TextBuffer {
         {
             // Extend the anchor leftward to the start of the word it sits in.
             let mut new_anchor = anchor;
-            for (i, c) in self.buf[..anchor].char_indices().rev() {
-                if c.is_whitespace() {
+            for (i, g) in self.buf[..anchor].grapheme_indices(true).rev() {
+                if Self::grapheme_is_word_boundary(WordDelim::WhiteSpace, g) {
                     break;
                 }
                 new_anchor = i;
@@ -142,8 +147,8 @@ impl TextBuffer {
         {
             // Extend the anchor rightward to the end of the word it sits in.
             let new_anchor = self.buf[anchor..]
-                .char_indices()
-                .find(|(_, c)| c.is_whitespace())
+                .grapheme_indices(true)
+                .find(|(_, g)| Self::grapheme_is_word_boundary(WordDelim::WhiteSpace, g))
                 .map_or(self.buf.len(), |(i, _)| anchor + i);
             self.selection_byte = Some(new_anchor);
         } else {
@@ -157,13 +162,13 @@ impl TextBuffer {
     /// are non-whitespace.
     fn is_inside_word(buf: &str, pos: usize) -> bool {
         let prev_is_word = buf[..pos]
-            .chars()
+            .graphemes(true)
             .next_back()
-            .is_some_and(|c| !c.is_whitespace());
+            .is_some_and(|g| !Self::grapheme_is_word_boundary(WordDelim::WhiteSpace, g));
         let next_is_word = buf[pos..]
-            .chars()
+            .graphemes(true)
             .next()
-            .is_some_and(|c| !c.is_whitespace());
+            .is_some_and(|g| !Self::grapheme_is_word_boundary(WordDelim::WhiteSpace, g));
         prev_is_word && next_is_word
     }
 
@@ -195,19 +200,25 @@ impl TextBuffer {
     pub fn move_end_of_line(&mut self) {
         self.cursor_byte = self
             .buf
-            .char_indices()
+            .grapheme_indices(true)
             .skip_while(|(i, _)| *i < self.cursor_byte)
-            .find_map(|(i, c)| if c == '\n' { Some(i) } else { None })
+            .find_map(|(i, g)| if g.contains('\n') { Some(i) } else { None })
             .unwrap_or(self.buf.len());
     }
 
     pub fn move_start_of_line(&mut self) {
         self.cursor_byte = self
             .buf
-            .char_indices()
+            .grapheme_indices(true)
             .rev()
             .skip_while(|(i, _)| *i >= self.cursor_byte)
-            .find_map(|(i, c)| if c == '\n' { Some(i + 1) } else { None })
+            .find_map(|(i, g)| {
+                if g.contains('\n') {
+                    Some(i + g.len())
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0);
     }
 
@@ -256,11 +267,7 @@ impl TextBuffer {
             return;
         }
 
-        let mut pos = byte_pos.min(self.buf.len());
-        while pos > 0 && !self.buf.is_char_boundary(pos) {
-            pos -= 1;
-        }
-        self.cursor_byte = pos;
+        self.cursor_byte = Self::snap_to_grapheme_boundary_left(&self.buf, byte_pos);
     }
 }
 

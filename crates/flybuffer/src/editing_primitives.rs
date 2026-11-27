@@ -2,14 +2,20 @@ use crate::TextBuffer;
 
 impl TextBuffer {
     pub(crate) fn insert_char_no_snapshot(&mut self, c: char) {
+        self.selection_byte = None;
         self.buf.insert(self.cursor_byte, c);
-        self.cursor_byte += c.len_utf8();
+        self.cursor_byte =
+            Self::snap_to_grapheme_boundary_right(&self.buf, self.cursor_byte + c.len_utf8());
     }
 
     pub(crate) fn insert_str_no_snapshot(&mut self, s: &str) {
+        self.selection_byte = None;
         let sanitized_str = s.replace("\r\n", "\n").replace('\r', "\n"); // remove carriage returns, which can mess up the display
         self.buf.insert_str(self.cursor_byte, &sanitized_str);
-        self.cursor_byte += sanitized_str.len();
+        self.cursor_byte = Self::snap_to_grapheme_boundary_right(
+            &self.buf,
+            self.cursor_byte + sanitized_str.len(),
+        );
     }
 
     pub fn insert_char(&mut self, c: char) {

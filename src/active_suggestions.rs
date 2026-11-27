@@ -1826,7 +1826,7 @@ impl UnprocessedSuggestion {
         let mut sug = sug.to_string();
 
         if comp_result_flags.filename_completion_desired && path_to_use.is_none() {
-            path_to_use = Some(std::path::PathBuf::from(shell::backend().expand_path(&sug)));
+            path_to_use = Some(shell::backend().resolve_completion_path(&sug));
         }
 
         let effective_quote_type = comp_result_flags

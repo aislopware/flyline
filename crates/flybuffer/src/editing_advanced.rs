@@ -1,23 +1,20 @@
 use crate::{SubString, TextBuffer, WordDelim};
+use unicode_segmentation::UnicodeSegmentation;
 
 impl TextBuffer {
-    fn less_strict_class(c: char) -> u8 {
-        if c.is_whitespace() {
-            0
-        } else if c.is_ascii_punctuation() {
-            1
-        } else {
-            2
+    fn less_strict_class(g: &str) -> u8 {
+        match g.chars().next() {
+            Some(c) if c.is_whitespace() => 0,
+            Some(c) if c.is_ascii_punctuation() => 1,
+            _ => 2,
         }
     }
 
-    fn less_strict_class_slash_only(c: char) -> u8 {
-        if c.is_whitespace() {
-            0
-        } else if c == '/' || c == '\\' {
-            1
-        } else {
-            2
+    fn less_strict_class_slash_only(g: &str) -> u8 {
+        match g.chars().next() {
+            Some(c) if c.is_whitespace() => 0,
+            Some('/' | '\\') => 1,
+            _ => 2,
         }
     }
 
@@ -41,14 +38,18 @@ impl TextBuffer {
         self.move_left();
         assert!(self.cursor_byte <= old_cursor_col);
         self.buf.drain(self.cursor_byte..old_cursor_col);
+        self.cursor_byte = Self::snap_to_grapheme_boundary_left(&self.buf, self.cursor_byte);
+        self.selection_byte = None;
     }
 
     pub fn delete_right(&mut self) {
         // delete one grapheme to the right
         self.push_snapshot(true);
+        self.selection_byte = None;
         let cursor_pos_right = self.right_move_pos();
         assert!(self.cursor_byte <= cursor_pos_right);
         self.buf.drain(self.cursor_byte..cursor_pos_right);
+        self.cursor_byte = Self::snap_to_grapheme_boundary_left(&self.buf, self.cursor_byte);
     }
 
     /// Computes the target cursor byte position when moving/deleting one
@@ -60,7 +61,7 @@ impl TextBuffer {
         cursor_byte: usize,
         slash_aware: bool,
     ) -> usize {
-        let class_fn: fn(char) -> u8 =
+        let class_fn: fn(&str) -> u8 =
             if slash_aware && Self::has_slash_in_word(&self.buf, cursor_byte) {
                 Self::less_strict_class_slash_only
             } else {
@@ -68,20 +69,20 @@ impl TextBuffer {
             };
         let mut iter = self
             .buf
-            .char_indices()
+            .grapheme_indices(true)
             .rev()
             .skip_while(|(i, _)| *i >= cursor_byte);
         match iter.next() {
-            Some((first_i, first_c)) => {
-                let class = class_fn(first_c);
-                iter.scan((first_i, first_c), |prev, (i, c)| {
-                    let (prev_i, prev_c) = *prev;
-                    let boundary = if class_fn(prev_c) == class && class_fn(c) != class {
+            Some((first_i, first_g)) => {
+                let class = class_fn(first_g);
+                iter.scan((first_i, first_g), |prev, (i, g)| {
+                    let (prev_i, prev_g) = *prev;
+                    let boundary = if class_fn(prev_g) == class && class_fn(g) != class {
                         Some(prev_i)
                     } else {
                         None
                     };
-                    *prev = (i, c);
+                    *prev = (i, g);
                     Some(boundary)
                 })
                 .find_map(|x| x)
@@ -113,21 +114,24 @@ impl TextBuffer {
 
     pub fn delete_one_word_left(&mut self, delim: WordDelim) {
         self.push_snapshot(true);
+        self.selection_byte = None;
         let old_cursor_col = self.cursor_byte;
 
         // First, find the position reached by skipping back over any contiguous
         // run of whitespace immediately before the cursor.
         let after_ws_skip = self.buf[..old_cursor_col]
-            .char_indices()
+            .grapheme_indices(true)
             .rev()
-            .find(|(_, c)| !c.is_whitespace())
-            .map_or(0, |(i, c)| i + c.len_utf8());
-        let ws_chars = self.buf[after_ws_skip..old_cursor_col].chars().count();
+            .find(|(_, g)| !g.chars().next().is_some_and(char::is_whitespace))
+            .map_or(0, |(i, g)| i + g.len());
+        let ws_graphemes = self.buf[after_ws_skip..old_cursor_col]
+            .graphemes(true)
+            .count();
 
-        // If there are 2+ contiguous whitespace chars before the cursor, just
-        // delete the whitespace and stop. Otherwise (0 or 1 ws chars), also
+        // If there are 2+ contiguous whitespace graphemes before the cursor, just
+        // delete the whitespace and stop. Otherwise (0 or 1 ws graphemes), also
         // consume the previous word using the per-delim word-boundary logic.
-        let new_cursor = if ws_chars >= 2 {
+        let new_cursor = if ws_graphemes >= 2 {
             after_ws_skip
         } else if delim == WordDelim::WhiteSpace {
             self.move_one_word_left_pos(WordDelim::WhiteSpace)
@@ -136,15 +140,17 @@ impl TextBuffer {
         };
 
         assert!(new_cursor <= old_cursor_col);
-        self.cursor_byte = new_cursor;
         self.buf.drain(new_cursor..old_cursor_col);
+        self.cursor_byte = Self::snap_to_grapheme_boundary_left(&self.buf, new_cursor);
     }
 
     pub fn delete_right_one_word(&mut self, delim: WordDelim) {
         self.push_snapshot(true);
+        self.selection_byte = None;
         let end_cursor = right_one_word_end_pos_in(&self.buf, self.cursor_byte, delim);
         assert!(end_cursor >= self.cursor_byte);
         self.buf.drain(self.cursor_byte..end_cursor);
+        self.cursor_byte = Self::snap_to_grapheme_boundary_left(&self.buf, self.cursor_byte);
     }
 
     pub fn replace_word_under_cursor(
@@ -195,7 +201,11 @@ impl TextBuffer {
                     start: actual_start,
                 });
             }
-            start = actual_start + 1;
+            let step = self.buf[actual_start..]
+                .chars()
+                .next()
+                .map_or(1, char::len_utf8);
+            start = actual_start + step;
         }
         None
     }
@@ -209,34 +219,39 @@ impl TextBuffer {
 
     pub fn delete_until_start_of_line(&mut self) {
         self.push_snapshot(true);
+        self.selection_byte = None;
         let old_cursor = self.cursor_byte;
         self.move_start_of_line();
         self.buf.drain(self.cursor_byte..old_cursor);
+        self.cursor_byte = Self::snap_to_grapheme_boundary_left(&self.buf, self.cursor_byte);
     }
 
     pub fn delete_until_end_of_line(&mut self) {
         self.push_snapshot(true);
+        self.selection_byte = None;
         let old_cursor = self.cursor_byte;
         self.move_end_of_line();
         self.buf.drain(old_cursor..self.cursor_byte);
-        self.cursor_byte = old_cursor;
+        self.cursor_byte = Self::snap_to_grapheme_boundary_left(&self.buf, old_cursor);
     }
 }
 
 /// `&str`-based core of [`TextBuffer::fine_grained_word_right_pos_from`].
 fn fine_grained_word_right_pos_in(buf: &str, cursor_byte: usize, slash_aware: bool) -> usize {
     let end = buf.len();
-    let class_fn: fn(char) -> u8 = if slash_aware && TextBuffer::has_slash_in_word(buf, cursor_byte)
+    let class_fn: fn(&str) -> u8 = if slash_aware && TextBuffer::has_slash_in_word(buf, cursor_byte)
     {
         TextBuffer::less_strict_class_slash_only
     } else {
         TextBuffer::less_strict_class
     };
-    let mut iter = buf.char_indices().skip_while(|(i, _)| *i < cursor_byte);
+    let mut iter = buf
+        .grapheme_indices(true)
+        .skip_while(|(i, _)| *i < cursor_byte);
     match iter.next() {
-        Some((_, first_c)) => {
-            let class = class_fn(first_c);
-            iter.find_map(|(i, c)| if class_fn(c) != class { Some(i) } else { None })
+        Some((_, first_g)) => {
+            let class = class_fn(first_g);
+            iter.find_map(|(i, g)| if class_fn(g) != class { Some(i) } else { None })
                 .unwrap_or(end)
         }
         None => end,
@@ -251,21 +266,21 @@ pub(crate) fn right_one_word_end_pos_in(buf: &str, start_cursor: usize, delim: W
     // First, find the position reached by skipping forward over any
     // contiguous run of whitespace immediately after `start_cursor`.
     let after_ws_skip = buf[start_cursor..]
-        .char_indices()
-        .find(|(_, c)| !c.is_whitespace())
+        .grapheme_indices(true)
+        .find(|(_, g)| !g.chars().next().is_some_and(char::is_whitespace))
         .map_or(end, |(i, _)| start_cursor + i);
-    let ws_chars = buf[start_cursor..after_ws_skip].chars().count();
+    let ws_graphemes = buf[start_cursor..after_ws_skip].graphemes(true).count();
 
-    // If there are 2+ contiguous whitespace chars, just consume the
-    // whitespace. Otherwise (0 or 1 ws chars), also consume the next word
+    // If there are 2+ contiguous whitespace graphemes, just consume the
+    // whitespace. Otherwise (0 or 1 ws graphemes), also consume the next word
     // using the per-delim word-boundary logic.
-    if ws_chars >= 2 {
+    if ws_graphemes >= 2 {
         after_ws_skip
     } else if delim == WordDelim::WhiteSpace {
-        buf.char_indices()
+        buf.grapheme_indices(true)
             .skip_while(|(i, _)| *i <= start_cursor)
-            .skip_while(|(_, c)| delim.is_word_boundary(*c))
-            .find(|(_, c)| delim.is_word_boundary(*c))
+            .skip_while(|(_, g)| g.chars().next().is_some_and(|c| delim.is_word_boundary(c)))
+            .find(|(_, g)| g.chars().next().is_some_and(|c| delim.is_word_boundary(c)))
             .map_or(end, |(i, _)| i)
     } else {
         fine_grained_word_right_pos_in(buf, after_ws_skip, true)
@@ -714,5 +729,56 @@ mod test_editing_advanced {
         // Empty word
         let tb = TextBuffer::new_with_cursor("hello █world");
         assert!(tb.is_cursor_on_s("").is_none());
+
+        // Multi-byte UTF-8 match occurring before the cursor must not panic when
+        // advancing the search offset past the first match.
+        let tb = TextBuffer::new_with_cursor("世界 foo 世界█");
+        let sub = tb.is_cursor_on_s("世界").unwrap();
+        assert_eq!(sub.s, "世界");
+        assert_eq!(sub.start, "世界 foo ".len());
+    }
+
+    #[test]
+    fn grapheme_boundaries_preserved_across_combining_marks_zwj_and_crlf() {
+        // Inserting a base character before a lone combining mark fuses them into
+        // one grapheme; cursor must snap to a grapheme boundary.
+        let mut tb = TextBuffer::new("\u{0301}");
+        tb.move_to_start();
+        tb.insert_str("世界");
+        assert_eq!(tb.buffer(), "世界\u{0301}");
+        assert_eq!(tb.cursor_byte, tb.buffer().len());
+
+        // Word movement across punctuation/whitespace with combining mark must not
+        // split the grapheme cluster.
+        let mut tb = TextBuffer::new("-\u{0301} abc");
+        tb.move_to_start();
+        tb.move_one_word_right_fine_grained();
+        assert_eq!(tb.cursor_byte, "-\u{0301}".len());
+        tb.move_one_word_left_fine_grained();
+        assert_eq!(tb.cursor_byte, 0);
+
+        // Moving to end/start of line across CRLF must not split `\r\n`.
+        let mut tb = TextBuffer::new("hi\r\nbye");
+        tb.move_to_start();
+        tb.move_end_of_line();
+        assert_eq!(tb.cursor_byte, 2);
+        tb.move_to_end();
+        tb.move_start_of_line();
+        assert_eq!(tb.cursor_byte, 4);
+
+        // Clicking/anchoring inside a ZWJ emoji must snap to a grapheme boundary.
+        let mut tb = TextBuffer::new("a👩‍💻b");
+        tb.try_move_cursor_to_byte_pos(5, false);
+        assert_eq!(tb.cursor_byte, 1);
+        tb.set_selection_anchor(8);
+        assert_eq!(tb.selection_byte(), Some(1));
+
+        // Deleting while a selection is active must not leave an out-of-bounds anchor.
+        let mut tb = TextBuffer::new("hello world");
+        tb.select_entire_buffer();
+        tb.move_to_start();
+        tb.set_selection_anchor(11);
+        tb.delete_right_one_word(WordDelim::WhiteSpace);
+        assert!(tb.selection_byte().is_none());
     }
 }
