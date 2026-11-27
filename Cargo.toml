@@ -17,7 +17,7 @@ flybuffer = { path = "crates/flybuffer" }
 flycontent = { path = "crates/flycontent" }
 
 anyhow = "1.0"
-clap = { version = "4.6.9", features = ["derive"] }
+clap = { version = "4.6.10", features = ["derive"] }
 clap_complete = { version = "4.6.12", features = ["unstable-dynamic"] }
 easing-function = "0.1"
 itertools = "0.15"
@@ -33,7 +33,7 @@ unicode-segmentation = "1.13"
 unicode-width = { version = "0.2", default-features = false }
 
 # crates.io release; [patch.crates-io] points its ratatui-core at the fork below.
-ansi-to-tui = "8.0.1"
+ansi-to-tui = "9.0.0"
 # Vendored forks (vendor/README.md): changes flyline needs that upstream does not have.
 ratatui = { path = "vendor/ratatui/ratatui", default-features = false, features = ["macros", "serde", "termina", "unstable-backend-writer", "unstable-rendered-line-info"] }
 skim = { path = "vendor/skim", default-features = false, features = ["algos_only"] }
