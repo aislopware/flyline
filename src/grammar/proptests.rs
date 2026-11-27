@@ -152,6 +152,9 @@ fn structured_bash_command() -> impl Strategy<Value = String> {
         Just("(( 1 + 2 ))".to_string()),
         Just("[[ ( a == b ) ]]".to_string()),
         Just("echo `echo ok`".to_string()),
+        Just("`true`".to_string()),
+        Just("echo do then else elif".to_string()),
+        Just("echo a \\\n b".to_string()),
         Just("echo ${HOME:-/tmp}".to_string()),
         Just("cat <(echo hi)".to_string()),
         Just("echo a &> /dev/null".to_string()),
@@ -171,6 +174,9 @@ fn structured_bash_command() -> impl Strategy<Value = String> {
             Just(format!(
                 "case x in a) {body} ;; (b) echo 2 ;& *) echo 3 ;; esac"
             )),
+            Just(format!(
+                "case x in\n  a)\n    {body}\n    ;;\n  b)\n    echo 2\n    ;&\n  *)\n    echo 3\n    ;;&\nesac"
+            )),
             Just(format!("f() {{ {body}; }}")),
             Just(format!("f() ({body})")),
             Just(format!("time ({body})")),
@@ -183,6 +189,7 @@ fn structured_bash_command() -> impl Strategy<Value = String> {
         compound.clone(),
         prop_oneof![
             Just(" | "),
+            Just(" \\\n | "),
             Just(" |& "),
             Just(" && "),
             Just(" || "),
@@ -415,6 +422,30 @@ proptest! {
                 cmd,
                 flyline_accepts,
                 bash_accepts
+            );
+        }
+    }
+
+    #[test]
+    fn differential_valid_bash_has_no_invalid_operators(
+        cmd in structured_bash_command(),
+    ) {
+        let Some(bash) = find_system_bash() else {
+            return Ok(());
+        };
+
+        if bash_n_accepts(&bash, &cmd) == Some(true) {
+            let tokens = DParser::parse_and_annotate(&cmd);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            prop_assert!(
+                invalid_vals.is_empty(),
+                "false-positive invalid operators {:?} for valid bash command {:?}",
+                invalid_vals,
+                cmd
             );
         }
     }

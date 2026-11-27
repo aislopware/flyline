@@ -582,6 +582,24 @@ impl DParser {
                 | TokenKind::While
                 | TokenKind::Until
                 | TokenKind::Select => in_plain_word_context,
+                TokenKind::Then | TokenKind::Elif | TokenKind::Else => {
+                    in_plain_word_context
+                        || self.current_command_range.is_some()
+                        || !matches!(nestings.last().map(|(_, k)| k), Some(TokenKind::If))
+                }
+                TokenKind::Do => {
+                    in_plain_word_context
+                        || self.current_command_range.is_some()
+                        || !matches!(
+                            nestings.last().map(|(_, k)| k),
+                            Some(
+                                TokenKind::For
+                                    | TokenKind::While
+                                    | TokenKind::Until
+                                    | TokenKind::Select
+                            )
+                        )
+                }
                 TokenKind::In => !Self::is_in_header_context(&self.tokens, &nestings, idx),
                 TokenKind::Fi | TokenKind::Done | TokenKind::Esac => !self
                     .nested_closing_satisfied(
@@ -1275,11 +1293,44 @@ impl DParser {
                 continue;
             }
 
+            // A standalone `\` immediately followed by a newline is a Bash line
+            // continuation (`\<newline>`), which Bash removes before tokenizing.
+            // Skip both tokens so the previous operator state is preserved
+            // across the continued line (e.g. `echo a \\\n | cat` stays valid,
+            // while `echo a; \\\n | cat` still flags `|`).
+            if matches!(kind, TokenKind::Word(w) if w == "\\")
+                && self
+                    .tokens
+                    .get(i + 1)
+                    .is_some_and(|next| matches!(next.token.kind, TokenKind::Newline))
+            {
+                i += 2;
+                continue;
+            }
+
             if matches!(kind, TokenKind::Newline) {
-                // Newlines after `|`, `|&`, `||`, `&&` continue the compound
-                // expression; after anything else they start a fresh command.
-                if prev_state != PrevState::ControlContinuation {
-                    prev_state = PrevState::CommandStart;
+                // If the immediately preceding unquoted word ended with an odd
+                // number of backslashes (e.g. `echo a\\\n | cat`), this newline
+                // is a line continuation and must preserve the previous state.
+                let is_line_continuation = i > 0
+                    && !self.tokens[i - 1].annotations.is_inside_single_quotes
+                    && !self.tokens[i - 1].annotations.is_inside_double_quotes
+                    && matches!(
+                        &self.tokens[i - 1].token.kind,
+                        TokenKind::Word(w)
+                            if w.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+                    );
+                if !is_line_continuation {
+                    // Newlines after `|`, `|&`, `||`, `&&` continue the compound
+                    // expression; newlines after a case terminator (`;;`, `;&`,
+                    // `;;&`) keep `CaseTerminator` so a stray `;;\n;;` is still
+                    // flagged; after anything else they start a fresh command.
+                    if !matches!(
+                        prev_state,
+                        PrevState::ControlContinuation | PrevState::CaseTerminator
+                    ) {
+                        prev_state = PrevState::CommandStart;
+                    }
                     prev_idx = None;
                 }
                 i += 1;
@@ -1382,8 +1433,10 @@ impl DParser {
                 }
                 PrevState::CommandStart => {
                     // Control operators cannot start a command (e.g. `| cat`, `& echo`,
-                    // `; echo`, `&& echo`).
-                    if is_any_control {
+                    // `; echo`, `&& echo`). Inside `case`, a clause terminator (`;;`,
+                    // `;&`, `;;&`) may appear on its own line after a newline.
+                    let allowed_case_end = is_case_terminator && case_depth > 0;
+                    if is_any_control && !allowed_case_end {
                         invalid[i] = true;
                     }
                 }
@@ -1396,7 +1449,6 @@ impl DParser {
                     | TokenKind::CmdSubst
                     | TokenKind::ProcessSubstIn
                     | TokenKind::ProcessSubstOut
-                    | TokenKind::Backtick
                     | TokenKind::If
                     | TokenKind::Then
                     | TokenKind::Elif
@@ -1404,8 +1456,9 @@ impl DParser {
                     | TokenKind::Do
                     | TokenKind::While
                     | TokenKind::Until
-            ) || (matches!(kind, TokenKind::LBrace)
-                && ann.command_word.is_some());
+            ) || (matches!(kind, TokenKind::Backtick)
+                && ann.opening.is_some())
+                || (matches!(kind, TokenKind::LBrace) && ann.command_word.is_some());
 
             prev_state = if is_redir_needs_target {
                 PrevState::RedirNeedsTarget
@@ -3519,6 +3572,155 @@ mod test_keyword_bracket_color {
     }
 
     #[test]
+    fn test_closing_backtick_not_treated_as_command_opener() {
+        for input in [
+            "echo `echo hi` | cat",
+            "echo `date`; ls",
+            "`true` && echo ok",
+            "echo \"`echo hi`\" | cat",
+            "echo `` | cat",
+        ] {
+            let tokens = DParser::parse_and_annotate(input);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            assert!(
+                invalid_vals.is_empty(),
+                "expected no invalid tokens in {input:?}, got {invalid_vals:?}"
+            );
+        }
+
+        // An operator right after an *opening* backtick is still invalid.
+        let tokens = DParser::parse_and_annotate("echo `| cat`");
+        let invalid_vals: Vec<&str> = tokens
+            .iter()
+            .filter(|t| t.annotations.is_invalid)
+            .map(|t| t.token.value.as_str())
+            .collect();
+        assert_eq!(invalid_vals, vec!["|"]);
+    }
+
+    #[test]
+    fn test_multiline_case_terminators_not_invalid() {
+        for input in [
+            "case $x in\n  a)\n    echo 1\n    ;;\nesac",
+            "case $x in\n  a)\n    echo 1\n    ;&\n  b)\n    echo 2\n    ;;&\n  c)\n    ;;\nesac",
+        ] {
+            let tokens = DParser::parse_and_annotate(input);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            assert!(
+                invalid_vals.is_empty(),
+                "expected no invalid tokens in {input:?}, got {invalid_vals:?}"
+            );
+        }
+
+        // Consecutive case terminators across a newline remain invalid.
+        let tokens =
+            DParser::parse_and_annotate("case $x in\n  a)\n    echo 1\n    ;;\n    ;;\nesac");
+        let invalid_vals: Vec<&str> = tokens
+            .iter()
+            .filter(|t| t.annotations.is_invalid)
+            .map(|t| t.token.value.as_str())
+            .collect();
+        assert_eq!(invalid_vals, vec![";;"]);
+    }
+
+    #[test]
+    fn test_keywords_as_plain_arguments_not_invalid() {
+        for input in [
+            "echo do | cat",
+            "echo then && echo ok",
+            "echo else; ls",
+            "echo elif | cat",
+            "if true; then echo then && echo else; fi",
+            "for x in do; do echo do | cat; done",
+            "case $x in\n  then|else)\n    echo ok\n    ;;\nesac",
+        ] {
+            let tokens = DParser::parse_and_annotate(input);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            assert!(
+                invalid_vals.is_empty(),
+                "expected no invalid tokens in {input:?}, got {invalid_vals:?}"
+            );
+        }
+
+        // Verify they are normalized to plain Word tokens in argument position.
+        let tokens = DParser::parse_and_annotate("echo do then else elif");
+        for word in ["do", "then", "else", "elif"] {
+            let tok = tokens
+                .iter()
+                .find(|t| t.token.value == word)
+                .unwrap_or_else(|| panic!("missing token {word:?}"));
+            assert_eq!(tok.token.kind, TokenKind::Word(word.to_string()));
+        }
+
+        // Real `then` / `do` in keyword position still flag a following control operator.
+        for (input, expected) in [
+            ("if true; then | cat; fi", vec!["|"]),
+            ("for x in 1; do | cat; done", vec!["|"]),
+        ] {
+            let tokens = DParser::parse_and_annotate(input);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            assert_eq!(invalid_vals, expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_line_continuation_before_operator_not_invalid() {
+        for input in [
+            "echo a \\\n | cat",
+            "echo a\\\n | cat",
+            "echo a \\\n| cat",
+            "echo a \\\n && echo b",
+            "echo a \\\n ; ls",
+            "echo a \\\n \\\n | cat",
+            "echo a > \\\n out.txt",
+        ] {
+            let tokens = DParser::parse_and_annotate(input);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            assert!(
+                invalid_vals.is_empty(),
+                "expected no invalid tokens in {input:?}, got {invalid_vals:?}"
+            );
+        }
+
+        // Invalid operator sequences across a line continuation or after an
+        // escaped (even) backslash before newline remain flagged.
+        for (input, expected) in [
+            ("\\\n | cat", vec!["|"]),
+            ("echo a; \\\n | cat", vec!["|"]),
+            ("echo a > \\\n | cat", vec!["|"]),
+            ("echo a \\\\\n | cat", vec!["|"]),
+        ] {
+            let tokens = DParser::parse_and_annotate(input);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            assert_eq!(invalid_vals, expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
     fn test_invalid_redirection_and_control_operators_flagged() {
         let invalid_cases: &[(&str, &[&str])] = &[
             ("echo a &| cat", &["&", "|"]),
@@ -3534,11 +3736,13 @@ mod test_keyword_bracket_color {
             ("echo a ||| echo b", &["||", "|"]),
             ("echo a & | cat", &["|"]),
             ("echo a | | cat", &["|"]),
+            ("echo && && x", &["&&"]),
             ("echo a > | cat", &["|"]),
             ("echo a >>(cat)", &[">>", "("]),
             ("echo a ;& echo b", &[";&"]),
             ("echo a ;;& echo b", &[";;&"]),
             ("echo a ;; echo b", &[";;"]),
+            ("ls ;; ls", &[";;"]),
             ("| cat", &["|"]),
             ("& echo a", &["&"]),
             ("; echo a", &[";"]),
