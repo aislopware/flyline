@@ -525,6 +525,7 @@ fn gen_completions_uncomitted(
                     word_under_cursor.as_ref(),
                     Some(word_left.len()),
                 );
+                let completions = apply_fignore(completions);
 
                 log::debug!(
                     "CompType::FilenameExpansion found {} completions for pattern: {}",
@@ -550,6 +551,7 @@ fn gen_completions_uncomitted(
                 }
                 let (completions, _comp_res_flags) =
                     tab_complete_fuzzy_filename(completion_context);
+                let completions = apply_fignore(completions);
 
                 log::debug!(
                     "CompType::FuzzyFilenameExpansion found {} completions for pattern: {}",
@@ -570,6 +572,55 @@ fn gen_completions_uncomitted(
 
     log::debug!("No completion types produced result");
     None
+}
+
+/// Filter filename completion candidates using Bash's `FIGNORE` shell variable
+/// and `shopt force_fignore`.
+///
+/// `FIGNORE` is a colon-separated list of filename suffixes to ignore (empty
+/// entries are ignored). Suffixes match the unquoted entry basename of both
+/// files and directories, including when the basename equals the suffix. If all
+/// candidates would be ignored and `force_fignore` is disabled, the unfiltered
+/// candidates are returned.
+fn apply_fignore(suggestions: Vec<UnprocessedSuggestion>) -> Vec<UnprocessedSuggestion> {
+    if suggestions.is_empty() {
+        return suggestions;
+    }
+    let Some(fignore) = shell::backend().env_var("FIGNORE") else {
+        return suggestions;
+    };
+    let suffixes: Vec<&str> = fignore.split(':').filter(|s| !s.is_empty()).collect();
+    if suffixes.is_empty() {
+        return suggestions;
+    }
+
+    let keep_flags: Vec<bool> = suggestions
+        .iter()
+        .map(|s| {
+            let name_cow: std::borrow::Cow<'_, str> = s
+                .full_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_else(|| {
+                    let trimmed = s.match_text().trim_end_matches('/');
+                    let dequoted = shell::dequoting_function_rust(trimmed);
+                    let base = dequoted.rsplit('/').next().unwrap_or(&dequoted).to_string();
+                    std::borrow::Cow::Owned(base)
+                });
+            !suffixes.iter().any(|suffix| name_cow.ends_with(suffix))
+        })
+        .collect();
+
+    if keep_flags.iter().any(|&keep| keep) || shell::backend().is_force_fignore_enabled() {
+        suggestions
+            .into_iter()
+            .zip(keep_flags)
+            .filter_map(|(s, keep)| keep.then_some(s))
+            .collect()
+    } else {
+        suggestions
+    }
 }
 
 fn filter_out_non_executables(paths: Vec<UnprocessedSuggestion>) -> Vec<UnprocessedSuggestion> {
@@ -609,7 +660,7 @@ fn tab_complete_first_word(command: &str, word_under_cursor: &str) -> ActiveSugg
         let pattern = command.to_string() + "*";
         let (files, _comp_res_flags) =
             tab_complete_glob_expansion(&pattern, word_under_cursor, Some(command.len()));
-        let executable_files = filter_out_non_executables(files);
+        let executable_files = apply_fignore(filter_out_non_executables(files));
         return ActiveSuggestionsBuilder::from_unprocessed(executable_files);
     }
 
@@ -668,7 +719,7 @@ fn tab_complete_fuzzy_first_word(command: &str) -> ActiveSuggestionsBuilder {
 
     if command.starts_with('.') || command.contains('/') || command.starts_with('~') {
         let (fuzzy_files, _comp_res_flags) = tab_complete_fuzzy_filename_from_word(command);
-        let executable_files = filter_out_non_executables(fuzzy_files);
+        let executable_files = apply_fignore(filter_out_non_executables(fuzzy_files));
         return ActiveSuggestionsBuilder::from_unprocessed(executable_files);
     }
 
@@ -2907,6 +2958,121 @@ mod tab_completion_tests {
                 .collect();
             assert!(on_glob.contains(&".bashrc".to_string()), "got {:?}", on_glob);
 
+            let _ = shell::backend().unset_env_var("BASHOPTS");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn fignore_filters_filename_completions() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = std::env::temp_dir().join(format!(
+                "flyline_fignore_test_{}",
+                rand::random::<u32>()
+            ));
+            std::fs::create_dir_all(dir.join("cache.tmp")).unwrap();
+            std::fs::create_dir_all(dir.join("only_ignored")).unwrap();
+            std::fs::write(dir.join("main.c"), "").unwrap();
+            std::fs::write(dir.join("main.o"), "").unwrap();
+            std::fs::write(dir.join("notes.txt~"), "").unwrap();
+            std::fs::write(dir.join("only_ignored/.swp"), "").unwrap();
+            std::fs::write(dir.join("only_ignored/foo.o"), "").unwrap();
+            std::fs::write(dir.join("script.sh"), "#!/bin/sh\n").unwrap();
+            std::fs::write(dir.join("script.o"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(dir.join("script.sh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::set_permissions(dir.join("script.o"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::env::set_current_dir(&dir).unwrap();
+
+            shell::backend()
+                .export_env_var("FIGNORE", "~:.swp:.o:.tmp")
+                .unwrap();
+            shell::backend()
+                .export_env_var("BASHOPTS", "checkwinsize:force_fignore")
+                .unwrap();
+
+            // Standard filename completion ignores matching files AND directories.
+            let ls_all: Vec<String> = run_completion("ls ").into_iter().map(|s| s.s).collect();
+            assert!(ls_all.contains(&"main.c".to_string()), "got {:?}", ls_all);
+            assert!(ls_all.contains(&"script.sh".to_string()), "got {:?}", ls_all);
+            assert!(!ls_all.contains(&"main.o".to_string()), "got {:?}", ls_all);
+            assert!(!ls_all.contains(&"notes.txt~".to_string()), "got {:?}", ls_all);
+            assert!(!ls_all.contains(&"cache.tmp".to_string()), "got {:?}", ls_all);
+            assert!(!ls_all.contains(&"script.o".to_string()), "got {:?}", ls_all);
+
+            // Prefix matching only returns non-ignored match.
+            let ls_main: Vec<String> = run_completion("ls main").into_iter().map(|s| s.s).collect();
+            assert_eq!(ls_main, vec!["main.c"]);
+
+            // First-word executable path completion also respects FIGNORE.
+            let first_word: Vec<String> = run_completion("./scr")
+                .into_iter()
+                .map(|s| format!("{}{}", s.prefix, s.s))
+                .collect();
+            assert_eq!(first_word, vec!["./script.sh"]);
+
+            // Explicit glob expansion is NOT filtered by FIGNORE (matches Bash).
+            let glob_o: Vec<String> = run_auto_start_completion("ls *.o")
+                .into_iter()
+                .map(|s| s.s)
+                .collect();
+            assert!(glob_o.contains(&"main.o".to_string()), "got {:?}", glob_o);
+            assert!(glob_o.contains(&"script.o".to_string()), "got {:?}", glob_o);
+
+            // Filename equal to the FIGNORE suffix is also ignored when force_fignore is enabled.
+            let dot_swp_forced: Vec<String> =
+                run_completion("ls only_ignored/.sw")
+                    .into_iter()
+                    .map(|s| s.s)
+                    .collect();
+            assert!(dot_swp_forced.is_empty(), "got {:?}", dot_swp_forced);
+
+            // When all matches are ignored and force_fignore is ON, result is empty.
+            let only_o_forced: Vec<String> =
+                run_completion("ls only_ignored/foo.o")
+                    .into_iter()
+                    .map(|s| s.s)
+                    .collect();
+            assert!(only_o_forced.is_empty(), "got {:?}", only_o_forced);
+
+            // Fuzzy filename completion also respects FIGNORE.
+            let fuzzy_o_forced: Vec<String> =
+                run_completion("ls only_ignored/fo")
+                    .into_iter()
+                    .map(|s| s.s)
+                    .collect();
+            assert!(fuzzy_o_forced.is_empty(), "got {:?}", fuzzy_o_forced);
+
+            // When force_fignore is OFF and all matches would be ignored, return them unfiltered.
+            shell::backend()
+                .export_env_var("BASHOPTS", "checkwinsize")
+                .unwrap();
+            let only_o_unforced: Vec<String> =
+                run_completion("ls only_ignored/foo.o")
+                    .into_iter()
+                    .map(|s| s.s)
+                    .collect();
+            assert_eq!(only_o_unforced, vec!["foo.o"]);
+
+            let dot_swp_unforced: Vec<String> =
+                run_completion("ls only_ignored/.sw")
+                    .into_iter()
+                    .map(|s| s.s)
+                    .collect();
+            assert_eq!(dot_swp_unforced, vec![".swp"]);
+
+            // Empty or colon-only FIGNORE ignores nothing.
+            shell::backend().export_env_var("FIGNORE", "::").unwrap();
+            shell::backend()
+                .export_env_var("BASHOPTS", "checkwinsize:force_fignore")
+                .unwrap();
+            let empty_fignore: Vec<String> =
+                run_completion("ls main").into_iter().map(|s| s.s).collect();
+            assert!(empty_fignore.contains(&"main.c".to_string()));
+            assert!(empty_fignore.contains(&"main.o".to_string()));
+
+            let _ = shell::backend().unset_env_var("FIGNORE");
             let _ = shell::backend().unset_env_var("BASHOPTS");
             let _ = std::fs::remove_dir_all(&dir);
         }

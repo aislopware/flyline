@@ -295,6 +295,14 @@ pub trait ShellBackend: Sync {
             .is_some_and(|opts| opts.split(':').any(|opt| opt == "dotglob"))
     }
 
+    /// True if the shell has `shopt -s force_fignore` enabled (Bash default: `true`).
+    fn is_force_fignore_enabled(&self) -> bool {
+        match self.env_var("BASHOPTS") {
+            Some(opts) => opts.split(':').any(|opt| opt == "force_fignore"),
+            None => true,
+        }
+    }
+
     /// Called when the line editor UI enters and prepares terminal mode.
     fn prep_terminal(&self) {}
 
