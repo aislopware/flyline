@@ -6,6 +6,17 @@ pub fn will_bash_accept_buffer(buffer: &str) -> bool {
     // e.g. unclosed quotes, unclosed parens/braces/brackets, etc.
     // its ok if there are syntax errors, as long as the command is "complete"
 
+    // `echo a \` + newline: the user continued the line and is now on a blank
+    // continuation line. Bash drops the escaped newline and reads what is left,
+    // so Enter here runs `echo a` rather than asking for yet another line.
+    // (Inside single quotes the backslash is literal, but the quote is unclosed
+    // either way, so the answer is the same.)
+    if let Some(continued) = buffer.trim_end_matches([' ', '\t']).strip_suffix("\\\n")
+        && continued.chars().rev().take_while(|c| *c == '\\').count() % 2 == 0
+    {
+        return will_bash_accept_buffer(continued);
+    }
+
     let tokens: Vec<Token> = collect_tokens_include_whitespace(buffer);
 
     if cfg!(test) {
@@ -213,7 +224,14 @@ pub(super) mod tests {
         assert!(!will_bash_accept_buffer("cat <<-EOF\nfoo\n  EOF"));
 
         // Trailing comments on delimiter line are allowed
-        assert!(will_bash_accept_buffer("cat <<EOF\nfoo\nEOF # comment"));
+        // Bash compares the whole line with the delimiter (bash -n warns
+        // "here-document delimited by end-of-file" for both).
+        assert!(!will_bash_accept_buffer("cat <<EOF\nfoo\nEOF # comment"));
+        assert!(!will_bash_accept_buffer("cat <<EOF\nfoo\nEOF "));
+        // A `<<EOF` inside a body is text: the last line closes the only heredoc.
+        assert!(will_bash_accept_buffer(
+            "cat <<EOF\nEOF | cat <<EOF\necho hi\nEOF"
+        ));
 
         // Empty heredoc body
         assert!(will_bash_accept_buffer("cat <<EOF\nEOF"));
@@ -675,6 +693,13 @@ pub(super) mod tests {
             "echo \"hello $USER\"",
             "echo $'hello\\''",
             "echo a | cat",
+            "echo a \\\n",
+            "if true; then \\\n",
+            "echo 'a \\\n",
+            "echo a \\\\\n",
+            "case x in a) echo 1 ;; esac \\\n",
+            "! (echo a \\\n b) \\\n ",
+            "f() (echo hi) \\\n ",
             "echo a |& cat",
             "echo a &> /dev/null",
             "echo a &>> /dev/null",

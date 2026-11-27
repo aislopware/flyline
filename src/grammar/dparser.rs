@@ -527,10 +527,13 @@ impl DParser {
                 _ => false,
             });
 
+        // Bash compares the whole line with the delimiter: `EOF ` or `EOF # done`
+        // does not end the here-document.
         let valid_after = self.tokens[idx + 1..]
             .iter()
             .take_while(|t| t.token.position.line == line && t.token.kind != TokenKind::Newline)
-            .all(|t| matches!(t.token.kind, TokenKind::Whitespace(_) | TokenKind::Comment));
+            .next()
+            .is_none();
 
         valid_before && valid_after
     }
@@ -818,7 +821,9 @@ impl DParser {
                 }
                 TokenKind::HereDoc { delimiter, quoted }
                 | TokenKind::HereDocDash { delimiter, quoted } => {
-                    if !delimiter.is_empty() {
+                    // `<<EOF` on a line of a here-document body is body text,
+                    // not a new here-document.
+                    if !delimiter.is_empty() && active_heredoc_opening_idx.is_none() {
                         let depth = nestings.len();
                         self.tokens[idx].annotations.opening = Some(OpeningState::Unmatched);
                         self.tokens[idx].annotations.bracket_depth = Some(depth);
