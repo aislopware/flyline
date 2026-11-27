@@ -531,20 +531,60 @@ pub(crate) fn format_large_scalar_var_tooltip(
     format!("{header}{body}…")
 }
 
-/// Run `func` with `STDOUT_FILENO` redirected to an anonymous pipe while a
-/// dedicated reader thread drains the pipe concurrently.
+/// Create a private, immediately-unlinked temporary file for single-threaded
+/// stdout capture without pipes or background threads.
+#[cfg_attr(test, allow(dead_code))]
+fn create_unlinked_temp_file() -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+
+    let mut dirs = vec![std::env::temp_dir()];
+    let fallback = PathBuf::from("/tmp");
+    if dirs[0] != fallback {
+        dirs.push(fallback);
+    }
+
+    for dir in dirs {
+        for _ in 0..8 {
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = rand::random::<u32>();
+            let path = dir.join(format!(".flyline-stdout-{pid}-{seq}-{nonce:08x}"));
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Some(file);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    None
+}
+
+/// Run `func` with `STDOUT_FILENO` redirected to an unlinked temporary file
+/// and read back at most `max_bytes`.
 ///
-/// Draining concurrently prevents a permanent pipe-buffer deadlock whenever
-/// `func` writes more than the OS pipe capacity (16 KiB on macOS, 64 KiB on
-/// Linux; see #1065). At most `max_bytes` are retained in memory; excess bytes
-/// are still drained to EOF so the writer never blocks or hits `EPIPE`.
-/// Invalid UTF-8 bytes are replaced lossily instead of panicking across FFI.
+/// Using an unlinked temporary file avoids OS pipe-buffer deadlocks (16 KiB on
+/// macOS, 64 KiB on Linux; see #1065) while remaining strictly single-threaded
+/// and fork-safe inside GNU Bash. Invalid UTF-8 bytes are replaced lossily
+/// instead of panicking across FFI.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn capture_stdout_with_limit<F, R>(max_bytes: usize, func: F) -> (R, String, bool)
 where
     F: FnOnce() -> R,
 {
-    use std::os::unix::io::FromRawFd as _;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::os::unix::io::AsRawFd as _;
 
     struct StdoutRestoreGuard(libc::c_int);
     impl Drop for StdoutRestoreGuard {
@@ -557,90 +597,56 @@ where
         }
     }
 
-    let set_cloexec = |fd: libc::c_int| unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
-    };
-
-    let mut fds: [libc::c_int; 2] = [-1, -1];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    let Some(mut temp_file) = create_unlinked_temp_file() else {
         return (func(), String::new(), false);
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
-    set_cloexec(read_fd);
-    set_cloexec(write_fd);
+    };
 
     let original_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
     if original_stdout < 0 {
-        unsafe {
-            libc::close(read_fd);
-            libc::close(write_fd);
-        }
         return (func(), String::new(), false);
     }
-    set_cloexec(original_stdout);
-
-    // Flush any buffered C stdout before redirecting so unrelated output does
-    // not leak into the capture pipe.
-    unsafe { libc::fflush(std::ptr::null_mut()) };
-
-    if unsafe { libc::dup2(write_fd, libc::STDOUT_FILENO) } < 0 {
-        unsafe {
-            libc::close(read_fd);
-            libc::close(write_fd);
-            libc::close(original_stdout);
+    unsafe {
+        let flags = libc::fcntl(original_stdout, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(original_stdout, libc::F_SETFD, flags | libc::FD_CLOEXEC);
         }
+        // Flush any buffered C stdout before redirecting so unrelated output
+        // does not leak into the capture file.
+        libc::fflush(std::ptr::null_mut());
+    }
+
+    if unsafe { libc::dup2(temp_file.as_raw_fd(), libc::STDOUT_FILENO) } < 0 {
+        unsafe { libc::close(original_stdout) };
         return (func(), String::new(), false);
     }
-    unsafe { libc::close(write_fd) };
 
     let restore_guard = StdoutRestoreGuard(original_stdout);
-
-    let reader_handle = std::thread::Builder::new()
-        .name("flyline-stdout-capture".to_string())
-        .spawn(move || {
-            use std::io::Read as _;
-            let mut read_file = unsafe { std::fs::File::from_raw_fd(read_fd) };
-            let mut captured = Vec::with_capacity(max_bytes.min(4096));
-            let mut truncated = false;
-            let mut chunk = [0u8; 4096];
-            loop {
-                match read_file.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let remaining = max_bytes.saturating_sub(captured.len());
-                        if remaining > 0 {
-                            let take = n.min(remaining);
-                            captured.extend_from_slice(&chunk[..take]);
-                            if take < n {
-                                truncated = true;
-                            }
-                        } else {
-                            truncated = true;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            (captured, truncated)
-        });
-
-    let Ok(reader_handle) = reader_handle else {
-        drop(restore_guard);
-        unsafe { libc::close(read_fd) };
-        return (func(), String::new(), false);
-    };
-
     let result = func();
-
-    // Flush C stdio and restore STDOUT_FILENO, closing the write end of the
-    // pipe so the reader thread observes EOF and exits cleanly.
+    // Flush C stdio and restore STDOUT_FILENO before reading back.
     drop(restore_guard);
 
-    let (captured, truncated) = reader_handle.join().unwrap_or_default();
+    if temp_file.seek(SeekFrom::Start(0)).is_err() {
+        return (result, String::new(), false);
+    }
+
+    let read_limit = max_bytes.saturating_add(1);
+    let mut captured = Vec::with_capacity(read_limit.min(4096));
+    let mut chunk = [0u8; 4096];
+    while captured.len() < read_limit {
+        let remaining = read_limit - captured.len();
+        let to_read = remaining.min(chunk.len());
+        match temp_file.read(&mut chunk[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => captured.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    let truncated = captured.len() > max_bytes;
+    if truncated {
+        captured.truncate(max_bytes);
+    }
     let output = String::from_utf8_lossy(&captured).into_owned();
     (result, output, truncated)
 }
@@ -730,7 +736,10 @@ mod tests {
         assert_eq!(tb.expand_filename("a\\`b.txt"), "a`b.txt");
         assert_eq!(tb.expand_filename("\"a\\`b.txt\""), "a`b.txt");
         assert_eq!(tb.expand_filename("'a`b.txt'"), "a`b.txt");
-        assert_eq!(tb.expand_filename("a`echo pwned`b.txt"), "a`echo pwned`b.txt");
+        assert_eq!(
+            tb.expand_filename("a`echo pwned`b.txt"),
+            "a`echo pwned`b.txt"
+        );
 
         // Command substitutions and unclosed braces must also stay literal.
         assert_eq!(tb.expand_filename("$(echo hi).txt"), "$(echo hi).txt");
@@ -744,10 +753,8 @@ mod tests {
 
     #[test]
     fn resolve_completion_path_prefers_existing_literal_filename() {
-        let dir = std::env::temp_dir().join(format!(
-            "flyline_resolve_literal_{}",
-            rand::random::<u32>()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("flyline_resolve_literal_{}", rand::random::<u32>()));
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["a`b.txt", "it's.txt", "a\\b.txt", "$HOME.txt"] {
             std::fs::write(dir.join(name), "").unwrap();

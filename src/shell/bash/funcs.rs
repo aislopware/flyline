@@ -215,10 +215,10 @@ pub fn format_shell_var_uncached(name: &str) -> String {
         }
     }
 
-    let (res, output, truncated) =
-        crate::shell::capture_stdout_with_limit(crate::shell::MAX_STDOUT_CAPTURE_BYTES, || unsafe {
-            bash_symbols::show_var_attributes(&mut var, 0, 0)
-        });
+    let (res, output, truncated) = crate::shell::capture_stdout_with_limit(
+        crate::shell::MAX_STDOUT_CAPTURE_BYTES,
+        || unsafe { bash_symbols::show_var_attributes(&mut var, 0, 0) },
+    );
     if res != 0 {
         return format!("${}=", name);
     }
