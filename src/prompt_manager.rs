@@ -1118,6 +1118,17 @@ fn format_prompt_line(
     leader_active: bool,
     ps2_ctx: Option<Ps2Context>,
 ) -> TaggedLine<'static> {
+    format_prompt_line_with_times(segments, now, now, mouse_enabled, leader_active, ps2_ctx)
+}
+
+fn format_prompt_line_with_times(
+    segments: &[PromptSegment],
+    time_now: &chrono::DateTime<chrono::Local>,
+    anim_now: &chrono::DateTime<chrono::Local>,
+    mouse_enabled: bool,
+    leader_active: bool,
+    ps2_ctx: Option<Ps2Context>,
+) -> TaggedLine<'static> {
     let tagged_spans: Vec<TaggedSpan<'static>> = segments
         .iter()
         .flat_map(|segment| -> Vec<TaggedSpan<'static>> {
@@ -1147,12 +1158,17 @@ fn format_prompt_line(
                     tagged
                 }
                 PromptSegment::DynamicTime { strftime, style } => {
+                    use std::fmt::Write as _;
+                    let mut formatted = String::new();
+                    if write!(&mut formatted, "{}", time_now.format(strftime)).is_err() {
+                        formatted = strftime.clone();
+                    }
                     vec![TaggedSpan::new(
-                        Span::styled(now.format(strftime).to_string(), *style),
+                        Span::styled(formatted, *style),
                         Tag::PromptDynamicTime,
                     )]
                 }
-                PromptSegment::Animation(anim) => get_frame_spans(anim, now)
+                PromptSegment::Animation(anim) => get_frame_spans(anim, anim_now)
                     .iter()
                     .map(|span| TaggedSpan::new(span.clone(), Tag::PromptAnimation))
                     .collect(),
@@ -1553,6 +1569,7 @@ impl PromptManager {
 
             let rps1_final = shell::backend()
                 .env_var("RPS1_FINAL")
+                .or_else(|| shell::backend().env_var("RPROMPT_FINAL"))
                 .and_then(|raw| builder.expand_prompt_string(raw));
 
             let fill_span_final = shell::backend().env_var("PS1_FILL_FINAL").map(|raw| {
@@ -1610,7 +1627,15 @@ impl PromptManager {
         Option<FormattedPromptRuler>,
     ) {
         use chrono::Local;
-        let now = if show_animations {
+        let anim_now = if show_animations {
+            Local::now()
+        } else {
+            self.construction_time
+        };
+        // On final submit render (`!is_running`), always evaluate dynamic time
+        // escapes (`\t`, `\T`, `\@`, `\A`, `\D{...}`) against the actual
+        // submission timestamp even when `show_animations` is disabled.
+        let time_now = if show_animations || !is_running {
             Local::now()
         } else {
             self.construction_time
@@ -1646,7 +1671,14 @@ impl PromptManager {
             .iter_mut()
             .map(|line| {
                 advance_pending_widgets(line);
-                format_prompt_line(line, &now, mouse_enabled, leader_active, None)
+                format_prompt_line_with_times(
+                    line,
+                    &time_now,
+                    &anim_now,
+                    mouse_enabled,
+                    leader_active,
+                    None,
+                )
             })
             .collect();
 
@@ -1654,20 +1686,40 @@ impl PromptManager {
             .iter_mut()
             .map(|line| {
                 advance_pending_widgets(line);
-                format_prompt_line(line, &now, mouse_enabled, leader_active, None)
+                format_prompt_line_with_times(
+                    line,
+                    &time_now,
+                    &anim_now,
+                    mouse_enabled,
+                    leader_active,
+                    None,
+                )
             })
             .collect();
 
         advance_pending_widgets(fill_span_src);
-        let formatted_fill =
-            format_prompt_line(fill_span_src, &now, mouse_enabled, leader_active, None);
+        let formatted_fill = format_prompt_line_with_times(
+            fill_span_src,
+            &time_now,
+            &anim_now,
+            mouse_enabled,
+            leader_active,
+            None,
+        );
 
         let formatted_ruler = match prompt_ruler_src {
             PromptRuler::None => None,
             PromptRuler::EmptyLine => Some(FormattedPromptRuler::EmptyLine),
             PromptRuler::Pattern(segments) => {
                 advance_pending_widgets(segments);
-                let line = format_prompt_line(segments, &now, mouse_enabled, leader_active, None);
+                let line = format_prompt_line_with_times(
+                    segments,
+                    &time_now,
+                    &anim_now,
+                    mouse_enabled,
+                    leader_active,
+                    None,
+                );
                 Some(FormattedPromptRuler::Line(line))
             }
         };
@@ -3166,5 +3218,64 @@ mod tests {
         ));
 
         let _ = shell::backend().unset_env_var("PROMPT_RULER");
+    }
+
+    #[test]
+    fn test_rps1_final_expands_dynamic_time_on_submit_without_animations() {
+        let _ = shell::backend().export_env_var("RPS1", r"\t");
+        let _ = shell::backend().export_env_var("RPS1_FINAL", r"\t \D{%H:%M:%S}");
+
+        let mut pm = PromptManager::new(false, &[], &[], None);
+        // Simulate a prompt that has been sitting open for 2 minutes before submit.
+        let past = chrono::Local::now() - chrono::Duration::seconds(120);
+        pm.construction_time = past;
+        let past_str = past.format("%H:%M:%S").to_string();
+
+        // While running with show_animations=false, RPS1 stays pinned to construction_time.
+        let (_, rprompt_running, _, _) = pm.get_ps1_lines(false, false, false, true);
+        let running_text: String = rprompt_running
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.span.content.as_ref())
+            .collect();
+        assert_eq!(running_text, past_str);
+
+        // On submit (`is_running=false`), RPS1_FINAL expands `\t` and `\D{...}` to
+        // current submit time even when `show_animations=false`.
+        let (_, rprompt_final, _, _) = pm.get_ps1_lines(false, false, false, false);
+        let final_text: String = rprompt_final
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.span.content.as_ref())
+            .collect();
+        assert_ne!(
+            final_text,
+            format!("{past_str} {past_str}"),
+            "RPS1_FINAL should reflect submit time rather than construction_time"
+        );
+        let parts: Vec<&str> = final_text.split(' ').collect();
+        assert_eq!(parts.len(), 2, "got {final_text:?}");
+        assert_eq!(parts[0], parts[1], "\\t and \\D{{%H:%M:%S}} should match");
+        assert_eq!(parts[0].len(), 8);
+
+        let _ = shell::backend().unset_env_var("RPS1");
+        let _ = shell::backend().unset_env_var("RPS1_FINAL");
+    }
+
+    #[test]
+    fn test_rprompt_final_fallback_and_invalid_strftime_no_panic() {
+        let _ = shell::backend().unset_env_var("RPS1_FINAL");
+        let _ = shell::backend().export_env_var("RPROMPT_FINAL", r"\D{%Q}");
+
+        let mut pm = PromptManager::new(false, &[], &[], None);
+        let (_, rprompt_final, _, _) = pm.get_ps1_lines(false, false, false, false);
+        let final_text: String = rprompt_final
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.span.content.as_ref())
+            .collect();
+        assert_eq!(final_text, "%Q");
+
+        let _ = shell::backend().unset_env_var("RPROMPT_FINAL");
     }
 }
