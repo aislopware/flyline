@@ -26,7 +26,7 @@ pub fn will_bash_accept_buffer(buffer: &str) -> bool {
         )
     }) {
         match &last_token.kind {
-            TokenKind::Pipe | TokenKind::And | TokenKind::Or => {
+            TokenKind::Pipe | TokenKind::PipeAnd | TokenKind::And | TokenKind::Or => {
                 return false;
             }
             TokenKind::Word(s)
@@ -45,7 +45,33 @@ pub fn will_bash_accept_buffer(buffer: &str) -> bool {
 }
 
 fn is_function_header_without_body(tokens: &[Token]) -> bool {
-    let non_trivia: Vec<&Token> = tokens
+    // Inspect the last command slice (after any top-level separator) so
+    // `echo a; foo()` and `echo a | function bar` are also caught.
+    let mut slice_start = 0usize;
+    for (idx, tok) in tokens.iter().enumerate() {
+        if matches!(
+            tok.kind,
+            TokenKind::Semicolon
+                | TokenKind::Pipe
+                | TokenKind::PipeAnd
+                | TokenKind::And
+                | TokenKind::Or
+                | TokenKind::Background
+                | TokenKind::Newline
+        ) {
+            // Only advance if there is at least one non-trivia token after this separator.
+            if tokens[idx + 1..].iter().any(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Whitespace(_) | TokenKind::Comment | TokenKind::Newline
+                )
+            }) {
+                slice_start = idx + 1;
+            }
+        }
+    }
+
+    let non_trivia: Vec<&Token> = tokens[slice_start..]
         .iter()
         .filter(|t| {
             !matches!(
@@ -477,5 +503,231 @@ mod tests {
     #[test]
     fn test_multiline_ands() {
         assert!(!will_bash_accept_buffer("echo && \n"));
+    }
+
+    #[test]
+    fn test_issue_1045_subshells_arrays_select_and_pipe_and() {
+        // Exact reproducer from upstream #1045: unmatched opening `(` before awk.
+        let issue_1045_cmd = r#"(awk 'gsub(/\\\\/, "\\") || sub(/\\$/, "")) { prefix = prefix $0; pending = 1; next } { print prefix $0; prefix = ""; pending = 0 } END { if (pending) print prefix }' cont.txt"#;
+        assert!(!will_bash_accept_buffer(issue_1045_cmd));
+        assert!(will_bash_accept_buffer(&format!("{issue_1045_cmd})")));
+
+        // Subshells in various command positions
+        assert!(!will_bash_accept_buffer("(echo hi"));
+        assert!(will_bash_accept_buffer("(echo hi)"));
+        assert!(!will_bash_accept_buffer("echo a; (echo b"));
+        assert!(will_bash_accept_buffer("echo a; (echo b)"));
+        assert!(!will_bash_accept_buffer("echo a | (echo b"));
+        assert!(!will_bash_accept_buffer("echo a && (echo b"));
+        assert!(!will_bash_accept_buffer("echo a || (echo b"));
+        assert!(!will_bash_accept_buffer("echo a & (echo b"));
+        assert!(!will_bash_accept_buffer("( (echo hi)"));
+        assert!(will_bash_accept_buffer("( (echo hi) )"));
+        assert!(!will_bash_accept_buffer("time (echo hi"));
+        assert!(!will_bash_accept_buffer("! (echo hi"));
+        assert!(!will_bash_accept_buffer("coproc (echo hi"));
+        assert!(!will_bash_accept_buffer("case x in a) (echo 1"));
+        assert!(!will_bash_accept_buffer("echo a\n(echo b"));
+
+        // Array literal assignments
+        assert!(!will_bash_accept_buffer("arr=(1 2"));
+        assert!(will_bash_accept_buffer("arr=(1 2)"));
+        assert!(!will_bash_accept_buffer("arr+=(1 2"));
+        assert!(!will_bash_accept_buffer("local arr=(1 2"));
+        assert!(!will_bash_accept_buffer("declare -a arr=(1 2"));
+        assert!(!will_bash_accept_buffer("a=1 b=(2 3"));
+        assert!(will_bash_accept_buffer("echo foo=(1 2"));
+
+        // `select` compound commands
+        assert!(!will_bash_accept_buffer("select x in a b"));
+        assert!(!will_bash_accept_buffer("select x in a b; do echo $x"));
+        assert!(will_bash_accept_buffer("select x in a b; do echo $x; done"));
+
+        // Trailing `|&`
+        assert!(!will_bash_accept_buffer("echo a |&"));
+        assert!(!will_bash_accept_buffer("echo a |&\n"));
+        assert!(will_bash_accept_buffer("echo a |& cat"));
+
+        // Unclosed `((` with a single `)` vs nested subshell `((echo hi) )`
+        assert!(!will_bash_accept_buffer("(( 1 + 2 )"));
+        assert!(will_bash_accept_buffer("(( 1 + 2 ))"));
+        assert!(will_bash_accept_buffer("((echo hi) )"));
+
+        // Command-group `{ ... }` requires `}` in command position
+        assert!(!will_bash_accept_buffer("{ echo a }"));
+        assert!(will_bash_accept_buffer("{ echo a; }"));
+        assert!(will_bash_accept_buffer("{ echo a\n}"));
+
+        // Multiline command after newline
+        assert!(!will_bash_accept_buffer("echo a\nif true"));
+        assert!(will_bash_accept_buffer("echo a\nif true; then echo b; fi"));
+
+        // Function after pipeline / separator
+        assert!(!will_bash_accept_buffer("echo a | foo() {"));
+        assert!(will_bash_accept_buffer("echo a | foo() { echo hi; }"));
+    }
+
+    pub(crate) fn find_system_bash() -> Option<String> {
+        for candidate in ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash", "bash"] {
+            if std::process::Command::new(candidate)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return Some(candidate.to_string());
+            }
+        }
+        None
+    }
+
+    /// Ask real `bash -n` whether `cmd` is complete valid (`Some(true)`),
+    /// incomplete / expecting more input (`Some(false)`), or a non-EOF syntax
+    /// error (`None`).
+    pub(crate) fn bash_n_accepts(bash: &str, cmd: &str) -> Option<bool> {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new(bash)
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(cmd.as_bytes());
+            if !cmd.ends_with('\n') {
+                let _ = stdin.write_all(b"\n");
+            }
+        }
+        let output = child.wait_with_output().ok()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let is_incomplete = stderr.contains("unexpected end of file")
+            || stderr.contains("unexpected EOF")
+            || (stderr.contains("here-document at line")
+                && stderr.contains("delimited by end-of-file"));
+        if is_incomplete {
+            Some(false)
+        } else if output.status.success() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn differential_command_acceptance_matches_bash_n() {
+        let Some(bash) = find_system_bash() else {
+            return;
+        };
+
+        let corpus = [
+            // Simple & compound complete commands
+            "echo hello",
+            "echo 'hello world'",
+            "echo \"hello $USER\"",
+            "echo $'hello\\''",
+            "echo a | cat",
+            "echo a |& cat",
+            "echo a &> /dev/null",
+            "echo a &>> /dev/null",
+            "echo a && echo b || echo c",
+            "echo a &",
+            "echo a ;",
+            "(echo hi)",
+            "( (echo hi) )",
+            "((echo hi) )",
+            "echo a; (echo b)",
+            "{ echo a; }",
+            "{ echo a\n}",
+            "if true; then echo a; fi",
+            "if true; then echo a; elif false; then echo b; else echo c; fi",
+            "for i in 1 2 3; do echo $i; done",
+            "for ((i=0; i<3; i++)); do echo $i; done",
+            "while true; do break; done",
+            "until false; do break; done",
+            "select x in a b; do break; done",
+            "case $x in a) echo 1 ;; (b|c) echo 2 ;& *) echo 3 ;; esac",
+            "[[ a == b ]]",
+            "[[ ( a == b ) && ( c == d ) ]]",
+            "(( 1 + 2 ))",
+            "echo $(( (1 + 2) * 3 ))",
+            "echo $(echo hi)",
+            "echo `echo hi`",
+            "echo ${HOME:-/tmp}",
+            "arr=(1 2 3)",
+            "arr+=(4 5)",
+            "local arr=(1 2)",
+            "declare -a arr=(1 2)",
+            "foo() { echo hi; }",
+            "foo() ( echo hi )",
+            "function foo { echo hi; }",
+            "cat <<EOF\nhello\nEOF",
+            "cat <<'EOF'\n$(not expanded)\nEOF",
+            "cat <<-EOF\n\thello\n\tEOF",
+            "diff <(echo a) <(echo b)",
+            "echo a\nif true; then echo b; fi",
+            // Incomplete commands (bash -n reports unexpected EOF / heredoc EOF)
+            "echo 'unclosed",
+            "echo \"unclosed",
+            "echo $'hello\\'",
+            "echo a |",
+            "echo a |&",
+            "echo a &&",
+            "echo a ||",
+            "(echo hi",
+            "(awk 'gsub(/\\\\/, \"\\\\\") || sub(/\\\\$/, \"\")) { print }' cont.txt",
+            "echo a; (echo b",
+            "echo a | (echo b",
+            "echo a && (echo b",
+            "( (echo hi",
+            "( (echo hi)",
+            "time (echo hi",
+            "! (echo hi",
+            "coproc (echo hi",
+            "case x in a) (echo 1",
+            "echo a\n(echo b",
+            "{ echo a",
+            "{ echo a }",
+            "if true",
+            "if true; then echo a",
+            "for i in 1 2",
+            "for ((i=0; i<3; i++))",
+            "while true",
+            "until false",
+            "select x in a b",
+            "case $x in a) echo 1 ;;",
+            "[[ a == b",
+            "[[ ( a == b",
+            "(( 1 + 2",
+            "(( 1 + 2 )",
+            "echo $((1 + 2",
+            "echo $((1 + 2)",
+            "echo $(echo hi",
+            "echo `echo hi",
+            "echo ${foo",
+            "arr=(1 2",
+            "arr+=(1 2",
+            "local arr=(1 2",
+            "declare -a arr=(1 2",
+            "a=1 b=(2 3",
+            "foo() {",
+            "foo() (",
+            "echo a | foo() {",
+            "cat <<EOF\nhi",
+            "cat <<EOF",
+            "diff <(echo a",
+            "echo a\nif true",
+        ];
+
+        for cmd in corpus {
+            if let Some(bash_accepts) = bash_n_accepts(&bash, cmd) {
+                let flyline_accepts = will_bash_accept_buffer(cmd);
+                assert_eq!(
+                    flyline_accepts, bash_accepts,
+                    "disagreement with bash -n for {cmd:?}: flyline={flyline_accepts}, bash={bash_accepts}"
+                );
+            }
+        }
     }
 }
