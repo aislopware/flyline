@@ -486,6 +486,165 @@ fn expand_shell_var<F>(
     }
 }
 
+/// Maximum number of bytes retained when capturing redirected C stdout.
+///
+/// The reader thread always drains the pipe to EOF even after hitting this cap
+/// so the writer never blocks on a full OS pipe buffer or receives `SIGPIPE`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const MAX_STDOUT_CAPTURE_BYTES: usize = 64 * 1024;
+
+/// Maximum number of characters retained in a formatted variable tooltip.
+pub(crate) const MAX_VAR_TOOLTIP_CHARS: usize = 1024;
+
+/// Truncate a tooltip string to at most `max_chars` Unicode scalar values,
+/// appending `"…"` if characters were dropped or `already_truncated` is set.
+pub(crate) fn truncate_tooltip_text(
+    text: &str,
+    max_chars: usize,
+    already_truncated: bool,
+) -> String {
+    let mut chars = text.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    let exceeded = chars.next().is_some();
+    if exceeded || already_truncated {
+        if prefix.ends_with('…') {
+            prefix
+        } else {
+            format!("{prefix}…")
+        }
+    } else {
+        prefix
+    }
+}
+
+/// Format a bounded preview of a large plain scalar shell variable for tooltip
+/// display without invoking Bash's `show_var_attributes` on megabytes of data.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn format_large_scalar_var_tooltip(
+    name: &str,
+    raw_prefix: &str,
+    max_chars: usize,
+) -> String {
+    let header = format!("${name}=\"");
+    let body_budget = max_chars.saturating_sub(header.chars().count() + 1);
+    let body: String = raw_prefix.chars().take(body_budget).collect();
+    format!("{header}{body}…")
+}
+
+/// Run `func` with `STDOUT_FILENO` redirected to an anonymous pipe while a
+/// dedicated reader thread drains the pipe concurrently.
+///
+/// Draining concurrently prevents a permanent pipe-buffer deadlock whenever
+/// `func` writes more than the OS pipe capacity (16 KiB on macOS, 64 KiB on
+/// Linux; see #1065). At most `max_bytes` are retained in memory; excess bytes
+/// are still drained to EOF so the writer never blocks or hits `EPIPE`.
+/// Invalid UTF-8 bytes are replaced lossily instead of panicking across FFI.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn capture_stdout_with_limit<F, R>(max_bytes: usize, func: F) -> (R, String, bool)
+where
+    F: FnOnce() -> R,
+{
+    use std::os::unix::io::FromRawFd as _;
+
+    struct StdoutRestoreGuard(libc::c_int);
+    impl Drop for StdoutRestoreGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fflush(std::ptr::null_mut());
+                libc::dup2(self.0, libc::STDOUT_FILENO);
+                libc::close(self.0);
+            }
+        }
+    }
+
+    let set_cloexec = |fd: libc::c_int| unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    };
+
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return (func(), String::new(), false);
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    set_cloexec(read_fd);
+    set_cloexec(write_fd);
+
+    let original_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if original_stdout < 0 {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return (func(), String::new(), false);
+    }
+    set_cloexec(original_stdout);
+
+    // Flush any buffered C stdout before redirecting so unrelated output does
+    // not leak into the capture pipe.
+    unsafe { libc::fflush(std::ptr::null_mut()) };
+
+    if unsafe { libc::dup2(write_fd, libc::STDOUT_FILENO) } < 0 {
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            libc::close(original_stdout);
+        }
+        return (func(), String::new(), false);
+    }
+    unsafe { libc::close(write_fd) };
+
+    let restore_guard = StdoutRestoreGuard(original_stdout);
+
+    let reader_handle = std::thread::Builder::new()
+        .name("flyline-stdout-capture".to_string())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut read_file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+            let mut captured = Vec::with_capacity(max_bytes.min(4096));
+            let mut truncated = false;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match read_file.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let remaining = max_bytes.saturating_sub(captured.len());
+                        if remaining > 0 {
+                            let take = n.min(remaining);
+                            captured.extend_from_slice(&chunk[..take]);
+                            if take < n {
+                                truncated = true;
+                            }
+                        } else {
+                            truncated = true;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            (captured, truncated)
+        });
+
+    let Ok(reader_handle) = reader_handle else {
+        drop(restore_guard);
+        unsafe { libc::close(read_fd) };
+        return (func(), String::new(), false);
+    };
+
+    let result = func();
+
+    // Flush C stdio and restore STDOUT_FILENO, closing the write end of the
+    // pipe so the reader thread observes EOF and exits cleanly.
+    drop(restore_guard);
+
+    let (captured, truncated) = reader_handle.join().unwrap_or_default();
+    let output = String::from_utf8_lossy(&captured).into_owned();
+    (result, output, truncated)
+}
+
 /// The active host shell backend. Defaults to `BashBackend`.
 pub fn backend() -> &'static dyn ShellBackend {
     *ACTIVE.get_or_init(init_backend)
@@ -618,5 +777,62 @@ mod tests {
             tb.env_var("MY_TRAP_VAR"),
             Some("triggered_value".to_string())
         );
+    }
+
+    #[test]
+    fn truncate_tooltip_and_large_scalar_formatting() {
+        assert_eq!(truncate_tooltip_text("short", 10, false), "short");
+        assert_eq!(truncate_tooltip_text("short", 10, true), "short…");
+        assert_eq!(truncate_tooltip_text("abcdef", 4, false), "abcd…");
+        assert_eq!(truncate_tooltip_text("αβγδε", 3, false), "αβγ…");
+
+        let preview = format_large_scalar_var_tooltip("big", &"x".repeat(200), 20);
+        assert!(preview.starts_with("$big=\""), "got {preview:?}");
+        assert!(preview.ends_with('…'), "got {preview:?}");
+        assert!(preview.chars().count() <= 20, "got {preview:?}");
+    }
+
+    use rusty_fork::rusty_fork_test;
+
+    rusty_fork_test! {
+        #[test]
+        fn capture_stdout_drains_large_output_without_deadlocking_and_handles_non_utf8() {
+            // Write 256 KiB (> macOS 16 KiB and Linux 64 KiB pipe buffers) directly to fd 1.
+            // Without a concurrent reader thread, this deadlocks permanently (#1065).
+            let payload = vec![b'A'; 256 * 1024];
+            let (written, output, truncated) = capture_stdout_with_limit(1024, || {
+                let mut total = 0usize;
+                while total < payload.len() {
+                    let n = unsafe {
+                        libc::write(
+                            libc::STDOUT_FILENO,
+                            payload[total..].as_ptr() as *const libc::c_void,
+                            payload.len() - total,
+                        )
+                    };
+                    assert!(n > 0, "write to redirected stdout failed: {n}");
+                    total += n as usize;
+                }
+                total
+            });
+            assert_eq!(written, 256 * 1024);
+            assert!(truncated);
+            assert_eq!(output.len(), 1024);
+            assert!(output.bytes().all(|b| b == b'A'));
+
+            // Invalid UTF-8 bytes must be decoded lossily rather than panicking.
+            let invalid = [b'o', b'k', 0xff, 0xfe, b'!'];
+            let (_, lossy, lossy_truncated) = capture_stdout_with_limit(1024, || unsafe {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    invalid.as_ptr() as *const libc::c_void,
+                    invalid.len(),
+                )
+            });
+            assert!(!lossy_truncated);
+            assert!(lossy.starts_with("ok"));
+            assert!(lossy.ends_with('!'));
+            assert!(lossy.contains('\u{FFFD}'));
+        }
     }
 }

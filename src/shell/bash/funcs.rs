@@ -13,9 +13,6 @@ use libc::c_char;
 use libc::c_int;
 use std::collections::{HashMap, HashSet};
 
-use std::io::Read;
-
-use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -23,42 +20,9 @@ fn with_redirected_stdout<F, R>(func: F) -> (R, String)
 where
     F: FnOnce() -> R,
 {
-    // Create a pipe to capture stdout
-    let (read_fd, write_fd) = unsafe {
-        let mut fds: [c_int; 2] = [0; 2];
-        libc::pipe(fds.as_mut_ptr());
-        (fds[0], fds[1])
-    };
-
-    // Save original stdout
-    let original_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
-
-    // Redirect stdout to write end of pipe
-    unsafe {
-        libc::dup2(write_fd, libc::STDOUT_FILENO);
-        libc::close(write_fd);
-    };
-
-    // Call the provided function
-    let result = func();
-
-    // Flush stdout to ensure all data is written to pipe
-    unsafe { libc::fflush(std::ptr::null_mut()) };
-
-    // Restore original stdout
-    unsafe {
-        libc::dup2(original_stdout, libc::STDOUT_FILENO);
-        libc::close(original_stdout);
-    };
-
-    // Read from pipe
-    let mut output = String::new();
-    unsafe {
-        let mut read_file = std::fs::File::from_raw_fd(read_fd);
-        read_file.read_to_string(&mut output).unwrap();
-    };
-
-    (result, output.to_string())
+    let (result, output, _truncated) =
+        crate::shell::capture_stdout_with_limit(crate::shell::MAX_STDOUT_CAPTURE_BYTES, func);
+    (result, output)
 }
 
 pub fn find_alias(cmd: &str) -> Option<String> {
@@ -218,26 +182,55 @@ pub fn get_command_info(cmd: &str) -> CommandWordInfo {
 }
 
 pub fn format_shell_var_uncached(name: &str) -> String {
+    const MAX_SCALAR_PREVIEW_BYTES: usize = 4096;
+
     let _guard = super::symbols::BASH_LOCK.lock();
-    get_shell_var(name)
-        .and_then(|mut var| {
-            let (res, output) = with_redirected_stdout(|| unsafe {
-                bash_symbols::show_var_attributes(&mut var, 0, 0)
-            });
-            if res != 0 {
-                None
-            } else {
-                Some(output.trim().to_string())
-            }
-        })
-        .map(|output| {
-            if let Some(pos) = output.find(name) {
-                format!("${}", output[pos..].trim())
-            } else {
-                output.trim().to_string()
-            }
-        })
-        .unwrap_or_else(|| format!("${}=", name))
+    let Some(mut var) = get_shell_var(name) else {
+        return format!("${}=", name);
+    };
+
+    // Fast path for large plain scalar variables: inspect at most
+    // MAX_SCALAR_PREVIEW_BYTES via strnlen so megabyte-sized variables
+    // (e.g. `var=$(cat bigfile)`) never block in `show_var_attributes`
+    // or produce multi-megabyte tooltip strings (#1065).
+    let is_plain_scalar = !var.is_array()
+        && !var.is_associative_array()
+        && !var.is_function()
+        && var.dynamic_value.is_none()
+        && (var.attributes as libc::c_ulong
+            & (bash_symbols::ATT_NAMEREF | bash_symbols::ATT_INVISIBLE))
+            == 0;
+    if is_plain_scalar && !var.value.is_null() {
+        let bounded_len = unsafe { libc::strnlen(var.value, MAX_SCALAR_PREVIEW_BYTES + 1) };
+        if bounded_len > MAX_SCALAR_PREVIEW_BYTES {
+            let slice = unsafe {
+                std::slice::from_raw_parts(var.value as *const u8, MAX_SCALAR_PREVIEW_BYTES)
+            };
+            let raw_preview = String::from_utf8_lossy(slice);
+            return crate::shell::format_large_scalar_var_tooltip(
+                name,
+                &raw_preview,
+                crate::shell::MAX_VAR_TOOLTIP_CHARS,
+            );
+        }
+    }
+
+    let (res, output, truncated) =
+        crate::shell::capture_stdout_with_limit(crate::shell::MAX_STDOUT_CAPTURE_BYTES, || unsafe {
+            bash_symbols::show_var_attributes(&mut var, 0, 0)
+        });
+    if res != 0 {
+        return format!("${}=", name);
+    }
+
+    let trimmed = output.trim();
+    let formatted = if let Some(pos) = trimmed.find(name) {
+        format!("${}", trimmed[pos..].trim())
+    } else {
+        trimmed.to_string()
+    };
+
+    crate::shell::truncate_tooltip_text(&formatted, crate::shell::MAX_VAR_TOOLTIP_CHARS, truncated)
 }
 
 static SHELL_VAR_CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
