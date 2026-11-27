@@ -567,6 +567,48 @@ pub(super) mod tests {
         assert!(will_bash_accept_buffer("echo a | foo() { echo hi; }"));
     }
 
+    #[test]
+    fn test_multiline_array_literals_with_keywords() {
+        assert!(will_bash_accept_buffer("arr=(\nif\n)"));
+        assert!(will_bash_accept_buffer("arr=(\ncase\n)"));
+        assert!(will_bash_accept_buffer("arr=(\n{\n)"));
+        assert!(will_bash_accept_buffer(
+            "arr=(\nfor\nwhile\nuntil\nselect\n)"
+        ));
+        assert!(will_bash_accept_buffer("local arr=(\nif\n)"));
+        assert!(will_bash_accept_buffer("declare -a arr=(\ncase\n)"));
+        assert!(will_bash_accept_buffer("arr+=(\nif\n)"));
+        assert!(will_bash_accept_buffer("arr=([0]=foo if)"));
+        assert!(will_bash_accept_buffer(
+            "arr=(\n  $(if true; then echo ok; fi)\n)"
+        ));
+
+        // Still incomplete when the array literal or a nested command subst is unclosed.
+        assert!(!will_bash_accept_buffer("arr=(\nif\n"));
+        assert!(!will_bash_accept_buffer("arr=(\n{\n"));
+        assert!(!will_bash_accept_buffer("arr=(\n  $(if true\n)"));
+        // After the array literal closes, a following newline restores command position.
+        assert!(!will_bash_accept_buffer("arr=(\nif\n)\nif true"));
+        assert!(will_bash_accept_buffer(
+            "arr=(\nif\n)\nif true; then echo ok; fi"
+        ));
+    }
+
+    #[test]
+    fn test_coproc_with_and_without_name() {
+        assert!(!will_bash_accept_buffer("coproc (echo hi"));
+        assert!(will_bash_accept_buffer("coproc (echo hi)"));
+        assert!(!will_bash_accept_buffer("coproc myproc (echo hi"));
+        assert!(will_bash_accept_buffer("coproc myproc (echo hi)"));
+        assert!(!will_bash_accept_buffer("coproc myproc { echo hi"));
+        assert!(will_bash_accept_buffer("coproc myproc { echo hi; }"));
+        assert!(!will_bash_accept_buffer("coproc myproc if true"));
+        assert!(will_bash_accept_buffer(
+            "coproc myproc if true; then echo hi; fi"
+        ));
+        assert!(!will_bash_accept_buffer("! coproc myproc (echo hi"));
+    }
+
     pub(crate) fn find_system_bash() -> Option<String> {
         for candidate in [
             "/opt/homebrew/bin/bash",
@@ -661,9 +703,15 @@ pub(super) mod tests {
             "echo `echo hi`",
             "echo ${HOME:-/tmp}",
             "arr=(1 2 3)",
+            "arr=(\nif\n)",
+            "arr=(\ncase\n)",
+            "arr=(\n{\n)",
             "arr+=(4 5)",
             "local arr=(1 2)",
             "declare -a arr=(1 2)",
+            "coproc (echo hi)",
+            "coproc myproc (echo hi)",
+            "coproc myproc { echo hi; }",
             "foo() { echo hi; }",
             "foo() ( echo hi )",
             "function foo { echo hi; }",
@@ -690,6 +738,8 @@ pub(super) mod tests {
             "time (echo hi",
             "! (echo hi",
             "coproc (echo hi",
+            "coproc myproc (echo hi",
+            "coproc myproc { echo hi",
             "case x in a) (echo 1",
             "echo a\n(echo b",
             "{ echo a",

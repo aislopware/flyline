@@ -203,7 +203,16 @@ impl DParser {
         new_tokens
     }
 
+    fn is_optional_nesting(&self, open_idx: usize, kind: &TokenKind) -> bool {
+        match kind {
+            TokenKind::LBracket => true,
+            TokenKind::LBrace => self.tokens[open_idx].annotations.command_word.is_none(),
+            _ => false,
+        }
+    }
+
     fn nested_opening_satisfied(
+        &self,
         token: &Token,
         nestings: &[(usize, TokenKind)],
         is_compound_command_position: bool,
@@ -211,14 +220,18 @@ impl DParser {
     ) -> bool {
         let current_nesting = nestings.last().map(|(_, k)| k);
         match token.kind {
-            TokenKind::Backtick | TokenKind::Quote | TokenKind::SingleQuote => {
-                if Some(&token.kind) == current_nesting {
-                    // backtick or quote is acting as closer
-                    false
-                } else {
-                    true
-                }
+            TokenKind::Backtick => {
+                // Unescaped backticks never nest; if the innermost mandatory
+                // nesting (skipping unclosed optional `{` / `[`) is already a
+                // Backtick, this token closes it rather than opening a new one.
+                let enclosing = nestings
+                    .iter()
+                    .rev()
+                    .find(|(open_idx, k)| !self.is_optional_nesting(*open_idx, k))
+                    .map(|(_, k)| k);
+                !matches!(enclosing, Some(TokenKind::Backtick))
             }
+            TokenKind::Quote | TokenKind::SingleQuote => Some(&token.kind) != current_nesting,
             TokenKind::LParen => {
                 if is_compound_command_position || is_array_literal_start {
                     return true;
@@ -242,15 +255,13 @@ impl DParser {
         }
     }
 
-    fn nested_closing_satisfied(
+    fn nested_closing_matches_entry(
         &self,
         token: &Token,
-        nestings: &[(usize, TokenKind)],
+        open_idx: usize,
+        current_nesting: &TokenKind,
         is_command_position: bool,
     ) -> bool {
-        let Some(&(open_idx, ref current_nesting)) = nestings.last() else {
-            return false;
-        };
         match (&token.kind, current_nesting) {
             // A command-group `{ ...; }` only closes when `}` is in command
             // position (after `;`, `\n`, `&`, etc.); in `{ echo a }`, `}` is
@@ -286,6 +297,35 @@ impl DParser {
         }
     }
 
+    /// Returns the number of unclosed optional nestings (argument-level `{` or `[`)
+    /// to pop from the top of `nestings` so `token` can match an enclosing opener.
+    fn nested_closing_skip_count(
+        &self,
+        token: &Token,
+        nestings: &[(usize, TokenKind)],
+        is_command_position: bool,
+    ) -> Option<usize> {
+        for (skipped, &(open_idx, ref kind)) in nestings.iter().rev().enumerate() {
+            if self.nested_closing_matches_entry(token, open_idx, kind, is_command_position) {
+                return Some(skipped);
+            }
+            if !self.is_optional_nesting(open_idx, kind) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn nested_closing_satisfied(
+        &self,
+        token: &Token,
+        nestings: &[(usize, TokenKind)],
+        is_command_position: bool,
+    ) -> bool {
+        self.nested_closing_skip_count(token, nestings, is_command_position)
+            .is_some()
+    }
+
     fn is_new_command_nesting(kind: &TokenKind) -> bool {
         matches!(
             kind,
@@ -308,7 +348,7 @@ impl DParser {
     }
 
     /// True if the active command tokens up to `idx` consist solely of
-    /// pipeline prefixes (`!`, `time`, `time -p`, `coproc`) or a complete
+    /// pipeline prefixes (`!`, `time`, `time -p`, `coproc [NAME]`) or a complete
     /// function header (`name()`, `function name`, `function name()`), meaning
     /// a following compound command (`(`, `{`, `if`, `for`, `while`, `until`,
     /// `select`, `case`) is still in command position.
@@ -324,11 +364,11 @@ impl DParser {
         if non_ws.is_empty() {
             return true;
         }
-        // Pipeline prefixes: `!`, `time`, `time -p`, `coproc` (possibly chained, e.g. `! time`)
+        // Pipeline prefixes: `!`, `time`, `time -p`, `coproc [NAME]` (possibly chained, e.g. `! time`)
         let mut pos = 0;
         while pos < non_ws.len() {
             match &non_ws[pos].kind {
-                TokenKind::Word(w) if w == "!" || w == "coproc" => pos += 1,
+                TokenKind::Word(w) if w == "!" => pos += 1,
                 TokenKind::Word(w) if w == "time" => {
                     pos += 1;
                     if non_ws
@@ -337,6 +377,17 @@ impl DParser {
                     {
                         pos += 1;
                     }
+                }
+                TokenKind::Word(w) if w == "coproc" => {
+                    pos += 1;
+                    // `coproc [NAME] compound-command` allows one optional NAME
+                    // word before the compound command (e.g. `coproc myproc (echo hi)`).
+                    if pos + 1 == non_ws.len()
+                        && matches!(&non_ws[pos].kind, TokenKind::Word(name) if !name.contains('='))
+                    {
+                        pos += 1;
+                    }
+                    break;
                 }
                 _ => break,
             }
@@ -565,8 +616,28 @@ impl DParser {
                 }
             }
 
+            // Inside an array literal `arr=(...)`, newlines and elements remain
+            // in value position rather than putting the parser into command
+            // position. Stop at any scope-isolating construct (like `$(...)`)
+            // or quote so commands nested inside elements still parse normally.
+            let in_array_literal = nestings
+                .iter()
+                .zip(nesting_isolates_scope.iter())
+                .rev()
+                .find(|((_, kind), isolates)| {
+                    **isolates
+                        || matches!(
+                            kind,
+                            TokenKind::LParen
+                                | TokenKind::Quote
+                                | TokenKind::SingleQuote
+                                | TokenKind::ExtGlob(_)
+                        )
+                })
+                .is_some_and(|((_, kind), isolates)| *kind == TokenKind::LParen && !*isolates);
+
             let previous_kind = previous_token.as_ref().map(|t| &t.token.kind);
-            let is_compound_cmd_pos = self.is_compound_command_position();
+            let is_compound_cmd_pos = !in_array_literal && self.is_compound_command_position();
             let in_plain_word_context = !is_compound_cmd_pos
                 || previous_kind
                     .is_some_and(|kind| matches!(kind, TokenKind::Assignment | TokenKind::Dollar))
@@ -698,7 +769,7 @@ impl DParser {
                 | TokenKind::While
                 | TokenKind::Until
                 | TokenKind::Select
-                    if Self::nested_opening_satisfied(
+                    if self.nested_opening_satisfied(
                         &token,
                         &nestings,
                         is_compound_cmd_pos,
@@ -790,6 +861,17 @@ impl DParser {
                         self.current_command_range.is_none(),
                     ) =>
                 {
+                    let skip = self
+                        .nested_closing_skip_count(
+                            &token,
+                            &nestings,
+                            self.current_command_range.is_none(),
+                        )
+                        .unwrap();
+                    for _ in 0..skip {
+                        nestings.pop();
+                        nesting_isolates_scope.pop();
+                    }
                     let (opening_idx, _opening_kind) = nestings.pop().unwrap();
                     let is_scope_isolating_nesting = nesting_isolates_scope.pop().unwrap_or(false);
                     let depth = nestings.len();
@@ -857,11 +939,12 @@ impl DParser {
                     }
                     self.current_command_range = None;
                 }
-                // Outside quotes and heredoc bodies, an unescaped newline ends
-                // the current simple command just like `;`.
+                // Outside quotes, heredoc bodies, and array literals, an
+                // unescaped newline ends the current simple command just like `;`.
                 TokenKind::Newline
                     if active_heredoc_opening_idx.is_none()
                         && !in_quote_nesting
+                        && !in_array_literal
                         && !prev_ends_with_continuation_backslash =>
                 {
                     if stop_parsing_at_command_boundary && !in_nesting_after_cursor {
@@ -902,12 +985,14 @@ impl DParser {
                         *range = *range.start()..=idx;
                     }
 
-                    if (stop_parsing_at_command_boundary && !in_nesting_after_cursor)
-                        || token_inclusively_contains_cursor
-                    {
-                        break;
+                    if !in_array_literal {
+                        if (stop_parsing_at_command_boundary && !in_nesting_after_cursor)
+                            || token_inclusively_contains_cursor
+                        {
+                            break;
+                        }
+                        self.current_command_range = None;
                     }
-                    self.current_command_range = None;
                 }
                 TokenKind::Word(word)
                     if self.is_heredoc_closing(
