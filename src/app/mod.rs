@@ -3,7 +3,7 @@ pub(crate) mod auto_close;
 pub(crate) mod formatted_buffer;
 mod ui;
 use crate::subshell_ipc::{self, IpcStatus, SubshellHandle};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::sys::wait::WaitStatus;
 pub(crate) use ui::DrawnContent;
 
 #[derive(Debug, Clone)]
@@ -1883,7 +1883,7 @@ impl<'a> App<'a> {
                     self.content_mode = ContentMode::Normal;
                     return true;
                 }
-                IpcStatus::Empty => match waitpid(handle.pid, Some(WaitPidFlag::WNOHANG)) {
+                IpcStatus::Empty => match handle.try_wait() {
                     Ok(WaitStatus::Exited(_, code)) => {
                         log::error!(
                             "Tab completion subshell PID {} exited with code {} before sending payload",
@@ -1940,7 +1940,7 @@ impl<'a> App<'a> {
                     };
                     return true;
                 }
-                IpcStatus::Empty => match waitpid(handle.pid, Some(WaitPidFlag::WNOHANG)) {
+                IpcStatus::Empty => match handle.try_wait() {
                     Ok(WaitStatus::Exited(_, code)) if code != 0 => {
                         log::error!(
                             "flycomp subshell PID {} exited with non-zero code {}",
@@ -2228,16 +2228,19 @@ impl<'a> App<'a> {
         // cmd_args is non-empty, so split_first() always returns Some.
         let (prog, args) = cmd_args.split_first().expect("ai_command is non-empty");
         crate::reset_sigchld();
-        match std::process::Command::new(prog)
-            .args(args)
-            .arg(&final_arg)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
+        // Its own process group, so cancelling kills the tools it started too; no
+        // terminal input, which flyline is reading.
+        match KillOnDropChild::spawn(
+            std::process::Command::new(prog)
+                .args(args)
+                .arg(&final_arg)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        ) {
             Ok(child) => {
                 self.content_mode = ContentMode::AgentModeWaiting {
-                    child: KillOnDropChild::new(child),
+                    child,
                     command_display,
                     start_time: std::time::Instant::now(),
                 };

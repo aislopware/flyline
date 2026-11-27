@@ -227,10 +227,30 @@ impl<T: DeserializeOwned> SubshellReceiver<T> {
 pub struct SubshellHandle<T> {
     pub pid: Pid,
     pub receiver: SubshellReceiver<T>,
+    /// Set once [`Self::try_wait`] has reaped the child: its pid is free again and
+    /// may already belong to another process, so `Drop` must not signal it.
+    reaped: std::cell::Cell<bool>,
+}
+
+impl<T> SubshellHandle<T> {
+    /// Reap the child if it has exited, without blocking.
+    pub fn try_wait(&self) -> nix::Result<nix::sys::wait::WaitStatus> {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        let status = waitpid(self.pid, Some(WaitPidFlag::WNOHANG))?;
+        if matches!(status, WaitStatus::Exited(..) | WaitStatus::Signaled(..)) {
+            self.reaped.set(true);
+        }
+        Ok(status)
+    }
 }
 
 impl<T> Drop for SubshellHandle<T> {
     fn drop(&mut self) {
+        if self.reaped.get() {
+            close_fd(self.receiver.payload_fd());
+            close_fd(self.receiver.log_fd());
+            return;
+        }
         // The child calls `setsid()` right after `fork()`, placing itself and
         // all of its descendants in process group `self.pid`. Kill the whole
         // process group first so grandchildren (e.g. `uv generate-shell-completion`)
@@ -352,6 +372,7 @@ where
             Some(SubshellHandle {
                 pid: child,
                 receiver: SubshellReceiver::new(payload_rx, log_rx),
+                reaped: std::cell::Cell::new(false),
             })
         }
         Err(e) => {

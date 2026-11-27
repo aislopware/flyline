@@ -21,7 +21,6 @@ impl KillOnDropChild {
 
     /// Place `cmd` in its own process group (`pgid == pid`) and spawn it wrapped
     /// in a [`KillOnDropChild`] so dropping terminates its entire process tree.
-    #[allow(dead_code)]
     pub fn spawn(cmd: &mut std::process::Command) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
@@ -53,14 +52,38 @@ impl std::fmt::Debug for KillOnDropChild {
     }
 }
 
+/// Whether `pid` is a child of ours that nobody has reaped yet (running, or a
+/// zombie). Checked without reaping it, so its pid and process group id stay
+/// reserved and cannot belong to another process while we signal them.
+#[cfg(unix)]
+fn is_unreaped_child(pid: libc::pid_t) -> bool {
+    // SAFETY: `info` is a plain C struct that waitid fills in; WNOWAIT leaves the
+    // child waitable.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    rc == 0
+}
+
 impl Drop for KillOnDropChild {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
             let pid = self.0.id();
-            if pid > 0
-                && let Ok(raw_pid) = libc::pid_t::try_from(pid)
+            if let Ok(raw_pid) = libc::pid_t::try_from(pid)
+                && raw_pid > 0
             {
+                // Once an earlier `try_wait` reaped it, the pid is free and may
+                // belong to another process or process group by now: signal nothing.
+                if !is_unreaped_child(raw_pid) {
+                    return;
+                }
                 let _ = nix::sys::signal::killpg(
                     nix::unistd::Pid::from_raw(raw_pid),
                     nix::sys::signal::Signal::SIGKILL,
@@ -134,5 +157,49 @@ mod tests {
 
         let _ = nix::sys::signal::kill(grandchild_pid, nix::sys::signal::Signal::SIGKILL);
         panic!("grandchild {grandchild_pid} survived KillOnDropChild::drop");
+    }
+
+    #[test]
+    fn a_reaped_child_is_not_signalled_but_a_zombie_leader_still_takes_its_group() {
+        // Reaped by try_wait: its pid may be reused, so drop must leave it alone.
+        let mut done = KillOnDropChild::spawn(&mut Command::new("true")).expect("spawn true");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while done.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "true did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let raw_pid = libc::pid_t::try_from(done.id()).expect("pid fits");
+        assert!(!is_unreaped_child(raw_pid));
+        drop(done);
+
+        // The leader exited but nobody reaped it yet; its background job lives on
+        // in the group, which drop must still kill.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 60 & echo $!"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut leader = KillOnDropChild::spawn(&mut cmd).expect("spawn sh");
+        let mut line = String::new();
+        BufReader::new(leader.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("read grandchild pid");
+        let grandchild_pid =
+            nix::unistd::Pid::from_raw(line.trim().parse::<libc::pid_t>().expect("parse pid"));
+        std::thread::sleep(Duration::from_millis(200));
+        let leader_pid = libc::pid_t::try_from(leader.id()).expect("pid fits");
+        assert!(
+            is_unreaped_child(leader_pid),
+            "the exited leader is a zombie"
+        );
+        drop(leader);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while test_process_is_running(grandchild_pid) {
+            if Instant::now() > deadline {
+                let _ = nix::sys::signal::kill(grandchild_pid, nix::sys::signal::Signal::SIGKILL);
+                panic!("grandchild {grandchild_pid} outlived its zombie leader's drop");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
