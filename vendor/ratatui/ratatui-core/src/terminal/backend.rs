@@ -1,6 +1,6 @@
 use crate::backend::Backend;
 use crate::layout::Size;
-use crate::terminal::{CursorVisibility, Terminal};
+use crate::terminal::Terminal;
 
 impl<B: Backend> Terminal<B> {
     /// Returns a shared reference to the backend.
@@ -28,14 +28,18 @@ impl<B: Backend> Terminal<B> {
     /// Mutating the backend directly can desynchronize Ratatui's internal buffers, cursor
     /// tracking, or viewport assumptions from what's on-screen. If you do this, call
     /// [`Terminal::clear`] or perform a full draw pass before relying on Ratatui's view of the
-    /// terminal again. Because the cursor visibility is no longer guaranteed, it is reset to
-    /// `CursorVisibility::Unknown` so a later draw re-shows the cursor defensively.
+    /// terminal again.
+    ///
+    /// Unlike upstream, this keeps the tracked cursor visibility: flyline calls it every frame
+    /// (synchronized output), and resetting it to `Unknown` made every frame re-send "show
+    /// cursor" or "hide cursor", which restarts the cursor's blink (upstream #2752). If you hide
+    /// or show the cursor through the backend, also call [`Terminal::hide_cursor`] or
+    /// [`Terminal::show_cursor`].
     ///
     /// [`Terminal::clear`]: crate::terminal::Terminal::clear
     /// [`Terminal::draw`]: crate::terminal::Terminal::draw
     /// [`Terminal::try_draw`]: crate::terminal::Terminal::try_draw
     pub const fn backend_mut(&mut self) -> &mut B {
-        self.cursor_visibility = CursorVisibility::Unknown;
         &mut self.backend
     }
 
@@ -61,7 +65,7 @@ impl<B: Backend> Terminal<B> {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::{Backend, TestBackend};
+    use crate::backend::TestBackend;
     use crate::layout::{Position, Size};
     use crate::terminal::{CursorVisibility, Terminal};
 
@@ -87,19 +91,17 @@ mod tests {
     }
 
     #[test]
-    fn backend_mut_invalidates_cursor_visibility() {
+    fn backend_mut_keeps_cursor_visibility() {
         let backend = TestBackend::new(3, 2);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Simulate a draw that leaves the cursor visible, then mutate the backend directly.
         terminal.show_cursor().unwrap();
         assert_eq!(terminal.cursor_visibility, CursorVisibility::Visible);
 
-        terminal.backend_mut().hide_cursor();
-
-        // Mutating the backend could desync the cursor, so visibility is reset to Unknown so a
-        // later draw defensively re-shows the cursor.
-        assert_eq!(terminal.cursor_visibility, CursorVisibility::Unknown);
+        // flyline borrows the backend every frame; that alone must not make the next draw
+        // re-send "show cursor".
+        let _ = terminal.backend_mut();
+        assert_eq!(terminal.cursor_visibility, CursorVisibility::Visible);
     }
 
     #[test]
