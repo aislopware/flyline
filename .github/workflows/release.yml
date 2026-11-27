@@ -176,3 +176,78 @@ jobs:
         run: |
           gh release edit "${{ needs.create-release.outputs.version }}" \
             --repo "${{ github.repository }}" --prerelease=false --latest
+
+  # ── Homebrew tap ────────────────────────────────────────────────────────────────────────────
+  # Points aislopware/homebrew-tap's Formula/flyline.rb at the new tag's source archive, which
+  # the formula builds from. The tap token lives in the better-update vault (org Jmango Vietnam,
+  # project `flyline`, environment `production`, key HOMEBREW_TAP_TOKEN); the only GitHub secret
+  # is BETTER_UPDATE_ROBOT, the robot token that opens it. Same arrangement as aislopware/slop-shot.
+  #
+  # THIS REPO IS PUBLIC: every line this job prints is public. Each value pulled from the vault is
+  # masked with `::add-mask::` before anything can echo it, and no secret crosses a step boundary.
+  homebrew-tap:
+    name: Bump aislopware/homebrew-tap
+    needs: [create-release, promote-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      # The vault client finds its project from eas.json's projectId, so `env pull` must run in
+      # the checkout; outside it, it exits 4 with "Project not linked".
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Pull the tap token from the vault and push the bump
+        env:
+          BETTER_UPDATE_ROBOT: ${{ secrets.BETTER_UPDATE_ROBOT }}
+          TAG: ${{ needs.create-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ -z "${BETTER_UPDATE_ROBOT}" ]; then
+            echo "::error::secret BETTER_UPDATE_ROBOT is not set; see the comment above this job"
+            exit 1
+          fi
+
+          # A standalone binary; with no BETTER_UPDATE_VERSION it installs the latest release.
+          curl -fsSL https://raw.githubusercontent.com/aislopware/better-update/main/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # `env pull --stdout` prints `export KEY='value'` lines; mask every value first.
+          vault="${RUNNER_TEMP}/vault.sh"
+          better-update env pull --environment production --stdout > "${vault}"
+          while IFS= read -r line; do
+            case "${line}" in export\ *) ;; *) continue ;; esac
+            value="${line#*=}"
+            value="${value#\'}"
+            value="${value%\'}"
+            [ -n "${value}" ] && echo "::add-mask::${value}"
+          done < "${vault}"
+          # shellcheck disable=SC1090
+          . "${vault}"
+          rm -f "${vault}"
+          token="${HOMEBREW_TAP_TOKEN:?HOMEBREW_TAP_TOKEN is not in the better-update vault}"
+
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          sha="$(curl -fsSL --retry 3 "${url}" | sha256sum | cut -d' ' -f1)"
+          [ "${#sha}" -eq 64 ] || { echo "::error::could not hash ${url}"; exit 1; }
+
+          git clone --depth 1 "https://x-access-token:${token}@github.com/aislopware/homebrew-tap.git" tap
+          cd tap
+          sed -i -E "s|^  url \".*\"|  url \"${url}\"|; s|^  sha256 \".*\"|  sha256 \"${sha}\"|" Formula/flyline.rb
+          # A sed that matches nothing still succeeds: read the result back.
+          if ! grep -qxF "  url \"${url}\"" Formula/flyline.rb \
+            || ! grep -qxF "  sha256 \"${sha}\"" Formula/flyline.rb; then
+            echo "::error::Formula/flyline.rb no longer has one-line url/sha256 entries"
+            exit 1
+          fi
+          git config user.name "flyline-release"
+          git config user.email "release@flyline.invalid"
+          # Re-running for the same tag leaves the file unchanged: nothing to push is success.
+          if git diff --quiet; then
+            echo "Formula/flyline.rb is already at ${TAG}"
+          else
+            git commit -am "flyline ${TAG#v}"
+            git push
+          fi
