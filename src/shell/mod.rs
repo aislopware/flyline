@@ -538,6 +538,27 @@ fn create_unlinked_temp_file() -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    // An anonymous in-memory file needs no writable directory (Android has no
+    // /tmp). The raw syscall works on any Linux >= 3.17, whatever the libc or the
+    // Android API level the library was built for.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: the name is a NUL-terminated string; a returned fd is ours to own.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c"flyline-stdout".as_ptr(),
+                libc::MFD_CLOEXEC,
+            )
+        };
+        if let Ok(fd) = libc::c_int::try_from(fd)
+            && fd >= 0
+        {
+            return Some(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+    }
+
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
 
@@ -597,8 +618,14 @@ where
         }
     }
 
-    let Some(mut temp_file) = create_unlinked_temp_file() else {
-        return (func(), String::new(), false);
+    // With nowhere to capture to, still keep the output off the terminal, where it
+    // would land on top of the prompt.
+    let (mut temp_file, capturing) = match create_unlinked_temp_file() {
+        Some(file) => (file, true),
+        None => match std::fs::OpenOptions::new().write(true).open("/dev/null") {
+            Ok(null) => (null, false),
+            Err(_) => return (func(), String::new(), false),
+        },
     };
 
     let original_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
@@ -625,7 +652,7 @@ where
     // Flush C stdio and restore STDOUT_FILENO before reading back.
     drop(restore_guard);
 
-    if temp_file.seek(SeekFrom::Start(0)).is_err() {
+    if !capturing || temp_file.seek(SeekFrom::Start(0)).is_err() {
         return (result, String::new(), false);
     }
 
