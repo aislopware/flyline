@@ -1285,12 +1285,16 @@ fn spawn_widget_child(command: &[String]) -> Result<std::process::Child, WidgetF
         prog,
         args
     );
-    std::process::Command::new(prog)
-        .args(args)
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn().map_err(|e| {
             log::error!(
                 "Custom prompt widget: failed to spawn command {:?}: {}",
                 command,
