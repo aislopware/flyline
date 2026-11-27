@@ -99,6 +99,9 @@ jobs:
         run: cargo nextest run --workspace --lib --locked
 
       - name: Vendored ratatui and termina tests
+        # vendor/ratatui pins `stable`; build with the same pinned toolchain.
+        env:
+          RUSTUP_TOOLCHAIN: "1.100.0"
         run: |
           (cd vendor/ratatui && cargo nextest run -p ratatui-core -p ratatui-termina --lib --locked)
           (cd vendor/termina && cargo nextest run --lib --locked)
