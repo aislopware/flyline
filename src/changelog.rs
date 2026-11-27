@@ -139,6 +139,22 @@ pub(crate) const CHANGELOG: &str = r#"# Changelog
 - **Space-prefixed commands stay private**: With `HISTCONTROL=ignorespace` or `ignoreboth`, the JSONL history no longer records commands that start with a space when bash-preexec (loaded by `atuin init bash`) has removed `ignorespace` from `HISTCONTROL`.
 - **First command in a new history file**: When the JSONL file is created, the first command is no longer written twice, and space-prefixed commands from Bash's history are left out.
 - **Window title from PS1**: flyline now sets the window title that PS1 sets with an OSC 0 or OSC 2 sequence, as readline does. Debian's default prompt and Ghostty's shell integration set the title this way; before, the tab kept showing the last command after it finished.
+
+## v2.1.0 (2026-11-27)
+- **Theme follows the terminal**: Switching the terminal or system between dark and light now switches flyline's palette at once in terminals that report it (DEC mode 2031: Ghostty, kitty, Contour and others). The completion popup takes its colours from the terminal's background.
+- **Prompts in mosh, Neovim and kmscon**: The prompt marks no longer use a save-cursor sequence these terminals misread, so prompts and command output stop overlapping.
+- **foot resize**: Resizing a foot window no longer leaves a copy of the prompt behind.
+- **Text selection in GNOME Terminal and other VTE terminals**: An idle prompt redraws only what changed (about 85 bytes a frame instead of 575), so a mouse selection is no longer cleared right away. It also saves bandwidth over ssh.
+- **Filenames with a backtick**: Completing in a directory with a file like ``a`b.txt`` no longer hangs on "Loading completions…", and filename completion never runs command substitution.
+- **Multi-word completion values**: A completion such as `background noise` is inserted as one quoted word; values the completion script already quoted are left alone.
+- **dotglob and FIGNORE**: Filename completion respects `shopt -s dotglob` and `FIGNORE`.
+- **Syntax highlighting**: Misplaced operators (`ls ;; ls`, `| cat`) are marked invalid. Valid code (backquotes, multi-line `case`, `do`/`then` used as arguments) is no longer marked.
+- **Enter acceptance**: Enter submits exactly when bash would: multi-line arrays, `coproc NAME`, a blank line after a trailing backslash, and here-documents that close only on an exact delimiter line.
+- **Time in prompts**: `\t` and `\D{...}` follow `TZ` set in the shell, `\D{%c}` prints what bash prints, including with flags such as `%^c`, and an invalid format is shown as written.
+- **Background processes**: Prompt widgets, completion subshells and the agent command run in their own process group with no terminal input; leaving the prompt kills the tools they started, and never a process that merely reused their pid.
+- **Stability**: Completion subshells can no longer hang at start-up when another thread was logging; `enable -d flyline` keeps the library mapped; builtin output that flyline reads never lands on the screen.
+- **OSC 7**: The working directory sent to the terminal is percent-encoded, so paths with spaces or `#` open new tabs in the right place.
+- **Toolchain**: The unmaintained chrono crate is replaced by jiff, and dependencies are up to date.
 "#;
 
 pub(crate) fn pretty_changelog() -> String {
