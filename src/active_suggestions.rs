@@ -1180,6 +1180,76 @@ mod description_tests {
     }
 
     #[test]
+    fn quoted_multi_word_values_handle_noquote_escapes_and_closed_quotes() {
+        let process = |raw: &str, word: &str, flags: shell::CompletionFlags| {
+            UnprocessedSuggestion {
+                raw_text: raw.to_string(),
+                full_path: None,
+                flags,
+                word_under_cursor: word.to_string(),
+                is_git_command: false,
+                custom_prefix: None,
+            }
+            .into_processed()
+            .formatted()
+        };
+        let default = shell::CompletionFlags::default();
+        let noquote = shell::CompletionFlags {
+            filename_quoting_desired: false,
+            ..default
+        };
+
+        assert_eq!(process("foo bar", "fo", noquote), "foo bar ");
+        assert_eq!(process("foo\\", "fo", default), "'foo\\' ");
+        assert_eq!(process("foo\\ bar", "\"fo", default), "\"foo bar");
+        assert_eq!(
+            process("background noise", "'back'", default),
+            "'background noise'"
+        );
+    }
+
+    #[test]
+    fn prefix_matching_ignores_the_quote_flyline_added() {
+        let sug = |raw: &str| {
+            UnprocessedSuggestion {
+                raw_text: raw.to_string(),
+                full_path: None,
+                flags: shell::CompletionFlags::default(),
+                word_under_cursor: "back".to_string(),
+                is_git_command: false,
+                custom_prefix: None,
+            }
+            .into_processed()
+        };
+        let builder = ActiveSuggestionsBuilder {
+            processed: vec![sug("background"), sug("background noise"), sug("minimal")],
+            unprocessed: std::collections::VecDeque::new(),
+            common_prefix: None,
+            auto_accept_if_solo: false,
+            insert_common_prefix: false,
+            comp_type: crate::tab_completion_context::CompType::FirstWord,
+            nosort: false,
+            compspec_was_useful: Some(true),
+            should_run_flycomp: false,
+        };
+        let active = ActiveSuggestions::new(
+            builder,
+            SubString::new("back", "back").unwrap(),
+            std::time::Duration::from_millis(0),
+            false,
+            crate::settings::SuggestionSortOrder::default(),
+            crate::settings::FuzzyMode::None,
+        );
+        let mut matched: Vec<usize> = active
+            .filtered_suggestions
+            .iter()
+            .map(|f| f.suggestion_idx)
+            .collect();
+        matched.sort_unstable();
+        assert_eq!(matched, vec![0, 1]);
+    }
+
+    #[test]
     fn test_into_list_windowing() {
         let palette = crate::palette::Palette::default();
         let builder = ActiveSuggestionsBuilder {
@@ -1986,12 +2056,16 @@ impl UnprocessedSuggestion {
             };
 
             (prefix_to_use, s)
+        } else if !comp_result_flags.filename_quoting_desired {
+            // `compopt -o noquote`: insert the values exactly as given.
+            (String::new(), sug.clone())
         } else if let Some(qc) = quote_char
-            && !had_closing_quote
             && word_under_cursor.starts_with(qc)
         {
-            // The user opened a quote: continue inside it, as for filenames.
-            let s = shell::quoting_function_rust(sug_core, effective_quote_type, false, false);
+            // The user opened a quote: continue inside it, as for filenames. The value
+            // may come pre-quoted (`foo\ bar`); quote its literal text once.
+            let literal = shell::dequoting_function_rust(sug_core);
+            let s = shell::quoting_function_rust(&literal, effective_quote_type, false, false);
             (qc.to_string(), s)
         } else if quote_char.is_none() && is_unquoted_multi_word(&sug) {
             // A value like `background noise` would be split into two words; insert it
@@ -2074,7 +2148,10 @@ fn is_unquoted_multi_word(s: &str) -> bool {
     while let Some(c) = chars.next() {
         match (quote, c) {
             (None, '\\') | (Some('"'), '\\') => {
-                chars.next();
+                // A trailing backslash would escape the space inserted after it.
+                if chars.next().is_none() {
+                    return true;
+                }
             }
             (None, '\'' | '"') => quote = Some(c),
             (Some(q), c) if c == q => quote = None,
@@ -2859,12 +2936,19 @@ impl ActiveSuggestions {
                     matching_indices: Vec::new(),
                 });
             }
-            if sug.s.to_lowercase().starts_with(&pattern.to_lowercase()) {
+            // A value flyline quoted on insertion (`'background noise'`) still
+            // matches what the user typed without the quote (`back`).
+            let quote_offset =
+                usize::from(sug.s.starts_with(['\'', '"']) && !pattern.starts_with(['\'', '"']));
+            if sug.s[quote_offset..]
+                .to_lowercase()
+                .starts_with(&pattern.to_lowercase())
+            {
                 let match_count = pattern.chars().count();
                 return Some(FilteredItem {
                     score: 1000,
                     suggestion_idx: idx,
-                    matching_indices: (0..match_count).collect(),
+                    matching_indices: (quote_offset..quote_offset + match_count).collect(),
                 });
             }
             return None;
