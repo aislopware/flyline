@@ -725,6 +725,10 @@ flyline set-style --default-theme dark   # original palette, optimised for dark 
 flyline set-style --default-theme light  # preset optimised for light terminals
 ```
 
+Without `--default-theme`, flyline picks the preset from the terminal's background colour
+(OSC 11, or `$COLORFGBG`). Terminals that report theme changes (DEC mode 2031: Ghostty,
+kitty, Contour and others) switch the preset as soon as you toggle between dark and light.
+
 ### Custom colours
 
 Style strings follow the [rich](https://rich.readthedocs.io/en/stable/style.html) syntax: a

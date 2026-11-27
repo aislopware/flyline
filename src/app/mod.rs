@@ -90,9 +90,10 @@ fn restore_terminal(write: &mut impl std::io::Write) {
     let reset = |code| Csi::Mode(DecMode::ResetDecPrivateMode(DecPrivateMode::Code(code)));
     let _ = write!(
         write,
-        "{}{}{}",
+        "{}{}{}{}",
         reset(DecPrivateModeCode::BracketedPaste),
         reset(DecPrivateModeCode::FocusTracking),
+        reset(DecPrivateModeCode::Theme),
         Csi::Keyboard(Keyboard::PopFlags(1))
     );
     mouse_state(|m| m.disable());
@@ -114,6 +115,7 @@ fn drain_shutdown_events(timeout: Duration) {
                 | TerminaEvent::Csi(Csi::Cursor(CsiCursor::ActivePositionReport { .. }))
                 | TerminaEvent::Csi(Csi::Device(CsiDevice::DeviceAttributes(_)))
                 | TerminaEvent::Osc(termina::escape::osc::Osc::ChangeDynamicColors(..))
+                | TerminaEvent::Csi(Csi::Mode(DecMode::ReportTheme(_)))
         )
     };
 
@@ -1175,6 +1177,13 @@ impl<'a> App<'a> {
                             self.on_possible_buffer_change();
                             true
                         }
+                        TerminaEvent::Csi(Csi::Mode(DecMode::ReportTheme(mode))) => {
+                            // The report only says dark or light; the new fg/bg arrive as
+                            // OSC 10/11 replies, which the arm below applies.
+                            log::debug!("Terminal theme changed to {:?}", mode);
+                            crate::term_info::request_terminal_colors();
+                            false
+                        }
                         TerminaEvent::Osc(termina::escape::osc::Osc::ChangeDynamicColors(
                             num,
                             colors,
@@ -2022,7 +2031,14 @@ impl<'a> App<'a> {
             }
 
             let set_mode = |code| Csi::Mode(DecMode::SetDecPrivateMode(DecPrivateMode::Code(code)));
-            let _ = crate::flush_stdout!("{}", set_mode(DecPrivateModeCode::FocusTracking));
+            // Mode 2031: the terminal reports `CSI ? 997 ; 1|2 n` when it switches between
+            // dark and light (macOS appearance, a theme toggle), so the palette can follow
+            // without restarting the shell. Terminals without it ignore the mode.
+            let _ = crate::flush_stdout!(
+                "{}{}",
+                set_mode(DecPrivateModeCode::FocusTracking),
+                set_mode(DecPrivateModeCode::Theme)
+            );
         });
         colors_changed
     }

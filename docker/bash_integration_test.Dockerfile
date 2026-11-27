@@ -19,9 +19,11 @@ COPY tests/focus_report_handoff.py /
 COPY tests/resize_no_delete_line.py /
 COPY tests/idle_redraw_bytes.py /
 COPY tests/nvim_terminal_prompt.py /
+COPY tests/theme_change_report.py /
 
 RUN script -q -c "/bin/bash -i -c \"flyline --version && echo 'SUCCESS: Test completed'\"" /dev/null
 RUN python3 /focus_report_handoff.py --bash /bin/bash --flyline /libflyline.so
 RUN python3 /resize_no_delete_line.py --bash /bin/bash --flyline /libflyline.so
 RUN python3 /idle_redraw_bytes.py --bash /bin/bash --flyline /libflyline.so
 RUN python3 /nvim_terminal_prompt.py --bash /bin/bash --flyline /libflyline.so
+RUN python3 /theme_change_report.py --bash /bin/bash --flyline /libflyline.so

@@ -582,6 +582,25 @@ pub fn detect_theme_from_colorfgbg() -> Option<ColourTheme> {
     parse_colorfgbg_theme(&val)
 }
 
+/// Ask the terminal for its foreground and background colours without waiting.
+///
+/// The OSC 10/11 replies come back through the app's event loop, which applies them.
+pub fn request_terminal_colors() {
+    use std::io::Write;
+    use termina::escape::osc::{ColorOrQuery, DynamicColorNumber, Osc};
+
+    let query = |num| Osc::ChangeDynamicColors(num, vec![ColorOrQuery::Query]);
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = write!(
+            tty,
+            "{}{}",
+            query(DynamicColorNumber::TextForegroundColor),
+            query(DynamicColorNumber::TextBackgroundColor)
+        );
+        let _ = tty.flush();
+    }
+}
+
 /// Query OSC 10 (fg), OSC 11 (bg), and DA2 in a single terminal round-trip.
 ///
 /// Because terminals process queries in FIFO order, any supported OSC 10/11
