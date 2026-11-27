@@ -157,6 +157,26 @@ pub trait ShellBackend: Sync {
     /// Expand a shell word into a filename (quote removal, tilde and variable expansion).
     fn expand_filename(&self, filename: &str) -> String;
 
+    /// Resolve a completion candidate string to a filesystem path.
+    ///
+    /// Programmable completions (e.g. `compgen -f` / `_filedir`) return raw,
+    /// unquoted filenames that may contain quotes, backslashes, backticks, or `$`
+    /// (such as ``a`b.txt`` or `it's.txt`). Check whether the literal path exists
+    /// before falling back to shell word expansion (for `~/...` or `$HOME/...`).
+    fn resolve_completion_path(&self, candidate: &str) -> PathBuf {
+        if !candidate.is_empty() {
+            let literal = if std::path::Path::new(candidate).is_absolute() {
+                PathBuf::from(candidate)
+            } else {
+                PathBuf::from(self.cwd()).join(candidate)
+            };
+            if literal.symlink_metadata().is_ok() {
+                return literal;
+            }
+        }
+        PathBuf::from(self.expand_path(candidate))
+    }
+
     /// Expand prompt escape sequences (`\u`, `\h`, `\w`, etc.).
     fn decode_prompt(&self, raw: &str, is_prompt: bool) -> Option<String>;
 
@@ -228,8 +248,8 @@ pub trait ShellBackend: Sync {
             std::fs::create_dir_all(parent)?;
         }
         if write_path.exists() {
-            let now = chrono::Local::now();
-            let datetime_str = now.format("%Y%m%d_%H%M%S").to_string();
+            let now = jiff::ZonedDateTime::now();
+            let datetime_str = now.strftime("%Y%m%d_%H%M%S").to_string();
             let file_name = write_path
                 .file_name()
                 .and_then(|f| f.to_str())
@@ -269,6 +289,20 @@ pub trait ShellBackend: Sync {
         false
     }
 
+    /// True if the shell has `shopt -s dotglob` enabled.
+    fn is_dotglob_enabled(&self) -> bool {
+        self.env_var("BASHOPTS")
+            .is_some_and(|opts| opts.split(':').any(|opt| opt == "dotglob"))
+    }
+
+    /// True if the shell has `shopt -s force_fignore` enabled (Bash default: `true`).
+    fn is_force_fignore_enabled(&self) -> bool {
+        match self.env_var("BASHOPTS") {
+            Some(opts) => opts.split(':').any(|opt| opt == "force_fignore"),
+            None => true,
+        }
+    }
+
     /// Called when the line editor UI enters and prepares terminal mode.
     fn prep_terminal(&self) {}
 
@@ -294,6 +328,526 @@ fn init_backend() -> &'static dyn ShellBackend {
 #[cfg(test)]
 fn init_backend() -> &'static dyn ShellBackend {
     &*test_backend::TEST_BACKEND
+}
+
+/// Expand a shell word into a literal filename safely in Rust without invoking
+/// Bash's `expand_string_to_string`.
+///
+/// Supports:
+/// - Leading unquoted tilde expansion (`~`, `~/...`, `~+`, `~-`, `~user`, `~user/...`)
+/// - Shell parameter expansion (`$NAME`, `${NAME}`) in unquoted and double-quoted text
+/// - Quote removal (`'...'`, `"..."`, `$'...'` ANSI-C quoting, `$"..."` locale quoting,
+///   and backslash escapes following Bash rules)
+///
+/// Deliberately does **not** perform command substitution (`` `...` ``, `$(...)`),
+/// arithmetic expansion, or process substitution. Calling Bash's
+/// `expand_string_to_string` on an unclosed backtick (e.g. a filename like
+/// ``a`b.txt``) triggers `jump_to_top_level` (`siglongjmp`), which unwinds out of
+/// the completion subshell and deadlocks on `FLYLINE_INSTANCE_PTR` (#1074); and
+/// paired backticks / `$(...)` in filenames would execute arbitrary commands on Tab.
+pub fn expand_shell_filename<F>(filename: &str, lookup_env: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut result = String::with_capacity(filename.len());
+    let mut rest = filename;
+
+    // Leading unquoted tilde expansion: up to the first `/` (or end of word),
+    // provided the tilde prefix itself contains no quoting or escapes.
+    if let Some(after_tilde) = rest.strip_prefix('~') {
+        let prefix_end = after_tilde.find('/').unwrap_or(after_tilde.len());
+        let tilde_prefix = &after_tilde[..prefix_end];
+        let has_quote_or_escape = tilde_prefix
+            .chars()
+            .any(|c| matches!(c, '\'' | '"' | '\\' | '$'));
+        if !has_quote_or_escape {
+            let expanded_tilde = match tilde_prefix {
+                "" => lookup_env("HOME"),
+                "+" => lookup_env("PWD"),
+                "-" => lookup_env("OLDPWD"),
+                user => crate::users::get_all_users()
+                    .iter()
+                    .find(|u| u.username == user)
+                    .map(|u| u.home_dir.clone()),
+            };
+            if let Some(dir) = expanded_tilde {
+                result.push_str(&dir);
+                rest = &after_tilde[prefix_end..];
+            }
+        }
+    }
+
+    let mut chars = rest.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    result.push(c);
+                }
+            }
+            Some('"') => match c {
+                '"' => quote = None,
+                '\\' => match chars.peek() {
+                    // Inside double quotes, backslash only escapes these characters;
+                    // backslash-newline is a line continuation (both removed).
+                    Some('\n') => {
+                        chars.next();
+                    }
+                    Some('$' | '`' | '"' | '\\') => {
+                        result.push(chars.next().unwrap());
+                    }
+                    _ => result.push('\\'),
+                },
+                '$' => expand_shell_var(&mut chars, &lookup_env, &mut result),
+                _ => result.push(c),
+            },
+            Some(_) => unreachable!(),
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => match chars.next() {
+                    Some('\n') | None => {}
+                    Some(escaped) => result.push(escaped),
+                },
+                '$' => match chars.peek() {
+                    Some('\'') => {
+                        chars.next();
+                        decode_ansi_c_quote(&mut chars, &mut result);
+                    }
+                    Some('"') => {
+                        chars.next();
+                        quote = Some('"');
+                    }
+                    _ => expand_shell_var(&mut chars, &lookup_env, &mut result),
+                },
+                _ => result.push(c),
+            },
+        }
+    }
+
+    result
+}
+
+/// Decode the body of a Bash ANSI-C quoted string (`$'...'`) after the opening
+/// `$'` has been consumed, stopping at the matching unescaped `'` or end of
+/// input without panicking.
+///
+/// Handles `\a`, `\b`, `\e`/`\E`, `\f`, `\n`, `\r`, `\t`, `\v`, `\\`, `\'`,
+/// `\"`, `\?`, `\nnn` (1-3 octal digits), `\xHH` (1-2 hex digits), `\uHHHH` /
+/// `\UHHHHHHHH` (Unicode code points), and `\cX` (control characters), and
+/// never runs command substitution or variable expansion.
+fn decode_ansi_c_quote(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
+    let mut pending_bytes: Vec<u8> = Vec::new();
+    let flush_bytes = |bytes: &mut Vec<u8>, out: &mut String| {
+        if !bytes.is_empty() {
+            out.push_str(&String::from_utf8_lossy(bytes));
+            bytes.clear();
+        }
+    };
+
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            break;
+        }
+        if c != '\\' {
+            flush_bytes(&mut pending_bytes, out);
+            out.push(c);
+            continue;
+        }
+
+        let Some(esc) = chars.next() else {
+            flush_bytes(&mut pending_bytes, out);
+            out.push('\\');
+            break;
+        };
+
+        match esc {
+            'a' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x07');
+            }
+            'b' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x08');
+            }
+            'e' | 'E' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x1b');
+            }
+            'f' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x0c');
+            }
+            'n' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\n');
+            }
+            'r' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\r');
+            }
+            't' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\t');
+            }
+            'v' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\x0b');
+            }
+            '\\' | '\'' | '"' | '?' => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push(esc);
+            }
+            '0'..='7' => {
+                let mut val = (esc as u32) - ('0' as u32);
+                for _ in 0..2 {
+                    if let Some(&next) = chars.peek()
+                        && matches!(next, '0'..='7')
+                    {
+                        val = (val << 3) | ((next as u32) - ('0' as u32));
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                pending_bytes.push((val & 0xff) as u8);
+            }
+            'x' => {
+                let mut val: u32 = 0;
+                let mut digits = 0;
+                while digits < 2 {
+                    if let Some(&next) = chars.peek()
+                        && let Some(d) = next.to_digit(16)
+                    {
+                        val = (val << 4) | d;
+                        digits += 1;
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if digits > 0 {
+                    pending_bytes.push((val & 0xff) as u8);
+                } else {
+                    flush_bytes(&mut pending_bytes, out);
+                    out.push('\\');
+                    out.push('x');
+                }
+            }
+            'u' | 'U' => {
+                let max_digits = if esc == 'u' { 4 } else { 8 };
+                let mut val: u32 = 0;
+                let mut digits = 0;
+                while digits < max_digits {
+                    if let Some(&next) = chars.peek()
+                        && let Some(d) = next.to_digit(16)
+                    {
+                        val = (val << 4) | d;
+                        digits += 1;
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                flush_bytes(&mut pending_bytes, out);
+                if digits > 0 {
+                    out.push(char::from_u32(val).unwrap_or('\u{FFFD}'));
+                } else {
+                    out.push('\\');
+                    out.push(esc);
+                }
+            }
+            'c' => {
+                if let Some(ctrl) = chars.next() {
+                    if ctrl == '\\' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                    }
+                    if ctrl == '?' {
+                        pending_bytes.push(0x7f);
+                    } else if ctrl.is_ascii() {
+                        pending_bytes.push((ctrl as u8).to_ascii_uppercase() & 0x1f);
+                    } else {
+                        flush_bytes(&mut pending_bytes, out);
+                        out.push('\\');
+                        out.push('c');
+                        out.push(ctrl);
+                    }
+                } else {
+                    flush_bytes(&mut pending_bytes, out);
+                    out.push('\\');
+                    out.push('c');
+                }
+            }
+            other => {
+                flush_bytes(&mut pending_bytes, out);
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+
+    flush_bytes(&mut pending_bytes, out);
+}
+
+/// Expand `$NAME` or `${NAME}` into `out`. Unknown names expand to empty.
+/// Unrecognised `$` forms (like `$`, `$(...)`, `$1`, `${invalid}`) are left literal
+/// without executing anything.
+fn expand_shell_var<F>(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    lookup_env: &F,
+    out: &mut String,
+) where
+    F: Fn(&str) -> Option<String>,
+{
+    if chars.peek() == Some(&'{') {
+        // Peek ahead by cloning the iterator so an unclosed or non-plain `${...}`
+        // (such as `${a` or `${foo:-bar}`) does not swallow the rest of the path.
+        let mut probe = chars.clone();
+        probe.next(); // consume '{'
+        let mut name = String::new();
+        let mut closed = false;
+        let mut valid = true;
+        for vc in probe.by_ref() {
+            if vc == '}' {
+                closed = true;
+                break;
+            }
+            let ok = if name.is_empty() {
+                vc.is_ascii_alphabetic() || vc == '_'
+            } else {
+                vc.is_ascii_alphanumeric() || vc == '_'
+            };
+            if !ok {
+                valid = false;
+                break;
+            }
+            name.push(vc);
+        }
+        if closed && valid && !name.is_empty() {
+            *chars = probe;
+            if let Some(val) = lookup_env(&name) {
+                out.push_str(&val);
+            }
+            return;
+        }
+        out.push('$');
+        return;
+    }
+
+    if chars
+        .peek()
+        .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
+    {
+        let mut name = String::new();
+        while let Some(&vc) = chars.peek() {
+            if vc.is_ascii_alphanumeric() || vc == '_' {
+                name.push(vc);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if let Some(val) = lookup_env(&name) {
+            out.push_str(&val);
+        }
+    } else {
+        out.push('$');
+    }
+}
+
+/// Maximum number of bytes retained when capturing redirected C stdout.
+///
+/// The reader thread always drains the pipe to EOF even after hitting this cap
+/// so the writer never blocks on a full OS pipe buffer or receives `SIGPIPE`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const MAX_STDOUT_CAPTURE_BYTES: usize = 64 * 1024;
+
+/// Maximum number of characters retained in a formatted variable tooltip.
+pub(crate) const MAX_VAR_TOOLTIP_CHARS: usize = 1024;
+
+/// Truncate a tooltip string to at most `max_chars` Unicode scalar values,
+/// appending `"…"` if characters were dropped or `already_truncated` is set.
+pub(crate) fn truncate_tooltip_text(
+    text: &str,
+    max_chars: usize,
+    already_truncated: bool,
+) -> String {
+    let mut chars = text.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    let exceeded = chars.next().is_some();
+    if exceeded || already_truncated {
+        if prefix.ends_with('…') {
+            prefix
+        } else {
+            format!("{prefix}…")
+        }
+    } else {
+        prefix
+    }
+}
+
+/// Format a bounded preview of a large plain scalar shell variable for tooltip
+/// display without invoking Bash's `show_var_attributes` on megabytes of data.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn format_large_scalar_var_tooltip(
+    name: &str,
+    raw_prefix: &str,
+    max_chars: usize,
+) -> String {
+    let header = format!("${name}=\"");
+    let body_budget = max_chars.saturating_sub(header.chars().count() + 1);
+    let body: String = raw_prefix.chars().take(body_budget).collect();
+    format!("{header}{body}…")
+}
+
+/// Create a private, immediately-unlinked temporary file for single-threaded
+/// stdout capture without pipes or background threads.
+#[cfg_attr(test, allow(dead_code))]
+fn create_unlinked_temp_file() -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // An anonymous in-memory file needs no writable directory (Android has no
+    // /tmp). The raw syscall works on any Linux >= 3.17, whatever the libc or the
+    // Android API level the library was built for.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: the name is a NUL-terminated string; a returned fd is ours to own.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c"flyline-stdout".as_ptr(),
+                libc::MFD_CLOEXEC,
+            )
+        };
+        if let Ok(fd) = libc::c_int::try_from(fd)
+            && fd >= 0
+        {
+            return Some(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+
+    let mut dirs = vec![std::env::temp_dir()];
+    let fallback = PathBuf::from("/tmp");
+    if dirs[0] != fallback {
+        dirs.push(fallback);
+    }
+
+    for dir in dirs {
+        for _ in 0..8 {
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce = rand::random::<u32>();
+            let path = dir.join(format!(".flyline-stdout-{pid}-{seq}-{nonce:08x}"));
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Some(file);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    None
+}
+
+/// Run `func` with `STDOUT_FILENO` redirected to an unlinked temporary file
+/// and read back at most `max_bytes`.
+///
+/// Using an unlinked temporary file avoids OS pipe-buffer deadlocks (16 KiB on
+/// macOS, 64 KiB on Linux; see #1065) while remaining strictly single-threaded
+/// and fork-safe inside GNU Bash. Invalid UTF-8 bytes are replaced lossily
+/// instead of panicking across FFI.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn capture_stdout_with_limit<F, R>(max_bytes: usize, func: F) -> (R, String, bool)
+where
+    F: FnOnce() -> R,
+{
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::os::unix::io::AsRawFd as _;
+
+    struct StdoutRestoreGuard(libc::c_int);
+    impl Drop for StdoutRestoreGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fflush(std::ptr::null_mut());
+                libc::dup2(self.0, libc::STDOUT_FILENO);
+                libc::close(self.0);
+            }
+        }
+    }
+
+    // With nowhere to capture to, still keep the output off the terminal, where it
+    // would land on top of the prompt.
+    let (mut temp_file, capturing) = match create_unlinked_temp_file() {
+        Some(file) => (file, true),
+        None => match std::fs::OpenOptions::new().write(true).open("/dev/null") {
+            Ok(null) => (null, false),
+            Err(_) => return (func(), String::new(), false),
+        },
+    };
+
+    let original_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if original_stdout < 0 {
+        return (func(), String::new(), false);
+    }
+    unsafe {
+        let flags = libc::fcntl(original_stdout, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(original_stdout, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+        // Flush any buffered C stdout before redirecting so unrelated output
+        // does not leak into the capture file.
+        libc::fflush(std::ptr::null_mut());
+    }
+
+    if unsafe { libc::dup2(temp_file.as_raw_fd(), libc::STDOUT_FILENO) } < 0 {
+        unsafe { libc::close(original_stdout) };
+        return (func(), String::new(), false);
+    }
+
+    let restore_guard = StdoutRestoreGuard(original_stdout);
+    let result = func();
+    // Flush C stdio and restore STDOUT_FILENO before reading back.
+    drop(restore_guard);
+
+    if !capturing || temp_file.seek(SeekFrom::Start(0)).is_err() {
+        return (result, String::new(), false);
+    }
+
+    let read_limit = max_bytes.saturating_add(1);
+    let mut captured = Vec::with_capacity(read_limit.min(4096));
+    let mut chunk = [0u8; 4096];
+    while captured.len() < read_limit {
+        let remaining = read_limit - captured.len();
+        let to_read = remaining.min(chunk.len());
+        match temp_file.read(&mut chunk[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => captured.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    let truncated = captured.len() > max_bytes;
+    if truncated {
+        captured.truncate(max_bytes);
+    }
+    let output = String::from_utf8_lossy(&captured).into_owned();
+    (result, output, truncated)
 }
 
 /// The active host shell backend. Defaults to `BashBackend`.
@@ -370,6 +924,103 @@ mod tests {
     }
 
     #[test]
+    fn expand_shell_filename_backticks_and_cmdsubst_are_literal() {
+        let tb = TestBackend::new();
+        tb.set_env("HOME", "/home/test");
+        tb.set_env("PWD", "/work");
+        tb.set_env("OLDPWD", "/prev");
+
+        // Unclosed and paired backticks must stay literal (never execute or longjmp).
+        assert_eq!(tb.expand_filename("a`b.txt"), "a`b.txt");
+        assert_eq!(tb.expand_filename("a\\`b.txt"), "a`b.txt");
+        assert_eq!(tb.expand_filename("\"a\\`b.txt\""), "a`b.txt");
+        assert_eq!(tb.expand_filename("'a`b.txt'"), "a`b.txt");
+        assert_eq!(
+            tb.expand_filename("a`echo pwned`b.txt"),
+            "a`echo pwned`b.txt"
+        );
+
+        // Command substitutions and unclosed braces must also stay literal.
+        assert_eq!(tb.expand_filename("$(echo hi).txt"), "$(echo hi).txt");
+        assert_eq!(tb.expand_filename("${unclosed"), "${unclosed");
+        assert_eq!(tb.expand_filename("${X:-default}"), "${X:-default}");
+
+        // Tilde ~+ and ~- expansion.
+        assert_eq!(tb.expand_filename("~+/sub"), format!("{}/sub", tb.cwd()));
+        assert_eq!(tb.expand_filename("~-/sub"), "/prev/sub");
+    }
+
+    #[test]
+    fn expand_shell_filename_ansi_c_and_locale_quoting() {
+        let tb = TestBackend::new();
+        tb.set_env("HOME", "/home/test");
+        tb.set_env("X", "val");
+
+        // ANSI-C quoting ($'...')
+        assert_eq!(tb.expand_filename("$'my dir'"), "my dir");
+        assert_eq!(tb.expand_filename("$'my dir'/"), "my dir/");
+        assert_eq!(tb.expand_filename("$'it\\'s'"), "it's");
+        assert_eq!(tb.expand_filename("$'it\\'s'/file"), "it's/file");
+        assert_eq!(tb.expand_filename("$'a\\tb'"), "a\tb");
+        assert_eq!(tb.expand_filename("$'a\\nb'"), "a\nb");
+        assert_eq!(tb.expand_filename("$'a\\\\b'"), "a\\b");
+        assert_eq!(tb.expand_filename("$'a\\eb\\Ec'"), "a\x1bb\x1bc");
+        assert_eq!(
+            tb.expand_filename("$'\\a\\b\\f\\r\\v\\\"\\?'"),
+            "\x07\x08\x0c\r\x0b\"?"
+        );
+        assert_eq!(tb.expand_filename("$'\\x41\\x42'"), "AB");
+        assert_eq!(tb.expand_filename("$'\\xc3\\xa9'"), "é");
+        assert_eq!(tb.expand_filename("$'\\101'"), "A");
+        assert_eq!(tb.expand_filename("$'\\u00e9\\U0001f600'"), "é😀");
+        assert_eq!(tb.expand_filename("$'\\cA\\c?'"), "\x01\x7f");
+        assert_eq!(tb.expand_filename("$'\\xz\\z'"), "\\xz\\z");
+        // No variable expansion or command substitution inside $'...'
+        assert_eq!(tb.expand_filename("$'$X'"), "$X");
+        assert_eq!(tb.expand_filename("$'$(echo pwned)'"), "$(echo pwned)");
+        assert_eq!(tb.expand_filename("$'`echo pwned`'"), "`echo pwned`");
+        // Quoted tilde is not expanded; unquoted tilde before / still expands.
+        assert_eq!(tb.expand_filename("$'~'/dir"), "~/dir");
+        assert_eq!(tb.expand_filename("~/$'my dir'"), "/home/test/my dir");
+
+        // Locale double-quoting ($"...") behaves like double quotes without cmdsubst.
+        assert_eq!(tb.expand_filename("$\"x y\""), "x y");
+        assert_eq!(tb.expand_filename("$\"$X/sub\""), "val/sub");
+        assert_eq!(tb.expand_filename("$\"a\\\"b\\\\c\""), "a\"b\\c");
+        assert_eq!(tb.expand_filename("$\"$(echo pwned)\""), "$(echo pwned)");
+        assert_eq!(tb.expand_filename("$\"`echo pwned`\""), "`echo pwned`");
+        // Inside double quotes, `$` before `"` closes the double quote rather than starting $"...".
+        assert_eq!(tb.expand_filename("\"$\"foo\"\""), "$foo");
+
+        // Lone `$` and unterminated `$'` / `$"` stay sane without panicking.
+        assert_eq!(tb.expand_filename("$"), "$");
+        assert_eq!(tb.expand_filename("$'"), "");
+        assert_eq!(tb.expand_filename("$'unterminated"), "unterminated");
+        assert_eq!(tb.expand_filename("$'trailing\\"), "trailing\\");
+        assert_eq!(tb.expand_filename("$\""), "");
+        assert_eq!(tb.expand_filename("$\"unterminated"), "unterminated");
+    }
+
+    #[test]
+    fn resolve_completion_path_prefers_existing_literal_filename() {
+        let dir =
+            std::env::temp_dir().join(format!("flyline_resolve_literal_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a`b.txt", "it's.txt", "a\\b.txt", "$HOME.txt"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+
+        let tb = TestBackend::new();
+        for name in ["a`b.txt", "it's.txt", "a\\b.txt", "$HOME.txt"] {
+            let abs = dir.join(name);
+            let resolved = tb.resolve_completion_path(abs.to_str().unwrap());
+            assert_eq!(resolved, abs, "literal path should win for {name}");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_backend_traps_execution() {
         let tb = TestBackend::new();
         assert!(!tb.has_pending_traps());
@@ -383,5 +1034,62 @@ mod tests {
             tb.env_var("MY_TRAP_VAR"),
             Some("triggered_value".to_string())
         );
+    }
+
+    #[test]
+    fn truncate_tooltip_and_large_scalar_formatting() {
+        assert_eq!(truncate_tooltip_text("short", 10, false), "short");
+        assert_eq!(truncate_tooltip_text("short", 10, true), "short…");
+        assert_eq!(truncate_tooltip_text("abcdef", 4, false), "abcd…");
+        assert_eq!(truncate_tooltip_text("αβγδε", 3, false), "αβγ…");
+
+        let preview = format_large_scalar_var_tooltip("big", &"x".repeat(200), 20);
+        assert!(preview.starts_with("$big=\""), "got {preview:?}");
+        assert!(preview.ends_with('…'), "got {preview:?}");
+        assert!(preview.chars().count() <= 20, "got {preview:?}");
+    }
+
+    use rusty_fork::rusty_fork_test;
+
+    rusty_fork_test! {
+        #[test]
+        fn capture_stdout_drains_large_output_without_deadlocking_and_handles_non_utf8() {
+            // Write 256 KiB (> macOS 16 KiB and Linux 64 KiB pipe buffers) directly to fd 1.
+            // Without a concurrent reader thread, this deadlocks permanently (#1065).
+            let payload = vec![b'A'; 256 * 1024];
+            let (written, output, truncated) = capture_stdout_with_limit(1024, || {
+                let mut total = 0usize;
+                while total < payload.len() {
+                    let n = unsafe {
+                        libc::write(
+                            libc::STDOUT_FILENO,
+                            payload[total..].as_ptr() as *const libc::c_void,
+                            payload.len() - total,
+                        )
+                    };
+                    assert!(n > 0, "write to redirected stdout failed: {n}");
+                    total += n as usize;
+                }
+                total
+            });
+            assert_eq!(written, 256 * 1024);
+            assert!(truncated);
+            assert_eq!(output.len(), 1024);
+            assert!(output.bytes().all(|b| b == b'A'));
+
+            // Invalid UTF-8 bytes must be decoded lossily rather than panicking.
+            let invalid = [b'o', b'k', 0xff, 0xfe, b'!'];
+            let (_, lossy, lossy_truncated) = capture_stdout_with_limit(1024, || unsafe {
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    invalid.as_ptr() as *const libc::c_void,
+                    invalid.len(),
+                )
+            });
+            assert!(!lossy_truncated);
+            assert!(lossy.starts_with("ok"));
+            assert!(lossy.ends_with('!'));
+            assert!(lossy.contains('\u{FFFD}'));
+        }
     }
 }

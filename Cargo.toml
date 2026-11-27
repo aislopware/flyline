@@ -17,7 +17,7 @@ flybuffer = { path = "crates/flybuffer" }
 flycontent = { path = "crates/flycontent" }
 
 anyhow = "1.0"
-clap = { version = "4.6.9", features = ["derive"] }
+clap = { version = "4.6.10", features = ["derive"] }
 clap_complete = { version = "4.6.12", features = ["unstable-dynamic"] }
 easing-function = "0.1"
 itertools = "0.15"
@@ -33,7 +33,7 @@ unicode-segmentation = "1.13"
 unicode-width = { version = "0.2", default-features = false }
 
 # crates.io release; [patch.crates-io] points its ratatui-core at the fork below.
-ansi-to-tui = "8.0.1"
+ansi-to-tui = "9.0.0"
 # Vendored forks (vendor/README.md): changes flyline needs that upstream does not have.
 ratatui = { path = "vendor/ratatui/ratatui", default-features = false, features = ["macros", "serde", "termina", "unstable-backend-writer", "unstable-rendered-line-info"] }
 skim = { path = "vendor/skim", default-features = false, features = ["algos_only"] }
@@ -62,17 +62,18 @@ crate-type = ["cdylib"]
 [dependencies]
 ansi-to-tui.workspace = true
 anyhow.workspace = true
-chrono = "0.4"
 clap.workspace = true
 clap_complete.workspace = true
 dirs = "7.0"
 # Only `parse` is used; the default features pull in chrono, time and serde.
 duration-str = { version = "0.21", default-features = false }
-easing-function.workspace = true
 flybuffer.workspace = true
-flycomp = { git = "https://github.com/HalFrgrd/flycomp.git", rev = "34e8e6e798fa35b4daa3d4c5586241e95d2dbacf" }
+flycomp = { path = "vendor/flycomp" }
 flycontent.workspace = true
 itertools.workspace = true
+# Time zones from the system tzdb (also Android's concatenated tzdata);
+# replaces the unmaintained chrono.
+jiff = "1.0"
 libc = "0.2"
 log.workspace = true
 lscolors.workspace = true
@@ -83,7 +84,6 @@ nix = { version = "0.32", features = ["fs", "poll", "process", "signal", "user"]
 # that every shell loads, and raises the MSRV to 1.95. Its gain is contended
 # lock throughput, which a line editor does not hit. Move when termina does.
 parking_lot = "0.12"
-parse-style.workspace = true
 pulldown-cmark.workspace = true
 rand.workspace = true
 ratatui.workspace = true
@@ -100,6 +100,7 @@ unicode-width.workspace = true
 uuid = { version = "1.29", features = ["v7"] }
 
 [dev-dependencies]
+proptest = "1"
 rusty-fork = "0.3.1"
 
 [profile.release]
@@ -108,8 +109,6 @@ overflow-checks = true
 lto = true
 codegen-units = 1
 
-[build-dependencies]
-chrono = "0.4"
 
 # cross-rs configurations
 [package.metadata.cross.target.aarch64-linux-android]

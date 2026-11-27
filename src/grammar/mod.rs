@@ -3,6 +3,8 @@ pub mod dparser;
 pub mod lexer;
 #[cfg(test)]
 mod lexer_tests;
+#[cfg(test)]
+mod proptests;
 pub mod quoting;
 
 pub use command_acceptance::*;

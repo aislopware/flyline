@@ -2,6 +2,23 @@ use crate::content::RelativePosition;
 use crate::shell;
 use crate::term_info;
 
+/// Percent-encode `s` for a `file://` URI (RFC 3986), keeping the unreserved
+/// characters and those in `keep`.
+///
+/// Terminals parse OSC 7 as a URI: a raw space, `#`, `?` or `%` in a directory name
+/// gives them the wrong path, and a raw control character would end the sequence.
+fn percent_encode_uri_part(s: &str, keep: &[u8]) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &byte in s.as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) || keep.contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 /// <https://code.visualstudio.com/docs/terminal/shell-integration#_supported-escape-sequences>
 /// <https://sw.kovidgoyal.net/kitty/shell-integration/>
 /// <https://ghostty.org/docs/features/shell-integration#troubleshooting>
@@ -121,10 +138,23 @@ impl std::fmt::Display for EscapeCodes {
         match self {
             // OSC 7
             EscapeCodes::CurrentDirectory { host, path } => {
-                write!(f, "\x1b]7;file://{}{}\x1b\\", host, path)
+                write!(
+                    f,
+                    "\x1b]7;file://{}{}\x1b\\",
+                    percent_encode_uri_part(host, b""),
+                    percent_encode_uri_part(path, b"/")
+                )
             }
+            // kitty reads this form's path verbatim (no percent-decoding), so only the
+            // control characters that would end the sequence early are dropped.
             EscapeCodes::KittyCurrentDirectory { host, path } => {
-                write!(f, "\x1b]7;kitty-shell-cwd://{}{}\x1b\\", host, path)
+                let strip = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
+                write!(
+                    f,
+                    "\x1b]7;kitty-shell-cwd://{}{}\x1b\\",
+                    strip(host),
+                    strip(path)
+                )
             }
             // OSC 2
             EscapeCodes::WindowTitle { title } => {
@@ -291,6 +321,14 @@ pub fn write_escape_codes_to(
     use termina::OneBased;
     use termina::escape::csi::{Csi, Cursor};
 
+    // DECSC / DECRC (`ESC 7` / `ESC 8`), not SCOSC / SCORC (`CSI s` / `CSI u`).
+    // mosh and some other emulators ignore `CSI s`, which left the cursor at
+    // the prompt-start mark and drew the input above the prompt
+    // (HalFrgrd/flyline#1070). `CSI s` also means DECSLRM when left/right
+    // margin mode is on. Every VT100-compatible terminal has DECSC.
+    const SAVE_CURSOR: &str = "\x1b7";
+    const RESTORE_CURSOR: &str = "\x1b8";
+
     if codes.is_empty() {
         return Ok(());
     }
@@ -310,7 +348,7 @@ pub fn write_escape_codes_to(
                 rel_pos.dy,
                 code
             );
-            write!(queue, "{}", Csi::Cursor(Cursor::SaveCursor))?;
+            queue.write_all(SAVE_CURSOR.as_bytes())?;
             if rel_pos.dy < 0 {
                 write!(queue, "{}", Csi::Cursor(Cursor::Up((-rel_pos.dy) as u32)))?;
             } else if rel_pos.dy > 0 {
@@ -325,7 +363,7 @@ pub fn write_escape_codes_to(
             )?;
             log::trace!("Writing escape code: {:?}", code);
             write!(queue, "{}", code)?;
-            write!(queue, "{}", Csi::Cursor(Cursor::RestoreCursor))?;
+            queue.write_all(RESTORE_CURSOR.as_bytes())?;
         } else {
             log::trace!("Writing escape code: {:?}", code);
             write!(queue, "{}", code)?;
@@ -333,4 +371,63 @@ pub fn write_escape_codes_to(
     }
     queue.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_directory_is_a_percent_encoded_file_uri() {
+        let path = "/tmp/a b/#1?/100%/\u{e9}\x1b]2;pwned\x07";
+        let osc7 = EscapeCodes::CurrentDirectory {
+            host: "my host".into(),
+            path: path.into(),
+        }
+        .to_string();
+        assert_eq!(
+            osc7,
+            "\x1b]7;file://my%20host/tmp/a%20b/%231%3F/100%25/%C3%A9%1B%5D2%3Bpwned%07\x1b\\"
+        );
+
+        let kitty = EscapeCodes::KittyCurrentDirectory {
+            host: "h".into(),
+            path: path.into(),
+        }
+        .to_string();
+        assert_eq!(
+            kitty,
+            "\x1b]7;kitty-shell-cwd://h/tmp/a b/#1?/100%/\u{e9}]2;pwned\x1b\\"
+        );
+    }
+
+    #[test]
+    fn prompt_marks_save_and_restore_the_cursor_with_decsc() {
+        let codes = [
+            EscapeCodes::PromptStart {
+                rel_pos: RelativePosition { col: 0, dy: -2 },
+            },
+            EscapeCodes::PromptEnd {
+                rel_pos: RelativePosition { col: 2, dy: 0 },
+            },
+        ];
+        let mut out = Vec::new();
+        write_escape_codes_to(&mut out, &codes).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            !out.contains("\x1b[s"),
+            "SCOSC is not supported by mosh: {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[u"),
+            "SCORC is not supported by mosh: {out:?}"
+        );
+        assert_eq!(out.matches("\x1b7").count(), 2, "{out:?}");
+        assert_eq!(out.matches("\x1b8").count(), 2, "{out:?}");
+        // Each mark is bracketed: save, move, mark, restore.
+        let start = out.find("\x1b]133;A").unwrap();
+        assert!(out[..start].ends_with("\x1b[2A\x1b[G"), "{out:?}");
+        assert!(out[start..].contains("\x1b8"), "{out:?}");
+    }
 }

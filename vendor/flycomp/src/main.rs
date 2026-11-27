@@ -1,0 +1,119 @@
+use clap::Parser;
+
+fn cli_styles() -> clap::builder::Styles {
+    clap::builder::Styles::styled()
+        .header(
+            clap::builder::styling::AnsiColor::Yellow.on_default()
+                | clap::builder::styling::Effects::BOLD,
+        )
+        .usage(
+            clap::builder::styling::AnsiColor::Yellow.on_default()
+                | clap::builder::styling::Effects::BOLD,
+        )
+        .literal(
+            clap::builder::styling::AnsiColor::Green.on_default()
+                | clap::builder::styling::Effects::BOLD,
+        )
+        .placeholder(clap::builder::styling::AnsiColor::White.on_default())
+        .error(
+            clap::builder::styling::AnsiColor::Red.on_default()
+                | clap::builder::styling::Effects::BOLD,
+        )
+        .valid(
+            clap::builder::styling::AnsiColor::Green.on_default()
+                | clap::builder::styling::Effects::BOLD,
+        )
+        .invalid(
+            clap::builder::styling::AnsiColor::Red.on_default()
+                | clap::builder::styling::Effects::BOLD,
+        )
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "flycomp")]
+#[command(about = "Generate shell completions from COMMAND --help output")]
+#[command(color = clap::ColorChoice::Auto)]
+#[command(styles = cli_styles())]
+struct CliArgs {
+    /// Command name or path to synthesize completions for.
+    #[arg(required_unless_present = "version")]
+    command: Option<String>,
+    /// Output format (defaults to bash).
+    #[arg(long, value_enum, default_value_t = flycomp::OutputFormat::Bash)]
+    output: flycomp::OutputFormat,
+    /// Log level to output to stderr (off, error, warn, info, debug, trace).
+    #[arg(long, default_value = "error")]
+    log_level: String,
+    /// Show version information
+    #[arg(long)]
+    version: bool,
+
+    #[command(flatten)]
+    settings: flycomp::FlycompSettings,
+}
+
+struct SimpleLogger;
+
+impl log::Log for SimpleLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        eprintln!("[{}] {}", record.level(), record.args());
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: SimpleLogger = SimpleLogger;
+
+fn main() -> anyhow::Result<()> {
+    let args = CliArgs::parse();
+
+    if args.version {
+        println!(
+            "flycomp version {} ({}) git:{} built:{}",
+            env!("CARGO_PKG_VERSION"),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            env!("GIT_HASH"),
+            env!("BUILD_TIME"),
+        );
+        return Ok(());
+    }
+
+    let log_level = match args.log_level.to_lowercase().as_str() {
+        "off" => log::LevelFilter::Off,
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "info" => log::LevelFilter::Info,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => anyhow::bail!("invalid log level: {}", args.log_level),
+    };
+
+    if log_level != log::LevelFilter::Off {
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log_level);
+    }
+
+    let command_str = args.command.as_deref().unwrap_or("");
+    match flycomp::generate_completion_output_with_settings(
+        command_str,
+        args.output,
+        &args.settings,
+    ) {
+        Ok(output) => {
+            print!("{}", output);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(1);
+        }
+    }
+}

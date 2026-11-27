@@ -42,7 +42,9 @@ def run_handoff_test(bash_path: Path, flyline_path: Path) -> str | None:
     with tempfile.TemporaryDirectory(prefix="flyline-focus-test-") as temporary_directory:
         bashrc_path = Path(temporary_directory) / "bashrc"
         bashrc_path.write_text(
-            f"PS1='$ '\n"
+            # Never let the test shell write the real ~/.bash_history.
+            "HISTFILE=/dev/null\n"
+            "PS1='$ '\n"
             f"enable -f {shlex.quote(str(flyline_path))} flyline\n"
             "flyline --set-delayed-startup-ms 0\n",
             encoding="utf-8",
@@ -53,6 +55,7 @@ def run_handoff_test(bash_path: Path, flyline_path: Path) -> str | None:
         if child_pid == 0:
             environment = os.environ | {
                 "COLUMNS": "80",
+                "HISTFILE": "/dev/null",
                 "LINES": "24",
                 "NO_COLOR": "1",
                 "TERM": "xterm-ghostty",

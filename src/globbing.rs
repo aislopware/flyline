@@ -78,6 +78,8 @@ pub(crate) struct PathPatternExpansion {
     /// (e.g. `baz*` or `*/*.txt`). Glob metacharacters the user quoted or
     /// escaped are kept escaped, e.g. `fi\[1\]*`.
     rhs_pattern: String,
+    /// Whether Bash's `shopt -s dotglob` was enabled when this expansion was constructed.
+    dotglob: bool,
 }
 
 impl PathPatternExpansion {
@@ -88,11 +90,13 @@ impl PathPatternExpansion {
         let raw_prefix = split.raw_prefix.to_string();
         let expanded_prefix = shell::backend().expand_path(&raw_prefix);
         let rhs_pattern = dequote_glob_pattern(pattern, &split, prefix_wildcard);
+        let dotglob = shell::backend().is_dotglob_enabled();
 
         PathPatternExpansion {
             raw_prefix,
             expanded_prefix,
             rhs_pattern,
+            dotglob,
         }
     }
 
@@ -130,7 +134,7 @@ impl PathPatternExpansion {
     }
 
     pub(crate) fn wants_hidden(&self) -> bool {
-        self.rhs_pattern.starts_with('.') && !self.rhs_pattern.starts_with("./")
+        self.dotglob || (self.rhs_pattern.starts_with('.') && !self.rhs_pattern.starts_with("./"))
     }
 
     pub(crate) fn static_prefix(&self) -> Option<String> {
@@ -1021,6 +1025,7 @@ mod tests {
             raw_prefix: String::new(),
             expanded_prefix: expanded_prefix.to_string(),
             rhs_pattern: rhs_pattern.to_string(),
+            dotglob: false,
         }
     }
 

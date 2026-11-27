@@ -20,13 +20,14 @@ RUN apt update && apt install -y \
 
 
 WORKDIR /tmp/bash-build
-RUN curl -LO https://ftp.gnu.org/gnu/bash/bash-${DOCKER_BASH_VERSION}.tar.gz \
+RUN curl -fsSLO https://ftp.gnu.org/gnu/bash/bash-${DOCKER_BASH_VERSION}.tar.gz \
  && tar xzf bash-${DOCKER_BASH_VERSION}.tar.gz \
  && cd bash-${DOCKER_BASH_VERSION} \
- && cp -f /usr/share/misc/config.guess support/config.guess 2>/dev/null || true \
- && cp -f /usr/share/misc/config.sub support/config.sub 2>/dev/null || true \
+ && { cp -f /usr/share/misc/config.guess support/config.guess 2>/dev/null || true; } \
+ && { cp -f /usr/share/misc/config.sub support/config.sub 2>/dev/null || true; } \
  && ./configure --prefix=/opt/bash-${DOCKER_BASH_VERSION} --with-readline \
- && make -j"$(nproc)" \
+ # bash 5.1's parallel build races on builtins/builtext.h; finish serially.
+ && { make -j"$(nproc)" || make; } \
  && make install \
  && cd .. \
  && rm -rf bash-${DOCKER_BASH_VERSION}* 

@@ -1,4 +1,5 @@
 use crate::backend::{Backend, ClearType};
+use crate::buffer::CellWidth;
 use crate::buffer::{Buffer, Cell};
 use crate::layout::{Position, Rect};
 use crate::terminal::{Frame, Terminal, Viewport};
@@ -152,8 +153,15 @@ impl<B: Backend> Terminal<B> {
                 let mut last_col = None;
                 for col in (0..width).rev() {
                     let cell = &self.buffers[current][(col, i)];
+                    // A blank cell looks the same as an erased one unless something
+                    // shows on blanks: a background, reverse video, underline, ...
+                    // The foreground does not matter. (Comparing `cell.style()` with
+                    // `Style::default()` never matched, since `style()` returns
+                    // `Some(Color::Reset)`, so every changed row was drawn out to the
+                    // last column, one erased cell at a time.)
                     let is_whitespace = (cell.symbol() == " " || cell.symbol().is_empty())
-                        && cell.style() == crate::style::Style::default();
+                        && cell.bg == crate::style::Color::Reset
+                        && !cell.modifier.intersects(crate::buffer::VISIBLE_ON_BLANK);
                     if !is_whitespace {
                         last_col = Some(col);
                         break;
@@ -164,15 +172,25 @@ impl<B: Backend> Terminal<B> {
                     let line_cells =
                         (0..=last).map(|col| (col, i, &self.buffers[current][(col, i)]));
                     self.backend.draw_relative_line(line_cells)?;
-                    self.inline_cursor_x = last + 1;
-                    if last + 1 < width {
-                        self.set_cursor_position(Position { x: last + 1, y: i })?;
+                    // A wide glyph in the last drawn cell advances the cursor by its
+                    // width, and a VS16 emoji's advance depends on the terminal, so
+                    // move to the end explicitly before erasing the rest of the row.
+                    let end =
+                        last.saturating_add(self.buffers[current][(last, i)].cell_width().max(1));
+                    if end < width {
+                        self.backend.set_cursor_column(end)?;
+                        self.inline_cursor_x = end;
                         self.backend.clear_region(ClearType::UntilNewLine)?;
+                    } else {
+                        // With autowrap off the cursor stays in the last column, or
+                        // past it in a pending-wrap state; leave it unknown so the
+                        // next move is explicit.
+                        self.inline_cursor_x = width;
                     }
                 } else {
                     self.set_cursor_position(Position { x: 0, y: i })?;
+                    // EL does not move the cursor, so it stays in column 0.
                     self.backend.clear_region(ClearType::UntilNewLine)?;
-                    self.inline_cursor_x = width;
                 }
             }
         }
@@ -602,9 +620,130 @@ mod tests {
         terminal.clear().unwrap();
 
         // The cursor ends at the viewport's top-left cell, which is row 2 on screen.
-        assert_eq!(terminal.backend().cursor_position(), Position { x: 0, y: 2 });
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position { x: 0, y: 2 }
+        );
         assert_eq!(terminal.inline_cursor_x, 0);
         assert_eq!(terminal.inline_cursor_y, 0);
+    }
+
+    /// Randomised differential test of the inline flush: whatever sequence of frames is
+    /// drawn, the screen (TestBackend) must look like the last frame. Blank cells only need
+    /// the same background and blank-visible modifiers, since EL leaves an unstyled blank.
+    #[test]
+    fn flush_inline_screen_matches_random_frames() {
+        use alloc::format;
+
+        use crate::buffer::{CellWidth, VISIBLE_ON_BLANK};
+        use crate::style::{Color, Modifier};
+
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self, n: u64) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (self.0 >> 33) % n
+            }
+        }
+
+        fn looks_blank(cell: &Cell) -> bool {
+            cell.symbol() == " " || cell.symbol().is_empty()
+        }
+
+        for seed in 0..300_u64 {
+            let mut rng = Lcg(seed);
+            let width = 1 + rng.next(12) as u16;
+            let height = 1 + rng.next(3) as u16;
+            let backend = TestBackend::new(width, height);
+            let options = TerminalOptions {
+                viewport: Viewport::Inline(height),
+            };
+            let mut terminal = Terminal::with_options(backend, options).unwrap();
+
+            for frame_index in 0..40 {
+                let mut expected = Buffer::empty(Rect::new(0, 0, width, height));
+                for y in 0..height {
+                    let mut x = 0;
+                    while x < width {
+                        let cell = &mut expected[(x, y)];
+                        match rng.next(7) {
+                            0 | 1 => {}
+                            2 => {
+                                cell.set_fg(Color::Red);
+                            }
+                            3 => {
+                                cell.set_bg(Color::Blue);
+                            }
+                            4 => {
+                                cell.set_style(Modifier::UNDERLINED);
+                            }
+                            5 if x + 1 < width => {
+                                cell.set_symbol("\u{4f60}");
+                                x += 1;
+                            }
+                            _ => {
+                                cell.set_symbol(["a", "b", "c"][rng.next(3) as usize]);
+                            }
+                        }
+                        x += 1;
+                    }
+                }
+
+                terminal
+                    .draw(|frame| frame.buffer_mut().merge(&expected))
+                    .unwrap();
+
+                let screen = terminal.backend().buffer();
+                for y in 0..height {
+                    let mut x = 0;
+                    while x < width {
+                        let want = &expected[(x, y)];
+                        let got = &screen[(x, y)];
+                        let context = format!(
+                            "seed {seed}, frame {frame_index}, cell ({x}, {y})\nexpected {expected:?}\nscreen {screen:?}"
+                        );
+                        if looks_blank(want) {
+                            assert!(looks_blank(got), "{context}");
+                            assert_eq!(want.bg, got.bg, "{context}");
+                            assert_eq!(
+                                want.modifier & VISIBLE_ON_BLANK,
+                                got.modifier & VISIBLE_ON_BLANK,
+                                "{context}"
+                            );
+                        } else {
+                            assert_eq!(want.symbol(), got.symbol(), "{context}");
+                            assert_eq!(want.fg, got.fg, "{context}");
+                            assert_eq!(want.bg, got.bg, "{context}");
+                        }
+                        x += want.cell_width().max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flush_inline_trims_blank_cells_and_tracks_wide_glyph_advance() {
+        let backend = TestBackend::new(10, 1);
+        let options = TerminalOptions {
+            viewport: Viewport::Inline(1),
+        };
+        let mut terminal = Terminal::with_options(backend, options).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget("ab\u{4f60}", frame.area());
+            })
+            .unwrap();
+
+        terminal.backend().assert_buffer_lines(["ab\u{4f60}      "]);
+        // "ab" plus a two-column glyph: the row is drawn up to column 4, not 10, and the
+        // rest is erased from column 4, not from the glyph's second half.
+        assert_eq!(terminal.inline_cursor_x, 4);
+        assert_eq!(terminal.backend().cursor_position(), Position::new(4, 0));
     }
 
     #[test]
@@ -642,8 +781,9 @@ mod tests {
         terminal
             .backend()
             .assert_buffer_lines(["Hi        ", "          "]);
-        assert_eq!(terminal.inline_cursor_x, 10);
+        // The blank row is erased with EL from column 0, not drawn with spaces.
+        assert_eq!(terminal.inline_cursor_x, 0);
         assert_eq!(terminal.inline_cursor_y, 1);
-        assert_eq!(terminal.backend().cursor_position(), Position::new(10, 1));
+        assert_eq!(terminal.backend().cursor_position(), Position::new(0, 1));
     }
 }

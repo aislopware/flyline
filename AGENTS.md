@@ -10,7 +10,7 @@ This document provides a simplified developer guide for [flyline](.), a Bash plu
 - **[src/shell/bash/symbols.rs](src/shell/bash/symbols.rs)**: C-compatible definitions of GNU Bash internal types, structures, and global variables.
 - **[src/prompt_manager.rs](src/prompt_manager.rs)**: Asynchronous shell prompt widgets, PS1 configurations, and terminal animations.
 - **[crates/flybuffer](crates/flybuffer)**: Text state management, cursor movements, and undo/redo stacks.
-- **[vendor/](vendor/README.md)**: Vendored forks of ratatui, termina and skim (git subtree). Edit them in place; update from upstream with `git subtree pull` as described in vendor/README.md.
+- **[vendor/](vendor/README.md)**: Vendored forks of ratatui, termina, skim and flycomp (git subtree). Edit them in place; update from upstream with `git subtree pull` as described in vendor/README.md.
 
 ## Useful Commands
 ```bash
@@ -26,8 +26,8 @@ enable -d flyline
 # Run unit tests only (avoids slow different-bash-version integration tests)
 cargo test --lib
 
-# To run flycomp unit tests specifically
-cargo test -p flycomp
+# To run flycomp unit tests specifically (vendored, its own workspace)
+(cd vendor/flycomp && cargo test --lib)
 
 # Format the codebase after making changes
 cargo fmt

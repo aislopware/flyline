@@ -1,0 +1,5 @@
+/target/
+*.gif
+*.svg
+grep_completion.sh
+evp_completion.json

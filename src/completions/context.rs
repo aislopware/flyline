@@ -412,6 +412,9 @@ fn get_completion_context_with_word_breaks<'a>(
                         TokenKind::Newline
                             | TokenKind::Semicolon
                             | TokenKind::DoubleSemicolon
+                            | TokenKind::SemiAnd
+                            | TokenKind::DoubleSemiAnd
+                            | TokenKind::PipeAnd
                             | TokenKind::And
                             | TokenKind::Or
                             | TokenKind::Background

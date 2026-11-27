@@ -48,7 +48,7 @@ jobs:
           key: supply-chain
       - name: Install cargo-deny and cargo-audit
         # Pinned; rust-cache keeps ~/.cargo/bin, so later runs skip the build.
-        run: cargo install --locked cargo-deny@0.22.0 cargo-audit@0.23.0
+        run: cargo install --locked cargo-deny@0.22.1 cargo-audit@0.23.0
       - name: cargo deny
         run: cargo deny check
       - name: cargo audit

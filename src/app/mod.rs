@@ -3,7 +3,7 @@ pub(crate) mod auto_close;
 pub(crate) mod formatted_buffer;
 mod ui;
 use crate::subshell_ipc::{self, IpcStatus, SubshellHandle};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::sys::wait::WaitStatus;
 pub(crate) use ui::DrawnContent;
 
 #[derive(Debug, Clone)]
@@ -90,9 +90,10 @@ fn restore_terminal(write: &mut impl std::io::Write) {
     let reset = |code| Csi::Mode(DecMode::ResetDecPrivateMode(DecPrivateMode::Code(code)));
     let _ = write!(
         write,
-        "{}{}{}",
+        "{}{}{}{}",
         reset(DecPrivateModeCode::BracketedPaste),
         reset(DecPrivateModeCode::FocusTracking),
+        reset(DecPrivateModeCode::Theme),
         Csi::Keyboard(Keyboard::PopFlags(1))
     );
     mouse_state(|m| m.disable());
@@ -114,6 +115,7 @@ fn drain_shutdown_events(timeout: Duration) {
                 | TerminaEvent::Csi(Csi::Cursor(CsiCursor::ActivePositionReport { .. }))
                 | TerminaEvent::Csi(Csi::Device(CsiDevice::DeviceAttributes(_)))
                 | TerminaEvent::Osc(termina::escape::osc::Osc::ChangeDynamicColors(..))
+                | TerminaEvent::Csi(Csi::Mode(DecMode::ReportTheme(_)))
         )
     };
 
@@ -145,6 +147,19 @@ fn drain_shutdown_events(timeout: Duration) {
             }
         }
     }
+}
+
+/// Ask the terminal for focus reports and, with DEC mode 2031, for a report when it
+/// switches between dark and light (`CSI ? 997 ; 1|2 n`: macOS appearance, a theme
+/// toggle), so the palette follows without restarting the shell. Terminals without
+/// these modes ignore them. [`restore_terminal`] turns both off again.
+fn enable_terminal_reports() {
+    let set_mode = |code| Csi::Mode(DecMode::SetDecPrivateMode(DecPrivateMode::Code(code)));
+    let _ = crate::flush_stdout!(
+        "{}{}",
+        set_mode(DecPrivateModeCode::FocusTracking),
+        set_mode(DecPrivateModeCode::Theme)
+    );
 }
 
 fn configure_terminal(extended_key_codes: bool, mouse_mode: &crate::settings::MouseMode) {
@@ -396,6 +411,8 @@ pub(crate) struct App<'a> {
     pub(super) leader_key_active_at: Option<std::time::Instant>,
     pub(super) app_start_time: std::time::Instant,
     pub(super) has_run_delayed_startup: Option<std::time::Instant>,
+    /// When a theme report made flyline ask for the terminal colours (OSC 10/11).
+    color_query_sent_at: Option<std::time::Instant>,
     pub(super) last_resize_time: Option<std::time::Instant>,
     pub(super) path_warming_subshell: Option<SubshellHandle<shell::PathScanPayload>>,
     pub(super) git_warming_subshell: Option<SubshellHandle<Option<crate::git::GitRepoPayload>>>,
@@ -547,6 +564,7 @@ impl<'a> App<'a> {
             leader_key_active_at: None,
             app_start_time: std::time::Instant::now(),
             has_run_delayed_startup: None,
+            color_query_sent_at: None,
             last_resize_time: None,
             path_warming_subshell,
             git_warming_subshell,
@@ -837,6 +855,7 @@ impl<'a> App<'a> {
             }
 
             if self.handle_delayed_startup() {
+                self.on_palette_changed();
                 redraw = true;
             }
 
@@ -1065,14 +1084,17 @@ impl<'a> App<'a> {
                                 );
                             }
 
-                            // Ive noticed that zellij maintains its "is_line_wrapped" state
-                            // even when we clear and redraw the lines
-                            // This causes miscalculations of number of rows to move up because
-                            // zellij combines two lines into one when the terminal is widened
-                            // but our logic thinks those two lines are still separate.
-                            // I have found issuing delete line commands fixes it.
+                            // DL is a workaround for multiplexers that keep their own
+                            // wrapped-line state across redraws (zellij joins two rows
+                            // into one when the window widens, so rows_up comes out
+                            // wrong). Direct terminals don't need it: the clear below
+                            // erases from the cursor down. foot implements DL as a
+                            // scroll of its grid ring buffer, and its next reflow then
+                            // shifts the cursor below the prompt, so every resize left
+                            // another prompt behind (HalFrgrd/flyline#1068).
+                            let reset_wrapped_lines = crate::term_info::multiplexer().is_some();
                             let delete_count = (rows_up as u32 + 1).min(winsize.rows as u32);
-                            if delete_count > 0 {
+                            if reset_wrapped_lines && delete_count > 0 {
                                 use termina::escape::csi::{Csi, Edit};
                                 let _ = crate::flush_stdout!(
                                     "{}",
@@ -1172,6 +1194,14 @@ impl<'a> App<'a> {
                             self.on_possible_buffer_change();
                             true
                         }
+                        TerminaEvent::Csi(Csi::Mode(DecMode::ReportTheme(mode))) => {
+                            // The report only says dark or light; the new fg/bg arrive as
+                            // OSC 10/11 replies, which the arm below applies.
+                            log::debug!("Terminal theme changed to {:?}", mode);
+                            crate::term_info::request_terminal_colors();
+                            self.color_query_sent_at = Some(std::time::Instant::now());
+                            false
+                        }
                         TerminaEvent::Osc(termina::escape::osc::Osc::ChangeDynamicColors(
                             num,
                             colors,
@@ -1189,10 +1219,14 @@ impl<'a> App<'a> {
                                     _ => {}
                                 }
                                 crate::term_info::update_terminal_colors(tc);
-                                crate::settings().apply_detected_terminal_colors(
+                                let changed = crate::settings().apply_detected_terminal_colors(
                                     tc,
                                     crate::term_info::detect_theme_from_colorfgbg(),
-                                )
+                                );
+                                if changed {
+                                    self.on_palette_changed();
+                                }
+                                changed
                             } else {
                                 false
                             }
@@ -1244,7 +1278,13 @@ impl<'a> App<'a> {
         let had_recent_started_focus_tracking = self
             .has_run_delayed_startup
             .is_some_and(|t| t.elapsed() < Duration::from_millis(100));
-        let should_drain = had_recent_mouse || had_recent_started_focus_tracking;
+        // A theme switch just before Enter: the OSC 10/11 replies may still be on
+        // their way, and must not reach the command's input.
+        let had_recent_color_query = self
+            .color_query_sent_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1));
+        let should_drain =
+            had_recent_mouse || had_recent_started_focus_tracking || had_recent_color_query;
 
         let exit_state = match self.mode {
             AppRunningState::Exiting(ExitState::WithCommand(cmd)) => {
@@ -1279,7 +1319,13 @@ impl<'a> App<'a> {
         // Stop terminal-generated events and consume trailing reports before self is dropped and releases raw mode.
         restore_terminal(&mut std::io::stdout());
         if should_drain {
-            drain_shutdown_events(Duration::from_millis(150));
+            let timeout = if had_recent_color_query {
+                // Covers the reply's round trip over a slow ssh link.
+                Duration::from_millis(400)
+            } else {
+                Duration::from_millis(150)
+            };
+            drain_shutdown_events(timeout);
         }
 
         exit_state
@@ -1328,6 +1374,10 @@ impl<'a> App<'a> {
         );
         if mouse_enabled {
             mouse_state(|m| m.enable());
+        }
+        if self.has_run_delayed_startup.is_some() {
+            // restore_terminal() turned these off; delayed startup turned them on.
+            enable_terminal_reports();
         }
 
         self.sync_viewport_top_from_cpr();
@@ -1833,7 +1883,7 @@ impl<'a> App<'a> {
                     self.content_mode = ContentMode::Normal;
                     return true;
                 }
-                IpcStatus::Empty => match waitpid(handle.pid, Some(WaitPidFlag::WNOHANG)) {
+                IpcStatus::Empty => match handle.try_wait() {
                     Ok(WaitStatus::Exited(_, code)) => {
                         log::error!(
                             "Tab completion subshell PID {} exited with code {} before sending payload",
@@ -1890,7 +1940,7 @@ impl<'a> App<'a> {
                     };
                     return true;
                 }
-                IpcStatus::Empty => match waitpid(handle.pid, Some(WaitPidFlag::WNOHANG)) {
+                IpcStatus::Empty => match handle.try_wait() {
                     Ok(WaitStatus::Exited(_, code)) if code != 0 => {
                         log::error!(
                             "flycomp subshell PID {} exited with non-zero code {}",
@@ -2018,8 +2068,7 @@ impl<'a> App<'a> {
                 log::warn!("[Startup] CPR returned None for viewport_top");
             }
 
-            let set_mode = |code| Csi::Mode(DecMode::SetDecPrivateMode(DecPrivateMode::Code(code)));
-            let _ = crate::flush_stdout!("{}", set_mode(DecPrivateModeCode::FocusTracking));
+            enable_terminal_reports();
         });
         colors_changed
     }
@@ -2179,16 +2228,19 @@ impl<'a> App<'a> {
         // cmd_args is non-empty, so split_first() always returns Some.
         let (prog, args) = cmd_args.split_first().expect("ai_command is non-empty");
         crate::reset_sigchld();
-        match std::process::Command::new(prog)
-            .args(args)
-            .arg(&final_arg)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
+        // Its own process group, so cancelling kills the tools it started too; no
+        // terminal input, which flyline is reading.
+        match KillOnDropChild::spawn(
+            std::process::Command::new(prog)
+                .args(args)
+                .arg(&final_arg)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        ) {
             Ok(child) => {
                 self.content_mode = ContentMode::AgentModeWaiting {
-                    child: KillOnDropChild::new(child),
+                    child,
                     command_display,
                     start_time: std::time::Instant::now(),
                 };
@@ -2213,6 +2265,50 @@ impl<'a> App<'a> {
                 AppRunningState::Exiting(ExitState::WithCommand(self.buffer.buffer().to_string()));
         } else {
             self.buffer.insert_newline();
+        }
+    }
+
+    /// Re-style the command line with the current palette.
+    fn reformat_buffer(&mut self) {
+        self.formatted_buffer_cache = if matches!(
+            self.content_mode,
+            ContentMode::FuzzyHistorySearch(FuzzyHistorySource::AgentPrompts)
+                | ContentMode::AgentError { .. }
+                | ContentMode::AgentOutputSelection { .. }
+                | ContentMode::AgentModeWaiting { .. }
+        ) {
+            format_agent_buffer(
+                &self.dparser_tokens_cache,
+                self.buffer.cursor_byte_pos(),
+                self.buffer.selection_byte(),
+                self.buffer.buffer().len(),
+                &crate::settings().colour_palette,
+                crate::settings().enable_easter_eggs,
+            )
+        } else {
+            format_buffer(
+                &self.dparser_tokens_cache,
+                self.buffer.cursor_byte_pos(),
+                self.buffer.selection_byte(),
+                self.buffer.buffer().len(),
+                self.mode.is_running(),
+                &crate::settings().colour_palette,
+                crate::settings().enable_easter_eggs,
+            )
+        };
+    }
+
+    /// The palette changed (a new terminal background or theme): drop every style
+    /// that was baked from the old one.
+    fn on_palette_changed(&mut self) {
+        self.reformat_buffer();
+        match &mut self.content_mode {
+            ContentMode::TabCompletion(active)
+            | ContentMode::TabCompletionWaiting {
+                last_active_suggestions: Some(active),
+                ..
+            } => active.invalidate_formatting(),
+            _ => {}
         }
     }
 
@@ -2593,32 +2689,7 @@ impl<'a> App<'a> {
             })
         })();
 
-        self.formatted_buffer_cache = if matches!(
-            self.content_mode,
-            ContentMode::FuzzyHistorySearch(FuzzyHistorySource::AgentPrompts)
-                | ContentMode::AgentError { .. }
-                | ContentMode::AgentOutputSelection { .. }
-                | ContentMode::AgentModeWaiting { .. }
-        ) {
-            format_agent_buffer(
-                &self.dparser_tokens_cache,
-                self.buffer.cursor_byte_pos(),
-                self.buffer.selection_byte(),
-                self.buffer.buffer().len(),
-                &crate::settings().colour_palette,
-                crate::settings().enable_easter_eggs,
-            )
-        } else {
-            format_buffer(
-                &self.dparser_tokens_cache,
-                self.buffer.cursor_byte_pos(),
-                self.buffer.selection_byte(),
-                self.buffer.buffer().len(),
-                self.mode.is_running(),
-                &crate::settings().colour_palette,
-                crate::settings().enable_easter_eggs,
-            )
-        };
+        self.reformat_buffer();
 
         let cursor_byte_pos = self.buffer.cursor_byte_pos();
         self.tooltip = self

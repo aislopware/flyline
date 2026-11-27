@@ -286,6 +286,21 @@ where
         let mut last_pos: Option<Position> = None;
         let mut skip_until_x = 0;
         let mut skip_y = 0;
+        // Erased cells waiting to be written as one `ECH n` + `CUF n`, so a run
+        // of blanks costs two sequences rather than two per cell.
+        let mut pending_erase: u16 = 0;
+        let flush_erase = |string: &mut String, pending: &mut u16| {
+            if *pending > 0 {
+                write!(
+                    string,
+                    "{}{}",
+                    Csi::Edit(Edit::EraseCharacter(u32::from(*pending))),
+                    Csi::Cursor(Cursor::Right(u32::from(*pending)))
+                )
+                .unwrap();
+                *pending = 0;
+            }
+        };
 
         for (x, y, cell) in content {
             if y == skip_y && x < skip_until_x {
@@ -296,6 +311,7 @@ where
             skip_y = y;
 
             if last_pos.map_or(x != 0, |p| x != p.x + 1 || y != p.y) {
+                flush_erase(&mut string, &mut pending_erase);
                 write!(string, "\x1b[{}G", x + 1).unwrap();
             }
             last_pos = Some(Position {
@@ -331,21 +347,20 @@ where
                 modifier = cell.modifier;
             }
             if !attributes.is_empty() {
+                // ECH erases with the current background, so a pending run must be
+                // written before the attributes change.
+                flush_erase(&mut string, &mut pending_erase);
                 write!(string, "{}", Csi::Sgr(Sgr::Attributes(attributes))).unwrap();
             }
 
             if let Some(sym) = cell.symbol_opt().filter(|s| !s.is_empty()) {
+                flush_erase(&mut string, &mut pending_erase);
                 string.push_str(sym);
             } else {
-                write!(
-                    string,
-                    "{}{}",
-                    Csi::Edit(Edit::EraseCharacter(1)),
-                    Csi::Cursor(Cursor::Right(1))
-                )
-                .unwrap();
+                pending_erase += 1;
             }
         }
+        flush_erase(&mut string, &mut pending_erase);
 
         if string.is_empty() {
             return Ok(());
@@ -1283,6 +1298,38 @@ mod tests {
         let right = Csi::Cursor(Cursor::Right(1)).to_string();
         assert!(output.contains(&erase));
         assert!(output.contains(&right));
+    }
+
+    #[test]
+    fn draw_relative_line_erases_a_run_of_blank_cells_at_once() {
+        let mut backend = backend();
+        let a = Cell::new("a");
+        let empty = Cell::EMPTY;
+        let mut red_blank = Cell::EMPTY;
+        red_blank.set_bg(Color::Red);
+        let b = Cell::new("b");
+        let content = [
+            (0, 0, &a),
+            (1, 0, &empty),
+            (2, 0, &empty),
+            (3, 0, &empty),
+            (4, 0, &red_blank),
+            (5, 0, &red_blank),
+            (6, 0, &b),
+        ];
+
+        backend.draw_relative_line(content.into_iter()).unwrap();
+
+        let output = backend.terminal.output();
+        let ech = |n| Csi::Edit(termina::escape::csi::Edit::EraseCharacter(n)).to_string();
+        let cuf = |n| Csi::Cursor(Cursor::Right(n)).to_string();
+        // Three default blanks, then two red ones: the background change splits the run,
+        // because ECH erases with the current background.
+        let default_run = format!("a{}{}", ech(3), cuf(3));
+        assert!(output.contains(&default_run), "{output:?}");
+        let red_run = format!("\x1b[41m{}{}\x1b[49mb", ech(2), cuf(2));
+        assert!(output.contains(&red_run), "{output:?}");
+        assert_eq!(output.matches(&ech(1)).count(), 0, "{output:?}");
     }
 
     #[test]

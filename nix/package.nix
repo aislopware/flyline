@@ -14,8 +14,8 @@ rustPlatform.buildRustPackage {
   src = lib.cleanSource ../.;
 
   cargoDeps = rustPlatform.importCargoLock {
+    # Every fork, flycomp included, is vendored: nothing is fetched from git.
     lockFile = ../Cargo.lock;
-    allowBuiltinFetchGit = true;
   };
   cargoHash = null;
 

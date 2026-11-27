@@ -1,0 +1,6431 @@
+use crate::{Arg, Command};
+use regex_lite::Regex;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedOption {
+    short: Option<String>,
+    long: Option<String>,
+    value_name: Option<String>,
+    num_args: Option<String>,
+}
+
+fn remove_device_controls(data: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\\[XZ]'[^']*'").unwrap())
+        .replace_all(data, "")
+        .into_owned()
+}
+
+fn replace_special_escapes(data: &str) -> String {
+    data.replace(r"\(oq", "'")
+        .replace(r"\(cq", "'")
+        .replace(r"\(aq", "'")
+        .replace(r"\(dq", "\"")
+        .replace(r"\(lq", "\"")
+        .replace(r"\(rq", "\"")
+        .replace(r"\(em", "--")
+        .replace(r"\(en", "-")
+        .replace(r"\(mi", "-")
+        .replace(r"\(hy", "-")
+        .replace(r"\e", "\\")
+        .replace(r"\-", "-")
+        .replace(r"\&", "")
+        .replace(r"\,", "")
+        .replace(r"\/", "")
+        .replace(r"\^", "")
+        .replace(r"\c", "")
+        .replace(r"\ ", " ")
+        .replace(r"\~", " ")
+        .replace(r"\:", "")
+        .replace(r"\|", "")
+        .replace(r"\%", "")
+}
+
+fn strip_font_escapes(data: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\\f(\([^)]{2}|\[[^\]]*\]|.)").unwrap())
+        .replace_all(data, "")
+        .into_owned()
+}
+
+fn strip_line_comment(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with(".\\\"") || trimmed.starts_with(".\"") {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+fn trim_known_inline_macros(line: &str) -> String {
+    let trimmed = line.trim();
+    let mut line = trimmed.to_string();
+
+    if let Some(stripped) = trimmed.strip_prefix('.') {
+        line = stripped.to_string();
+
+        static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let macro_re = RE.get_or_init(|| {
+            Regex::new(
+                r"^(?:[A-Z][A-Za-z]?|rb|Nm|Fl|Ar|Pa|Ev|Dv|Cm|Ic|No|Sq|Dq|Pq|Em|Sy|Li|Tn|Ns|Op|Oo|Oc|Xo|Xc|Xr)\s+",
+            )
+            .unwrap()
+        });
+        while macro_re.is_match(&line) {
+            line = macro_re.replace(&line, "").into_owned();
+        }
+    }
+
+    if line.ends_with(" ,") || line.ends_with(" .") {
+        let punctuation = line.chars().last().unwrap();
+        line.truncate(line.len() - 2);
+        line.push(punctuation);
+    }
+
+    line
+}
+
+fn normalize_whitespace(data: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\s+").unwrap())
+        .replace_all(data.trim(), " ")
+        .into_owned()
+}
+
+fn clean_sentence(desc: &str) -> String {
+    let desc = normalize_whitespace(desc);
+    if desc.is_empty() {
+        return desc;
+    }
+
+    let max_len = 160;
+    let mut sentences = desc
+        .split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty());
+    let mut out = String::new();
+
+    for sentence in sentences.by_ref() {
+        let candidate = if out.is_empty() {
+            format!("{sentence}.")
+        } else {
+            format!("{out} {sentence}.")
+        };
+        if candidate.len() > max_len && !out.is_empty() {
+            break;
+        }
+        out = candidate;
+        if out.len() >= max_len {
+            break;
+        }
+    }
+
+    if out.is_empty() {
+        desc.chars().take(max_len).collect::<String>()
+    } else {
+        out.trim_end_matches('.').to_string()
+    }
+}
+
+fn strip_groff_wrappers(data: &str) -> String {
+    let data = remove_device_controls(data);
+    let data = strip_font_escapes(&data);
+    let data = replace_special_escapes(&data);
+    let data = data.replace("\x0C", " ");
+    static RE1: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let data = RE1
+        .get_or_init(|| Regex::new(r"(?m)^\.PD(?: \d+)?$").unwrap())
+        .replace_all(&data, "")
+        .into_owned();
+    static RE2: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE2.get_or_init(|| Regex::new(r"\.([A-Z][A-Za-z]?|rb)\b").unwrap())
+        .replace_all(&data, "")
+        .into_owned()
+}
+
+fn normalize_text(data: &str, cmd_name: &str) -> String {
+    let mut lines = Vec::new();
+
+    for raw_line in data.lines() {
+        let Some(raw_line) = strip_line_comment(raw_line) else {
+            continue;
+        };
+        let line = raw_line.replace(".Nm", cmd_name);
+        let line = strip_groff_wrappers(&line);
+        let line = trim_known_inline_macros(&line);
+        let line = line
+            .replace("\\-\\^-", "--")
+            .replace("\\^-", "-")
+            .replace("\\^", "")
+            .replace(" Ns ", "")
+            .replace(" Xo", "")
+            .replace(" Xc", "")
+            .replace(" Oo ", "[")
+            .replace(" Oc", "]")
+            .replace(" Op ", "[")
+            .replace(" Ar ", " ")
+            .replace(" Pa ", " ")
+            .replace(" Ev ", " ")
+            .replace(" Dv ", " ")
+            .replace(" Cm ", " ")
+            .replace(" Ic ", " ")
+            .replace(" Fl Fl ", " --")
+            .replace(" Fl ", " -")
+            .replace("No ", "")
+            .replace("Sq ", "")
+            .replace("Dq ", "")
+            .replace("Pq ", "")
+            .replace("Em ", "")
+            .replace("Sy ", "")
+            .replace("Li ", "")
+            .replace("Tn ", "")
+            .replace("Ux", "Unix")
+            .replace("Bx", "BSD");
+        let line = normalize_whitespace(&line);
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn unquote(data: &str) -> String {
+    let trimmed = data.trim();
+    if trimmed.len() >= 2 {
+        if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('`') && trimmed.ends_with('\''))
+        {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn clean_option_source(data: &str, cmd_name: &str) -> String {
+    normalize_text(data, cmd_name)
+        .replace('\n', ", ")
+        .replace('"', "")
+        .replace(" [ ", "[")
+        .replace(" ]", "]")
+        .replace(" ,", ",")
+        .replace(" :", ":")
+        .replace(" =", "=")
+        .replace("= ", "=")
+        .replace(" / ", "/")
+}
+
+fn split_aliases(option_text: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\s*(?:,|\||/|\bor\b)\s*").unwrap())
+        .split(option_text)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn normalize_value_token(token: &str) -> Option<String> {
+    let token = token.trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '.'));
+    if token.is_empty() {
+        return None;
+    }
+    let candidate = token.trim_matches(|ch| matches!(ch, '[' | ']')).trim();
+    let token = if candidate.starts_with('-') {
+        token
+    } else {
+        candidate
+    };
+    if token.is_empty() || (token.starts_with('-') && !token.starts_with('[')) {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn find_value_type(remainder: &str) -> (Option<String>, Option<String>) {
+    let remainder = remainder.trim();
+    if remainder.is_empty() {
+        return (None, None);
+    }
+
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    if let Some(caps) = RE
+        .get_or_init(|| Regex::new(r"^\[=?(?P<value>[^\]]+)\]").unwrap())
+        .captures(remainder)
+    {
+        let value = normalize_value_token(caps.name("value").unwrap().as_str());
+        return (value, Some("?".to_string()));
+    }
+
+    if let Some(value) = remainder.strip_prefix('=') {
+        let value = value
+            .split_whitespace()
+            .next()
+            .and_then(normalize_value_token);
+        return (value, Some("1".to_string()));
+    }
+
+    let candidate = remainder
+        .split_whitespace()
+        .next()
+        .and_then(normalize_value_token);
+    if let Some(value) = candidate {
+        if value.chars().all(|ch| ch.is_ascii_digit()) {
+            return (None, None);
+        }
+        return (Some(value), Some("1".to_string()));
+    }
+
+    (None, None)
+}
+
+fn extract_val_from_alias(alias: &str) -> Option<String> {
+    let alias = alias.trim();
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let caps = RE
+        .get_or_init(|| {
+            Regex::new(r"^(?P<option>--?(?:\[no\-?\])?[A-Za-z0-9#][A-Za-z0-9_-]*)(?P<rest>.*)$")
+                .unwrap()
+        })
+        .captures(alias)?;
+    let rest = caps.name("rest").map(|m| m.as_str()).unwrap_or("");
+    let (value_name, _) = find_value_type(rest);
+    value_name
+}
+
+fn parse_alias(alias: &str, shared_value_name: Option<&str>) -> Option<ParsedOption> {
+    let alias = alias.trim();
+    // Support options that contain brackets for negation, e.g. --[no-]color or --[no]color.
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let caps = RE
+        .get_or_init(|| {
+            Regex::new(r"^(?P<option>--?(?:\[no\-?\])?[A-Za-z0-9#][A-Za-z0-9_-]*)(?P<rest>.*)$")
+                .unwrap()
+        })
+        .captures(alias)?;
+    let option = caps.name("option").unwrap().as_str();
+    if option == "-" || option == "--" {
+        return None;
+    }
+
+    let rest = caps.name("rest").map(|m| m.as_str()).unwrap_or("");
+    let (value_name, num_args) = find_value_type(rest);
+    let mut parsed = ParsedOption {
+        short: None,
+        long: None,
+        value_name,
+        num_args,
+    };
+
+    if option.starts_with("--") {
+        parsed.long = Some(option.to_string());
+    } else if option.len() == 2 {
+        parsed.short = Some(option.to_string());
+    } else {
+        let mut handled = false;
+        let stripped = option.trim_start_matches('-');
+        if !option.starts_with("--") && stripped.len() >= 2 {
+            let chars: Vec<char> = stripped.chars().collect();
+            if chars[0].is_alphabetic() {
+                if let Some(val_name) = shared_value_name {
+                    if stripped.ends_with(val_name) && stripped.len() > val_name.len() {
+                        let prefix = &stripped[..stripped.len() - val_name.len()];
+                        if prefix.chars().count() == 1 {
+                            parsed.short = Some(format!("-{prefix}"));
+                            if parsed.value_name.is_none() {
+                                parsed.value_name = Some(val_name.to_string());
+                                parsed.num_args = Some("1".to_string());
+                            }
+                            handled = true;
+                        }
+                    }
+                } else {
+                    let suffix: String = chars[1..].iter().collect();
+                    if !suffix.is_empty()
+                        && suffix
+                            .chars()
+                            .all(|c| c.is_uppercase() && c.is_alphabetic())
+                    {
+                        parsed.short = Some(format!("-{}", chars[0]));
+                        if parsed.value_name.is_none() {
+                            parsed.value_name = Some(suffix);
+                            parsed.num_args = Some("1".to_string());
+                        }
+                        handled = true;
+                    }
+                }
+            }
+        }
+        if !handled {
+            parsed.long = Some(format!("--{}", &option[1..]));
+        }
+    }
+
+    Some(parsed)
+}
+
+fn parse_option_declaration(option_text: &str, cmd_name: &str) -> Vec<ParsedOption> {
+    let option_text = clean_option_source(option_text, cmd_name);
+    let option_text = unquote(&option_text);
+    let aliases = split_aliases(&option_text);
+    let mut parsed = Vec::new();
+    let mut pending_short: Option<ParsedOption> = None;
+
+    let mut shared_value_name = None;
+    for alias in &aliases {
+        if let Some(val) = extract_val_from_alias(alias) {
+            shared_value_name = Some(val);
+            break;
+        }
+    }
+
+    for alias in aliases {
+        let Some(current) = parse_alias(&alias, shared_value_name.as_deref()) else {
+            continue;
+        };
+
+        match (&pending_short, &current.short, &current.long) {
+            (Some(existing), None, Some(_)) if existing.long.is_none() => {
+                let mut merged = existing.clone();
+                merged.long = current.long.clone();
+                if current.value_name.is_some() {
+                    merged.value_name = current.value_name.clone();
+                    merged.num_args = current.num_args.clone();
+                } else if merged.value_name.is_none() {
+                    merged.value_name = current.value_name.clone();
+                    merged.num_args = current.num_args.clone();
+                }
+                parsed.push(merged);
+                pending_short = None;
+            }
+            (Some(existing), Some(_), None) => {
+                parsed.push(existing.clone());
+                pending_short = Some(current);
+            }
+            _ if current.short.is_some() && current.long.is_none() => {
+                if let Some(existing) = pending_short.replace(current) {
+                    parsed.push(existing);
+                }
+            }
+            _ => {
+                parsed.push(current);
+            }
+        }
+    }
+
+    if let Some(existing) = pending_short {
+        parsed.push(existing);
+    }
+
+    parsed
+}
+
+fn looks_like_option_block(option_text: &str, cmd_name: &str) -> bool {
+    let Some(first_line) = option_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with(".PD"))
+    else {
+        return false;
+    };
+
+    !parse_option_declaration(first_line, cmd_name).is_empty()
+}
+
+fn merge_arg(existing: &mut Arg, incoming: ParsedOption, description: &str) {
+    if existing.short.is_none() {
+        existing.short = incoming.short;
+    }
+    if existing.long.is_none() {
+        existing.long = incoming.long;
+    }
+    if existing.value_name.is_none() {
+        existing.value_name = incoming.value_name;
+    }
+    if existing.num_args.is_none() {
+        existing.num_args = incoming.num_args;
+    }
+    if existing
+        .description
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+        && !description.is_empty()
+    {
+        existing.description = Some(description.to_string());
+    }
+}
+
+fn add_option(cmd: &mut Command, option_text: &str, description: &str) -> bool {
+    let description = clean_sentence(&normalize_text(
+        description,
+        cmd.name.as_deref().unwrap_or(""),
+    ));
+    let parsed_options = parse_option_declaration(option_text, cmd.name.as_deref().unwrap_or(""));
+    let mut added = false;
+
+    for parsed in parsed_options {
+        let key_short = parsed.short.clone();
+        let key_long = parsed.long.clone();
+        if key_short.is_none() && key_long.is_none() {
+            continue;
+        }
+
+        if let Some(existing) = cmd.args.iter_mut().find(|arg| {
+            (key_short.is_some() && arg.short == key_short)
+                || (key_long.is_some() && arg.long == key_long)
+        }) {
+            merge_arg(existing, parsed, &description);
+        } else {
+            cmd.args.push(Arg {
+                short: parsed.short,
+                long: parsed.long,
+                description: if description.is_empty() {
+                    None
+                } else {
+                    Some(description.clone())
+                },
+                value_name: parsed.value_name,
+                num_args: parsed.num_args,
+                ..Default::default()
+            });
+            added = true;
+        }
+    }
+
+    added
+}
+
+fn section_title(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let title = trimmed
+        .strip_prefix(".SH ")
+        .or_else(|| trimmed.strip_prefix(".Sh "))?
+        .trim()
+        .trim_matches('"');
+    Some(title.to_string())
+}
+
+fn extract_section<'a>(content: &'a str, names: &[&str]) -> Option<&'a str> {
+    let mut start = None;
+    let mut offset = 0;
+
+    for line in content.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+
+        if let Some(title) = section_title(line) {
+            if start.is_none() && names.iter().any(|name| *name == title) {
+                start = Some(offset);
+                continue;
+            }
+
+            if let Some(section_start) = start {
+                return Some(&content[section_start..line_start]);
+            }
+        }
+    }
+
+    start.map(|section_start| &content[section_start..])
+}
+
+fn top_level_sections(content: &str) -> Vec<&str> {
+    let mut sections = Vec::new();
+    let mut current_start = None;
+    let mut offset = 0;
+
+    for line in content.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+
+        if section_title(line).is_some() {
+            if let Some(section_start) = current_start.replace(line_start) {
+                sections.push(&content[section_start..line_start]);
+            }
+        }
+    }
+
+    if let Some(section_start) = current_start {
+        sections.push(&content[section_start..]);
+    }
+
+    sections
+}
+
+fn parse_type1_blocks(cmd: &mut Command, section: &str) -> bool {
+    let mut found = false;
+    let cmd_name = cmd.name.clone().unwrap_or_default();
+
+    let lines: Vec<&str> = section.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line.starts_with(".PP")
+            || line.starts_with(".sp")
+            || line.starts_with(".SS")
+            || line.starts_with(".Ss")
+        {
+            let mut opt_lines = Vec::new();
+            i += 1;
+
+            let mut rs_found = false;
+            while i < lines.len() {
+                let next_line = lines[i].trim();
+                if next_line.starts_with(".RS") {
+                    rs_found = true;
+                    break;
+                }
+                if next_line.starts_with(".PP")
+                    || next_line.starts_with(".sp")
+                    || next_line.starts_with(".SS")
+                    || next_line.starts_with(".Ss")
+                {
+                    break;
+                }
+                opt_lines.push(lines[i]);
+                i += 1;
+            }
+
+            if rs_found {
+                i += 1; // skip .RS
+                let mut desc_lines = Vec::new();
+                let mut nesting = 1;
+
+                while i < lines.len() && nesting > 0 {
+                    let next_line = lines[i].trim();
+                    if next_line.starts_with(".RS") {
+                        nesting += 1;
+                    } else if next_line.starts_with(".RE") {
+                        nesting -= 1;
+                    }
+                    if nesting > 0 {
+                        desc_lines.push(lines[i]);
+                        i += 1;
+                    }
+                }
+
+                if nesting == 0 {
+                    let option_text = opt_lines.join("\n");
+                    let description = desc_lines.join("\n");
+
+                    if looks_like_option_block(&option_text, &cmd_name) {
+                        found |= add_option(cmd, &option_text, &description);
+                    }
+                    i += 1; // skip .RE
+                    continue;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    found
+}
+
+fn split_option_and_desc(line: &str) -> (String, Option<String>) {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("\\f") {
+        return (line.to_string(), None);
+    }
+
+    let mut in_format = false;
+    let mut chars = trimmed.char_indices().peekable();
+    let mut split_idx = None;
+    let mut saw_format = false;
+
+    while let Some(&(i, c)) = chars.peek() {
+        if trimmed[i..].starts_with("\\f") {
+            saw_format = true;
+            let rest = &trimmed[i + 2..];
+            if rest.starts_with('R')
+                || rest.starts_with('P')
+                || rest.starts_with("(R")
+                || rest.starts_with("[R]")
+                || rest.starts_with("(P")
+                || rest.starts_with("[P]")
+            {
+                in_format = false;
+            } else {
+                in_format = true;
+            }
+            chars.next();
+            chars.next();
+            if let Some(&(_, next_c)) = chars.peek() {
+                if next_c == '(' {
+                    chars.next();
+                    chars.next();
+                    chars.next();
+                } else if next_c == '[' {
+                    while let Some(&(_, inside_c)) = chars.peek() {
+                        chars.next();
+                        if inside_c == ']' {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+
+        if !in_format && saw_format && c.is_alphanumeric() {
+            split_idx = Some(i);
+            break;
+        }
+
+        chars.next();
+    }
+
+    if let Some(idx) = split_idx {
+        let opt = trimmed[..idx].trim().to_string();
+        let desc = trimmed[idx..].trim().to_string();
+        let opt_cleaned = if opt.ends_with(':') {
+            opt[..opt.len() - 1].trim().to_string()
+        } else {
+            opt
+        };
+        (opt_cleaned, Some(desc))
+    } else {
+        (line.to_string(), None)
+    }
+}
+
+fn parse_tagged_blocks(cmd: &mut Command, section: &str) -> bool {
+    let mut found = false;
+    static NO_IX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let no_ix = NO_IX
+        .get_or_init(|| Regex::new(r"(?m)^\.IX.*\n?").unwrap())
+        .replace_all(section, "")
+        .into_owned();
+
+    static TRAILING_DIGITS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let trailing_digits = TRAILING_DIGITS.get_or_init(|| Regex::new(r"\d+$").unwrap());
+    static STRUCTURAL_MACRO: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let structural_macro = STRUCTURAL_MACRO.get_or_init(|| {
+        Regex::new(r"^\.(?:TP|TQ|IP|SH|Sh|SS|Ss|UNINDENT|UN|PP|Pp|RS|RE|sp)\b").unwrap()
+    });
+    static CONDITIONAL_STRUCTURAL_MACRO: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let conditional_structural_macro = CONDITIONAL_STRUCTURAL_MACRO.get_or_init(|| {
+        Regex::new(r"^\.(?:ie|el)\b.*\.(?:TP|TQ|IP|HP|SH|Sh|SS|Ss|UNINDENT|UN|PP|Pp|RS|RE|sp)\b")
+            .unwrap()
+    });
+    static PD_MACRO: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let pd_macro = PD_MACRO.get_or_init(|| Regex::new(r"^\.PD(?:\s+\d+)?$").unwrap());
+    let lines: Vec<&str> = no_ix.lines().collect();
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim();
+        let is_tp = trimmed.starts_with(".TP") || trimmed.starts_with(".TQ");
+        let is_hp = trimmed.starts_with(".HP");
+        let is_ip = trimmed.starts_with(".IP ");
+        if !is_tp && !is_ip && !is_hp {
+            idx += 1;
+            continue;
+        }
+        idx += 1;
+
+        let mut opt_desc_first_line: Option<String> = None;
+        let mut option_from_next_line = false;
+
+        let mut option_name = if is_ip {
+            let ip_val = trailing_digits
+                .replace(trimmed.trim_start_matches(".IP").trim(), "")
+                .into_owned();
+            let cleaned_ip = clean_option_source(&ip_val, cmd.name.as_deref().unwrap_or(""));
+            if cleaned_ip.starts_with('-') {
+                ip_val
+            } else {
+                option_from_next_line = true;
+                let mut option_line = String::new();
+                while idx < lines.len() {
+                    let next_trimmed = lines[idx].trim();
+                    if next_trimmed.is_empty() {
+                        idx += 1;
+                        continue;
+                    }
+                    option_line = next_trimmed.to_string();
+                    idx += 1;
+                    break;
+                }
+                while idx < lines.len() {
+                    let next_trimmed = lines[idx].trim();
+                    if next_trimmed.is_empty()
+                        || !next_trimmed.starts_with('.')
+                        || structural_macro.is_match(next_trimmed)
+                    {
+                        break;
+                    }
+                    option_line.push(' ');
+                    option_line.push_str(next_trimmed);
+                    idx += 1;
+                }
+                let (opt, desc) = split_option_and_desc(&option_line);
+                if let Some(d) = desc {
+                    opt_desc_first_line = Some(d);
+                }
+                opt
+            }
+        } else {
+            let mut option_line = String::new();
+            while idx < lines.len() {
+                let next_trimmed = lines[idx].trim();
+                if next_trimmed.is_empty() {
+                    idx += 1;
+                    continue;
+                }
+                option_line = next_trimmed.to_string();
+                idx += 1;
+                break;
+            }
+            while idx < lines.len() {
+                let next_trimmed = lines[idx].trim();
+                if next_trimmed.is_empty() {
+                    idx += 1;
+                    continue;
+                }
+                if structural_macro.is_match(next_trimmed) {
+                    break;
+                }
+
+                // Allow "or" (or "," or "|") separator if followed by a flag/macro
+                let is_separator = next_trimmed.eq_ignore_ascii_case("or")
+                    || next_trimmed == ","
+                    || next_trimmed == "|";
+                if !next_trimmed.starts_with('.') {
+                    let mut is_followed_by_flag = false;
+                    if is_separator {
+                        let mut look_idx = idx + 1;
+                        while look_idx < lines.len() {
+                            let look_trimmed = lines[look_idx].trim();
+                            if look_trimmed.is_empty() {
+                                look_idx += 1;
+                                continue;
+                            }
+                            if look_trimmed.starts_with('.') || look_trimmed.starts_with('-') {
+                                is_followed_by_flag = true;
+                            }
+                            break;
+                        }
+                    }
+                    if !is_followed_by_flag {
+                        break;
+                    }
+                }
+
+                option_line.push(' ');
+                option_line.push_str(next_trimmed);
+                idx += 1;
+            }
+            option_line
+        };
+
+        if is_ip && !option_from_next_line {
+            while idx < lines.len() {
+                let next_trimmed = lines[idx].trim();
+                if next_trimmed.is_empty() || pd_macro.is_match(next_trimmed) {
+                    idx += 1;
+                    continue;
+                }
+                if next_trimmed.starts_with(".IP ") {
+                    option_name.push_str(", ");
+                    option_name.push_str(
+                        &trailing_digits
+                            .replace(next_trimmed.trim_start_matches(".IP").trim(), "")
+                            .into_owned(),
+                    );
+                    idx += 1;
+                    continue;
+                }
+                break;
+            }
+        }
+
+        let mut desc_lines = Vec::new();
+        if let Some(first) = opt_desc_first_line {
+            desc_lines.push(first);
+        }
+        while idx < lines.len() {
+            let next_trimmed = lines[idx].trim();
+            if next_trimmed.is_empty() || pd_macro.is_match(next_trimmed) {
+                idx += 1;
+                continue;
+            }
+            if is_hp && (next_trimmed == ".IP" || next_trimmed.starts_with(".IP ")) {
+                idx += 1;
+                continue;
+            }
+            if conditional_structural_macro.is_match(next_trimmed) {
+                break;
+            }
+            if next_trimmed.starts_with(".TP")
+                || next_trimmed.starts_with(".TQ")
+                || next_trimmed.starts_with(".IP ")
+                || next_trimmed.starts_with(".HP")
+                || next_trimmed.starts_with(".SH")
+                || next_trimmed.starts_with(".Sh")
+                || next_trimmed.starts_with(".SS")
+                || next_trimmed.starts_with(".Ss")
+                || next_trimmed.starts_with(".PP")
+                || next_trimmed.starts_with(".Pp")
+                || next_trimmed.starts_with(".sp")
+                || next_trimmed.starts_with(".UNINDENT")
+                || next_trimmed == ".UN"
+            {
+                break;
+            }
+            desc_lines.push(lines[idx].to_string());
+            idx += 1;
+        }
+
+        found |= add_option(cmd, &option_name, &desc_lines.join("\n"));
+    }
+
+    found
+}
+
+fn parse_scdoc_blocks(cmd: &mut Command, section: &str) -> bool {
+    let mut found = false;
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?ms)(.*?)\.RE").unwrap());
+    let mut cursor = section;
+
+    while let Some(caps) = re.captures(cursor) {
+        let block = caps.get(1).unwrap().as_str();
+        let cleaned: Vec<String> = block
+            .lines()
+            .map(|line| normalize_whitespace(&strip_groff_wrappers(line)))
+            .filter(|line| !line.is_empty() && line != ".P" && line != ".RS 4")
+            .collect();
+
+        if cleaned.len() >= 2 {
+            found |= add_option(cmd, &cleaned[0], &cleaned[1]);
+        }
+
+        cursor = &cursor[caps.get(0).unwrap().end()..];
+    }
+
+    found
+}
+
+fn parse_darwin_option_line(line: &str) -> Option<String> {
+    if !line.starts_with(".It Fl") {
+        return None;
+    }
+
+    let mut text = line.trim().trim_start_matches(".It").trim().to_string();
+    text = format!(" {text} ")
+        .replace(" Ns = Ns ", "=")
+        .replace(" Ns ", "")
+        .replace(" Oo ", "[")
+        .replace(" Oc ", "] ")
+        .replace(" Op ", "[")
+        .replace(" Fl Fl ", " --")
+        .replace(" Fl ", " -");
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    text = RE
+        .get_or_init(|| Regex::new(r"(?P<prefix>^|[\s=\[:])Ar\s+").unwrap())
+        .replace_all(&text, "${prefix}")
+        .into_owned();
+    let declaration = normalize_whitespace(&strip_groff_wrappers(&text));
+    if !declaration.contains('-') {
+        return None;
+    }
+
+    Some(declaration)
+}
+
+fn parse_darwin(cmd: &mut Command, section: &str) -> bool {
+    let mut found = false;
+    let mut lines = section.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let Some(option_name) = parse_darwin_option_line(line) else {
+            continue;
+        };
+
+        let mut desc_lines = Vec::new();
+        while let Some(next) = lines.peek() {
+            if next.starts_with(".It Fl") || next.starts_with(".Sh") || next.starts_with(".SH") {
+                break;
+            }
+            if let Some(next_line) = strip_line_comment(next) {
+                let text = normalize_text(&next_line, cmd.name.as_deref().unwrap_or(""));
+                if !text.is_empty() {
+                    desc_lines.push(text);
+                }
+            }
+            lines.next();
+        }
+
+        found |= add_option(cmd, &option_name, &desc_lines.join(" "));
+    }
+
+    found
+}
+
+fn deroff(content: &str, cmd_name: &str) -> String {
+    let mut out = Vec::new();
+
+    for raw_line in content.lines() {
+        let Some(raw_line) = strip_line_comment(raw_line) else {
+            continue;
+        };
+        let trimmed = raw_line.trim_start();
+
+        if trimmed.starts_with(".Sh ") || trimmed.starts_with(".SH ") {
+            out.push(trimmed[4..].trim().trim_matches('"').to_uppercase());
+            continue;
+        }
+        if trimmed.starts_with(".Ss ") || trimmed.starts_with(".SS ") {
+            out.push(trimmed[4..].trim().trim_matches('"').to_uppercase());
+            continue;
+        }
+        if let Some(option_name) = parse_darwin_option_line(trimmed) {
+            out.push(option_name);
+            continue;
+        }
+        if trimmed.starts_with(".PP")
+            || trimmed.starts_with(".Pp")
+            || trimmed.starts_with(".IP")
+            || trimmed.starts_with(".TP")
+            || trimmed.starts_with(".TQ")
+            || trimmed.starts_with(".RS")
+            || trimmed.starts_with(".RE")
+            || trimmed.starts_with(".Bl")
+            || trimmed.starts_with(".El")
+        {
+            out.push(String::new());
+            continue;
+        }
+
+        let line = normalize_text(&raw_line, cmd_name);
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+
+    out.join("\n")
+}
+
+fn parse_deroff(cmd: &mut Command, content: &str) -> bool {
+    let text = deroff(content, cmd.name.as_deref().unwrap_or(""));
+    let mut lines: Vec<&str> = text.lines().collect();
+
+    while let Some(line) = lines.first() {
+        let upper = line.trim().to_uppercase();
+        if upper == "DESCRIPTION" || upper == "OPTIONS" || upper == "COMMAND OPTIONS" {
+            break;
+        }
+        lines.remove(0);
+    }
+
+    let mut found = false;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = normalize_whitespace(lines[index]);
+        if line.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let upper = line.to_uppercase();
+        if upper == "BUGS" || upper == "EXAMPLES" || upper == "FILES" {
+            break;
+        }
+        if !line.starts_with('-') {
+            index += 1;
+            continue;
+        }
+
+        let option_line = line;
+        index += 1;
+        let mut desc_parts = Vec::new();
+
+        while index < lines.len() {
+            let next = normalize_whitespace(lines[index]);
+            let upper = next.to_uppercase();
+            if next.is_empty() {
+                index += 1;
+                if !desc_parts.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            if next.starts_with('-') || upper == "BUGS" || upper == "EXAMPLES" || upper == "FILES" {
+                break;
+            }
+            desc_parts.push(next);
+            index += 1;
+        }
+
+        found |= add_option(cmd, &option_line, &desc_parts.join(" "));
+    }
+
+    found
+}
+
+fn parse_type1(cmd: &mut Command, content: &str) -> bool {
+    let mut found = false;
+    if let Some(section) = extract_section(content, &["OPTIONS"]) {
+        found |= parse_type1_blocks(cmd, section);
+        if !found {
+            found |= parse_tagged_blocks(cmd, section);
+        }
+    }
+    found
+}
+
+fn parse_type2(cmd: &mut Command, content: &str) -> bool {
+    extract_section(content, &["OPTIONS"])
+        .map(|section| parse_tagged_blocks(cmd, section))
+        .unwrap_or(false)
+}
+
+fn parse_type3(cmd: &mut Command, content: &str) -> bool {
+    extract_section(content, &["DESCRIPTION"])
+        .map(|section| parse_tagged_blocks(cmd, section))
+        .unwrap_or(false)
+}
+
+fn parse_type4(cmd: &mut Command, content: &str) -> bool {
+    extract_section(content, &["FUNCTION LETTERS"])
+        .map(|section| parse_tagged_blocks(cmd, section))
+        .unwrap_or(false)
+}
+
+fn parse_scdoc(cmd: &mut Command, content: &str) -> bool {
+    if !content.contains("Generated by scdoc") {
+        return false;
+    }
+    extract_section(content, &["OPTIONS"])
+        .map(|section| parse_scdoc_blocks(cmd, section))
+        .unwrap_or(false)
+}
+
+fn parse_darwin_sections(cmd: &mut Command, content: &str) -> bool {
+    let mut found = false;
+    if let Some(section) = extract_section(content, &["DESCRIPTION"]) {
+        found |= parse_darwin(cmd, section);
+    }
+    if !found {
+        if let Some(section) = extract_section(content, &["OPTIONS"]) {
+            found |= parse_darwin(cmd, section);
+        }
+    }
+    found
+}
+
+fn parse_subcommand_name(cmd_name: &str, token: &str) -> Option<String> {
+    let normalized = normalize_whitespace(&strip_groff_wrappers(token));
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let caps = RE
+        .get_or_init(|| {
+            Regex::new(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9+._-]*)\((?P<section>\d+)\)$").unwrap()
+        })
+        .captures(&normalized)?;
+    let name = caps.name("name").unwrap().as_str();
+    let prefix = format!("{cmd_name}-");
+    let stripped = name.strip_prefix(&prefix)?;
+
+    if stripped.is_empty() {
+        return None;
+    }
+
+    Some(stripped.to_string())
+}
+
+fn add_subcommand(cmd: &mut Command, name: &str, description: &str) -> bool {
+    let description = clean_sentence(&normalize_text(
+        description,
+        cmd.name.as_deref().unwrap_or(""),
+    ));
+
+    if let Some(existing) = cmd
+        .subcommands
+        .iter_mut()
+        .find(|subcommand| subcommand.name.as_deref() == Some(name))
+    {
+        if existing
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+            && !description.is_empty()
+        {
+            existing.description = Some(description);
+        }
+        return false;
+    }
+
+    cmd.subcommands.push(Command {
+        name: Some(name.to_string()),
+        aliases: Vec::new(),
+        description: if description.is_empty() {
+            None
+        } else {
+            Some(description)
+        },
+        args: Vec::new(),
+        subcommands: Vec::new(),
+        author: None,
+    });
+    true
+}
+
+fn extract_subcommand_candidates(section: &str, cmd_name: &str) -> Vec<(String, String)> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?ms)\.PP\s*(.*?)\.RS 4\s*(.*?)\.RE").unwrap());
+    let mut candidates = Vec::new();
+
+    for caps in re.captures_iter(section) {
+        let raw_name = caps.get(1).unwrap().as_str();
+        let raw_description = caps.get(2).unwrap().as_str();
+        let Some(name) = parse_subcommand_name(cmd_name, raw_name) else {
+            continue;
+        };
+        candidates.push((name, raw_description.to_string()));
+    }
+
+    if candidates.is_empty() {
+        let lines: Vec<&str> = section.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if let Some(name) = parse_subcommand_name(cmd_name, line) {
+                i += 1;
+                if i < lines.len() && lines[i].trim() == ".br" {
+                    i += 1;
+                }
+
+                let mut desc_parts = Vec::new();
+                while i < lines.len() {
+                    let next_line = lines[i].trim();
+                    if next_line.starts_with(".sp")
+                        || next_line.starts_with(".SS")
+                        || next_line.starts_with(".SH")
+                        || parse_subcommand_name(cmd_name, next_line).is_some()
+                    {
+                        break;
+                    }
+                    if !next_line.is_empty() {
+                        desc_parts.push(next_line);
+                    }
+                    i += 1;
+                }
+                candidates.push((name, desc_parts.join("\n")));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    candidates
+}
+
+fn parse_subcommands(cmd: &mut Command, content: &str) -> bool {
+    let Some(cmd_name) = cmd.name.clone() else {
+        return false;
+    };
+
+    let mut found = false;
+
+    for section in top_level_sections(content) {
+        let candidates = extract_subcommand_candidates(section, &cmd_name);
+        let is_commands_section = section
+            .lines()
+            .next()
+            .map(|l| {
+                let upper = l.to_uppercase();
+                upper.contains("COMMAND") || upper.contains("SUBCOMMAND")
+            })
+            .unwrap_or(false);
+
+        if !is_commands_section && candidates.len() < 3 {
+            continue;
+        }
+
+        for (name, description) in candidates {
+            found |= add_subcommand(cmd, &name, &description);
+        }
+    }
+
+    found
+}
+
+fn parse_main_description(cmd: &mut Command, content: &str) {
+    let cmd_name = match &cmd.name {
+        Some(n) => n.as_str(),
+        None => return,
+    };
+
+    let mut in_name_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(".SH ") || trimmed.starts_with(".Sh ") {
+            let section_name = trimmed[4..].trim().trim_matches('"').to_uppercase();
+            if section_name == "NAME" {
+                in_name_section = true;
+                continue;
+            } else {
+                if in_name_section {
+                    break;
+                }
+            }
+        }
+
+        if in_name_section {
+            if trimmed.starts_with(".Nd ") {
+                let desc = trimmed[4..].trim();
+                let clean_desc = clean_sentence(&normalize_text(desc, cmd_name));
+                if !clean_desc.is_empty() {
+                    cmd.description = Some(clean_desc);
+                    break;
+                }
+            }
+
+            let normalized_line = normalize_text(line, cmd_name);
+            if !normalized_line.is_empty() {
+                if let Some(pos) = normalized_line.find(" - ") {
+                    let left = normalized_line[..pos].trim();
+                    let right = normalized_line[pos + 3..].trim();
+                    let left_lower = left.to_lowercase();
+                    let cmd_name_lower = cmd_name.to_lowercase();
+                    if left_lower.contains(&cmd_name_lower) {
+                        let clean_desc = clean_sentence(right);
+                        if !clean_desc.is_empty() {
+                            cmd.description = Some(clean_desc);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_manpage_base(cmd_name: &str, content: &str) -> Option<Command> {
+    let mut cmd = Command {
+        name: Some(cmd_name.to_string()),
+        aliases: Vec::new(),
+        description: None,
+        args: Vec::new(),
+        subcommands: Vec::new(),
+        author: None,
+    };
+
+    parse_subcommands(&mut cmd, content);
+    parse_main_description(&mut cmd, content);
+
+    let parsers: [fn(&mut Command, &str) -> bool; 7] = [
+        parse_scdoc,
+        parse_type1,
+        parse_type2,
+        parse_type4,
+        parse_type3,
+        parse_darwin_sections,
+        parse_deroff,
+    ];
+
+    for parser in parsers {
+        let before = cmd.args.len();
+        let success = parser(&mut cmd, content);
+        if success && cmd.args.len() > before {
+            break;
+        }
+    }
+
+    if cmd.args.is_empty() && cmd.subcommands.is_empty() {
+        None
+    } else {
+        // Expand bracketed negation flags (like --[no-]color) into both variants
+        cmd.expand_no_options();
+        cmd.populate_possible_values();
+        cmd.deduplicate_args();
+        Some(cmd)
+    }
+}
+
+pub fn parse_manpage(cmd_name: &str, content: &str) -> Option<Command> {
+    parse_manpage_base(cmd_name, content)
+}
+
+pub fn parse_manpage_recursive<F>(
+    cmd_name: &str,
+    content: &str,
+    max_depth: usize,
+    loader: &F,
+) -> Option<Command>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut cmd = parse_manpage_base(cmd_name, content)?;
+    let mut cmd_path = vec![cmd_name.to_string()];
+    parse_manpage_recursive_impl(&mut cmd, &mut cmd_path, max_depth, loader);
+    Some(cmd)
+}
+
+fn parse_manpage_recursive_impl<F>(
+    cmd: &mut Command,
+    cmd_path: &mut Vec<String>,
+    max_depth: usize,
+    loader: &F,
+) where
+    F: Fn(&str) -> Option<String>,
+{
+    if cmd_path.len() - 1 >= max_depth {
+        return;
+    }
+
+    let num_subcommands = cmd.subcommands.len();
+    for idx in 0..num_subcommands {
+        let sub_name = match &cmd.subcommands[idx].name {
+            Some(n) => n.clone(),
+            None => continue,
+        };
+
+        cmd_path.push(sub_name.clone());
+        let sub_man_name = cmd_path.join("-");
+
+        if let Some(sub_content) = loader(&sub_man_name) {
+            if let Some(parsed_sub) = parse_manpage_base(&sub_man_name, &sub_content) {
+                let target = &mut cmd.subcommands[idx];
+                target.args = parsed_sub.args;
+                if target.description.is_none()
+                    || target.description.as_deref().unwrap_or("").is_empty()
+                {
+                    target.description = parsed_sub.description;
+                }
+                target.subcommands = parsed_sub.subcommands;
+
+                parse_manpage_recursive_impl(target, cmd_path, max_depth, loader);
+            }
+        }
+        cmd_path.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ValueHint;
+    use std::fs;
+
+    const TYPE1_FIXTURE: &str = r#".TH EXAMPLE 1
+.SH "OPTIONS"
+.PP
+.BI \-a \&,
+.BI \-\^-all
+.RS 4
+Show hidden files and include dot entries.
+.RE
+.PP
+.BI \-o \ output \&,
+.BI \-\^-output = file
+.RS 4
+Write the generated report to the chosen file path.
+.RE
+.PP
+.BI \-d [debug-file] \&,
+.BI \-\^-debug [=debug-file]
+.RS 4
+Enable debug logging and optionally write traces to debug-file.
+.RE
+"#;
+
+    const TYPE2_FIXTURE: &str = r#".TH SAMPLE 1
+.SH OPTIONS
+.TP
+.B \-n
+Number output lines before printing them.
+.TP
+.BI \-f \ input-file
+Read input from input-file instead of stdin.
+.TP
+.BI \-\^-format = json
+Render the output using the requested json format.
+"#;
+
+    const DARWIN_FIXTURE: &str = r#".Dd January 1 2026
+.Dt SAMPLE 1
+.Os
+.Sh DESCRIPTION
+The options are as follows:
+.Bl -tag -width Ds -compact
+.It Fl a
+Enable agent forwarding for the current connection.
+.It Fl b Ar bind_address
+Bind to bind_address before opening the remote session.
+.It Fl Fl verbose
+Produce verbose logs for each connection phase.
+.El
+"#;
+
+    const DEROFF_FIXTURE: &str = r#".TH RAW 1
+.SH DESCRIPTION
+-q, --quiet
+Suppress normal output while still reporting errors.
+
+-p PATH, --path PATH
+Read files from PATH before applying filters.
+
+BUGS
+None documented.
+"#;
+
+    use crate::test_helpers::*;
+
+    fn parse_test_manpage(name: &str) -> Command {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("man_pages")
+            .join(name);
+        let content = fs::read_to_string(path).unwrap();
+        let cmd_name = name.split('.').next().unwrap();
+        parse_manpage(cmd_name, &content).unwrap()
+    }
+
+    fn parse_test_manpage_recursive(name: &str, max_depth: usize) -> Command {
+        let base_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("man_pages");
+        let path = base_dir.join(name);
+        let content = fs::read_to_string(path).unwrap();
+        let cmd_name = name.split('.').next().unwrap();
+        let loader = |sub_man_name: &str| -> Option<String> {
+            let base_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("man_pages");
+            if let Ok(c) = fs::read_to_string(base_dir.join(format!("{sub_man_name}.1"))) {
+                return Some(c);
+            }
+            if let Ok(c) = fs::read_to_string(base_dir.join(format!("{sub_man_name}.8"))) {
+                return Some(c);
+            }
+            None
+        };
+        parse_manpage_recursive(cmd_name, &content, max_depth, &loader).unwrap()
+    }
+
+    #[test]
+    fn parses_type1_options_exhaustively() {
+        let cmd = parse_manpage("example", TYPE1_FIXTURE).unwrap();
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: Some("--all".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Show hidden files",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-o".to_string()),
+                        long: Some("--output".to_string()),
+                        value_name: Some("file".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "chosen file path",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--debug".to_string()),
+                        value_name: Some("debug-file".to_string()),
+                        num_args: Some("?".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "optionally write traces",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_type2_options_exhaustively() {
+        let cmd = parse_manpage("sample", TYPE2_FIXTURE).unwrap();
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Number output lines",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: None,
+                        value_name: Some("input-file".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "instead of stdin",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--format".to_string()),
+                        value_name: Some("json".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "requested json format",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_darwin_options_exhaustively() {
+        let cmd = parse_manpage("sample", DARWIN_FIXTURE).unwrap();
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "agent forwarding",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: None,
+                        value_name: Some("bind_address".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Hostname,
+                        ..Default::default()
+                    },
+                    description_contains: "before opening the remote session",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "verbose logs",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_deroff_options_exhaustively() {
+        let cmd = parse_manpage("raw", DEROFF_FIXTURE).unwrap();
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-q".to_string()),
+                        long: Some("--quiet".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Suppress normal output",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-p".to_string()),
+                        long: Some("--path".to_string()),
+                        value_name: Some("PATH".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::AnyPath,
+                        ..Default::default()
+                    },
+                    description_contains: "Read files from PATH",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_git_options_with_values_and_descriptions() {
+        let cmd = parse_test_manpage("git.1");
+        assert!(cmd.subcommands.len() >= 9);
+        assert_contains_subcommands(
+            &cmd,
+            &[
+                ("add", "file contents to the index"),
+                ("commit", "Record changes to the repository"),
+                ("diff", "Show changes between commits"),
+                ("fetch", "Download objects and refs"),
+                ("init", "Create an empty Git repository"),
+                ("log", "Show commit logs"),
+                ("pull", "Fetch from and integrate"),
+                ("push", "Update remote refs"),
+                ("status", "Show the working tree status"),
+            ],
+        );
+        let expected = [
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-v".to_string()),
+                    long: Some("--version".to_string()),
+                    value_name: None,
+                    num_args: None,
+                    ..Default::default()
+                },
+                description_contains: "Prints the Git suite version",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-C".to_string()),
+                    long: None,
+                    value_name: Some("<path>".to_string()),
+                    num_args: Some("1".to_string()),
+                    value_hint: crate::ValueHint::DirPath,
+                    ..Default::default()
+                },
+                description_contains: "instead of the current working directory",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-c".to_string()),
+                    long: None,
+                    value_name: Some("<name>=<value>".to_string()),
+                    num_args: Some("1".to_string()),
+                    ..Default::default()
+                },
+                description_contains: "override values from configuration files",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: None,
+                    long: Some("--config-env".to_string()),
+                    value_name: Some("<name>=<envvar>".to_string()),
+                    num_args: Some("1".to_string()),
+                    ..Default::default()
+                },
+                description_contains: "retrieve the value",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: None,
+                    long: Some("--exec-path".to_string()),
+                    value_name: Some("<path>".to_string()),
+                    num_args: Some("?".to_string()),
+                    value_hint: crate::ValueHint::AnyPath,
+                    ..Default::default()
+                },
+                description_contains: "Path to wherever your core Git programs are installed",
+            },
+        ];
+
+        assert_contains_expected_args(&cmd, &expected);
+    }
+
+    #[test]
+    fn parses_real_cat_fixture() {
+        let cmd = parse_test_manpage("cat.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-A".to_string()),
+                        long: Some("--show-all".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "equivalent to -vET",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: Some("--number-nonblank".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "number nonempty output lines",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-e".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "equivalent to -vE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-E".to_string()),
+                        long: Some("--show-ends".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display $ at end of each line",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: Some("--number".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "number all output lines",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--squeeze-blank".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "suppress repeated empty output lines",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-t".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "equivalent to -vT",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-T".to_string()),
+                        long: Some("--show-tabs".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display TAB characters as ^I",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-u".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "(ignored)",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--show-nonprinting".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "use ^ and M- notation",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_chmod_fixture() {
+        let cmd = parse_test_manpage("chmod.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: Some("--changes".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "report only when a change is made",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--silent".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "suppress most error messages",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--quiet".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "suppress most error messages",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "diagnostic for every file processed",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--no-preserve-root".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not treat '/' specially",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--preserve-root".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "fail to operate recursively on '/'",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--reference".to_string()),
+                        value_name: Some("RFILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "use RFILE's mode",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-R".to_string()),
+                        long: Some("--recursive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "change files and directories recursively",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_chown_fixture() {
+        let cmd = parse_test_manpage("chown.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: Some("--changes".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "report only when a change is made",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--silent".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "suppress most error messages",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--quiet".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "suppress most error messages",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output a diagnostic for every file processed",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--dereference".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "affect the referent of each symbolic link",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--no-dereference".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "affect symbolic links instead of any referenced file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--from".to_string()),
+                        value_name: Some("CURRENT_OWNER:CURRENT_GROUP".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "only if its current owner and/or group match",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--no-preserve-root".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not treat '/' specially",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--preserve-root".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "fail to operate recursively on '/'",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--reference".to_string()),
+                        value_name: Some("RFILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "use RFILE's owner and group",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-R".to_string()),
+                        long: Some("--recursive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "operate on files and directories recursively",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-H".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "if a command line argument is a symbolic link",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-L".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "traverse every symbolic link to a directory",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-P".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not traverse any symbolic links",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_cp_fixture() {
+        let cmd = parse_test_manpage("cp.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: Some("--archive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "same as -dR --preserve=all",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--attributes-only".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "don't copy the file data",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--backup".to_string()),
+                        value_name: Some("CONTROL".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "make a backup of each existing destination file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "does not accept an argument",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--copy-contents".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "copy contents of special files when recursive",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "same as --no-dereference --preserve=links",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--debug".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "explain how a file is copied",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--force".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "remove it and try again",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--interactive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "prompt before overwrite",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-H".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "follow command-line symbolic links in SOURCE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-l".to_string()),
+                        long: Some("--link".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "hard link files instead of copying",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-L".to_string()),
+                        long: Some("--dereference".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "always follow symbolic links in SOURCE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: Some("--no-clobber".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not overwrite an existing file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-P".to_string()),
+                        long: Some("--no-dereference".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "never follow symbolic links in SOURCE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-p".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "same as --preserve=mode,ownership,timestamps",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--preserve".to_string()),
+                        value_name: Some("ATTR_LIST".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "preserve the specified attributes",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--no-preserve".to_string()),
+                        value_name: Some("ATTR_LIST".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "don't preserve the specified attributes",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--parents".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "use full source file name under DIRECTORY",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-R".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "copy directories recursively",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--recursive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "copy directories recursively",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--reflink".to_string()),
+                        value_name: Some("WHEN".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "control clone/CoW copies",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--remove-destination".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "remove each existing destination file before",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--sparse".to_string()),
+                        value_name: Some("WHEN".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "control creation of sparse files",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--strip-trailing-slashes".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "remove any trailing slashes from each SOURCE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--symbolic-link".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "make symbolic links instead of copying",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-S".to_string()),
+                        long: Some("--suffix".to_string()),
+                        value_name: Some("SUFFIX".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "override the usual backup suffix",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-t".to_string()),
+                        long: Some("--target-directory".to_string()),
+                        value_name: Some("DIRECTORY".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::DirPath,
+                        ..Default::default()
+                    },
+                    description_contains: "copy all SOURCE arguments into DIRECTORY",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-T".to_string()),
+                        long: Some("--no-target-directory".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "treat DEST as a normal file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--update".to_string()),
+                        value_name: Some("UPDATE".to_string()),
+                        num_args: Some("?".to_string()),
+                        value_enum: Some(vec![
+                            "all".to_string(),
+                            "none".to_string(),
+                            "older".to_string(),
+                        ]),
+                        ..Default::default()
+                    },
+                    description_contains: "control which existing files are updated",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-u".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "equivalent to --update",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "explain what is being done",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-x".to_string()),
+                        long: Some("--one-file-system".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "stay on this file system",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-Z".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "set SELinux security context of destination",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--context".to_string()),
+                        value_name: Some("CTX".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "like -Z, or if CTX is specified then set the",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_gawk_fixture() {
+        let cmd = parse_test_manpage("gawk.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--file".to_string()),
+                        value_name: Some("program-file".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "program source from the file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-F".to_string()),
+                        long: Some("--field-separator".to_string()),
+                        value_name: Some("fs".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "input field separator",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: Some("--characters-as-bytes".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "single-byte characters",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: Some("--traditional".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "compatibility mode",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_grep_fixture() {
+        let cmd = parse_test_manpage("grep.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-E".to_string()),
+                        long: Some("--extended-regexp".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "extended regular expressions",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--ignore-case".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Ignore case distinctions",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--file".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "Obtain patterns from FILE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--no-ignore-case".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Do not ignore case distinctions",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-A".to_string()),
+                        long: Some("--after-context".to_string()),
+                        value_name: Some("NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "lines of trailing context",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-B".to_string()),
+                        long: Some("--before-context".to_string()),
+                        value_name: Some("NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "lines of leading context",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-C".to_string()),
+                        long: Some("--context".to_string()),
+                        value_name: Some("NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "lines of output context",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--color".to_string()),
+                        value_name: Some("WHEN".to_string()),
+                        num_args: Some("?".to_string()),
+                        value_hint: crate::ValueHint::Unknown,
+                        ..Default::default()
+                    },
+                    description_contains: "display them in color",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--exclude".to_string()),
+                        value_name: Some("GLOB".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Unknown,
+                        ..Default::default()
+                    },
+                    description_contains: "Skip any command-line file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--exclude-dir".to_string()),
+                        value_name: Some("GLOB".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Unknown,
+                        ..Default::default()
+                    },
+                    description_contains: "Skip any command-line directory",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--exclude-from".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "globs read from FILE",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_ls_fixture() {
+        let cmd = parse_test_manpage("ls.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: Some("--all".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not ignore entries starting with",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--author".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "print the author of each file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--block-size".to_string()),
+                        value_name: Some("SIZE".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "scale sizes by SIZE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--directory".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "list directories themselves",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_mkdir_fixture() {
+        let cmd = parse_test_manpage("mkdir.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-m".to_string()),
+                        long: Some("--mode".to_string()),
+                        value_name: Some("MODE".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "set file mode",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-p".to_string()),
+                        long: Some("--parents".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "make parent directories as needed",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "message for each created directory",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-Z".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "set SELinux security context",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--context".to_string()),
+                        value_name: Some("CTX".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "like -Z, or if CTX is specified then set the SELinux",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_mv_fixture() {
+        let cmd = parse_test_manpage("mv.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--backup".to_string()),
+                        value_name: Some("CONTROL".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "make a backup of each existing destination file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "does not accept an argument",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--debug".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "explain how a file is copied",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--force".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not prompt before overwriting",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--interactive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "prompt before overwrite",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: Some("--no-clobber".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not overwrite an existing file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--no-copy".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not copy if renaming fails",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--strip-trailing-slashes".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "remove any trailing slashes from each SOURCE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-S".to_string()),
+                        long: Some("--suffix".to_string()),
+                        value_name: Some("SUFFIX".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "override the usual backup suffix",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-t".to_string()),
+                        long: Some("--target-directory".to_string()),
+                        value_name: Some("DIRECTORY".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::DirPath,
+                        ..Default::default()
+                    },
+                    description_contains: "move all SOURCE arguments into DIRECTORY",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-T".to_string()),
+                        long: Some("--no-target-directory".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "treat DEST as a normal file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--update".to_string()),
+                        value_name: Some("UPDATE".to_string()),
+                        num_args: Some("?".to_string()),
+                        value_enum: Some(vec![
+                            "all".to_string(),
+                            "none".to_string(),
+                            "older".to_string(),
+                        ]),
+                        ..Default::default()
+                    },
+                    description_contains: "control which existing files are updated",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-u".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "equivalent to --update",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "explain what is being done",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-Z".to_string()),
+                        long: Some("--context".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "set SELinux security context of destination",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_ping_fixture() {
+        let cmd = parse_test_manpage("ping.8");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-4".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Use IPv4 only",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-6".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Use IPv6 only",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Audible ping",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: None,
+                        value_name: Some("count".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "Stop after sending count",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_rm_fixture() {
+        let cmd = parse_test_manpage("rm.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--force".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "ignore nonexistent files and arguments",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "prompt before every removal",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-I".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "prompt once before removing more than three files",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--interactive".to_string()),
+                        value_name: Some("WHEN".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "prompt according to WHEN",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--one-file-system".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "skip any directory that is on a file system different",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--no-preserve-root".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "do not treat '/' specially",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--preserve-root".to_string()),
+                        value_name: Some("all".to_string()),
+                        num_args: Some("?".to_string()),
+                        value_enum: Some(vec!["all".to_string()]),
+                        ..Default::default()
+                    },
+                    description_contains: "do not remove '/'",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "remove directories and their contents recursively",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-R".to_string()),
+                        long: Some("--recursive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "remove directories and their contents recursively",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--dir".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "remove empty directories",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "explain what is being done",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_sed_fixture() {
+        let cmd = parse_test_manpage("sed.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: Some("--quiet".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "suppress automatic printing of pattern space",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--silent".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "suppress automatic printing of pattern space",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--debug".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "annotate program execution",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-e".to_string()),
+                        long: Some("--expression".to_string()),
+                        value_name: Some("script".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "add the script to the commands",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--file".to_string()),
+                        value_name: Some("script-file".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "add the contents of script-file to the commands",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--follow-symlinks".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "follow symlinks when processing in place",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--in-place".to_string()),
+                        value_name: Some("SUFFIX".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "edit files in place",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-l".to_string()),
+                        long: Some("--line-length".to_string()),
+                        value_name: Some("N".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "specify the desired line-wrap length",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--posix".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "disable all GNU extensions",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-E".to_string()),
+                        long: None,
+                        ..Default::default()
+                    },
+                    description_contains: "use extended regular expressions in the script",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--regexp-extended".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "use extended regular expressions in the script",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--separate".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "consider files as separate rather than as a single",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--sandbox".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "operate in sandbox mode",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-u".to_string()),
+                        long: Some("--unbuffered".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "load minimal amounts of data",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-z".to_string()),
+                        long: Some("--null-data".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "separate lines by NUL characters",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_wget_fixture() {
+        let cmd = parse_test_manpage("wget.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert!(
+            cmd.args
+                .iter()
+                .all(|arg| arg.long.as_deref() != Some("--no-"))
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-V".to_string()),
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Display the version of Wget",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: Some("--background".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Go to background immediately after startup",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-o".to_string()),
+                        long: Some("--output-file".to_string()),
+                        value_name: Some("logfile".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "Log all messages to logfile",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--report-speed".to_string()),
+                        value_name: Some("type".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Output bandwidth as type",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--load-cookies".to_string()),
+                        value_name: Some("file".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "Load cookies from file before the first HTTP retrieval",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_find_options_with_descriptions() {
+        let cmd = parse_test_manpage("find.1");
+        assert_expected_subcommands(&cmd, &[]);
+        for item in [
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-P".to_string()),
+                    long: None,
+                    value_name: None,
+                    num_args: None,
+                    ..Default::default()
+                },
+                description_contains: "Never follow symbolic links",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-L".to_string()),
+                    long: None,
+                    value_name: None,
+                    num_args: None,
+                    ..Default::default()
+                },
+                description_contains: "Follow symbolic links",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-H".to_string()),
+                    long: None,
+                    value_name: None,
+                    num_args: None,
+                    ..Default::default()
+                },
+                description_contains: "except while processing the command line arguments",
+            },
+        ] {
+            let arg = find_arg(&cmd, &item);
+            assert_eq!(arg.short, item.arg.short);
+            assert!(normalize_desc(arg.description.as_deref()).contains(item.description_contains));
+        }
+    }
+
+    #[test]
+    fn parses_real_ssh_options_with_values_and_descriptions() {
+        let cmd = parse_test_manpage("ssh.1");
+        assert_expected_subcommands(&cmd, &[]);
+        for item in [
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-4".to_string()),
+                    long: None,
+                    value_name: None,
+                    num_args: None,
+                    ..Default::default()
+                },
+                description_contains: "IPv4 addresses only",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-B".to_string()),
+                    long: None,
+                    value_name: Some("bind_interface".to_string()),
+                    num_args: Some("1".to_string()),
+                    ..Default::default()
+                },
+                description_contains: "Bind to the address",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-b".to_string()),
+                    long: None,
+                    value_name: Some("bind_address".to_string()),
+                    num_args: Some("1".to_string()),
+                    value_hint: crate::ValueHint::Hostname,
+                    ..Default::default()
+                },
+                description_contains: "source address",
+            },
+        ] {
+            let arg = find_arg(&cmd, &item);
+            assert_eq!(arg.short, item.arg.short);
+            assert_eq!(arg.value_name, item.arg.value_name);
+            let expected_hint = if arg.takes_value() {
+                crate::extract_value_hint(arg.value_name.as_deref(), arg.description.as_deref())
+            } else {
+                crate::ValueHint::Unknown
+            };
+            assert_eq!(
+                arg.value_hint, expected_hint,
+                "ValueHint mismatch for arg {:?} / {:?}",
+                arg.short, arg.long
+            );
+            assert!(normalize_desc(arg.description.as_deref()).contains(item.description_contains));
+        }
+    }
+
+    #[test]
+    fn parses_real_sudo_options_with_short_long_pairs() {
+        let cmd = parse_test_manpage("sudo.8");
+        assert_expected_subcommands(&cmd, &[]);
+        for item in [
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-A".to_string()),
+                    long: Some("--askpass".to_string()),
+                    value_name: None,
+                    num_args: None,
+                    ..Default::default()
+                },
+                description_contains: "requires a password",
+            },
+            ExpectedArg {
+                arg: Arg {
+                    short: Some("-a".to_string()),
+                    long: Some("--auth-type".to_string()),
+                    value_name: Some("type".to_string()),
+                    num_args: Some("1".to_string()),
+                    ..Default::default()
+                },
+                description_contains: "authentication",
+            },
+        ] {
+            let arg = find_arg(&cmd, &item);
+            assert_eq!(arg.short, item.arg.short);
+            assert_eq!(arg.long, item.arg.long);
+            assert_eq!(arg.value_name, item.arg.value_name);
+            assert_eq!(
+                arg.value_hint,
+                crate::extract_value_hint(arg.value_name.as_deref(), arg.description.as_deref()),
+                "ValueHint mismatch for arg {:?} / {:?}",
+                arg.short,
+                arg.long
+            );
+            assert!(normalize_desc(arg.description.as_deref()).contains(item.description_contains));
+        }
+    }
+
+    #[test]
+    fn parses_real_zstd_fixture() {
+        let cmd = parse_test_manpage("zstd.1");
+        println!("PARSED ARGS: {:#?}", cmd.args);
+
+        // Assertions on the parsed command structure and options
+        let keep_item = ExpectedArg {
+            arg: Arg {
+                short: Some("-k".to_string()),
+                long: Some("--keep".to_string()),
+                value_name: None,
+                num_args: None,
+                ..Default::default()
+            },
+            description_contains: "keep source file(s)",
+        };
+        let keep_arg = find_arg(&cmd, &keep_item);
+        assert_eq!(keep_arg.short.as_deref(), Some("-k"));
+        assert_eq!(keep_arg.long.as_deref(), Some("--keep"));
+        assert!(normalize_desc(keep_arg.description.as_deref()).contains("keep source file(s)"));
+
+        let rm_item = ExpectedArg {
+            arg: Arg {
+                short: None,
+                long: Some("--rm".to_string()),
+                value_name: None,
+                num_args: None,
+                ..Default::default()
+            },
+            description_contains: "remove source file(s)",
+        };
+        let rm_arg = find_arg(&cmd, &rm_item);
+        assert_eq!(rm_arg.long.as_deref(), Some("--rm"));
+
+        let decompress_item = ExpectedArg {
+            arg: Arg {
+                short: Some("-d".to_string()),
+                long: Some("--decompress".to_string()),
+                value_name: None,
+                num_args: None,
+                ..Default::default()
+            },
+            description_contains: "Decompress",
+        };
+        let decompress_arg = find_arg(&cmd, &decompress_item);
+        assert_eq!(decompress_arg.short.as_deref(), Some("-d"));
+
+        let ultra_item = ExpectedArg {
+            arg: Arg {
+                short: None,
+                long: Some("--ultra".to_string()),
+                value_name: None,
+                num_args: None,
+                ..Default::default()
+            },
+            description_contains: "unlocks high compression levels",
+        };
+        let ultra_arg = find_arg(&cmd, &ultra_item);
+        assert_eq!(ultra_arg.long.as_deref(), Some("--ultra"));
+    }
+
+    #[test]
+    fn parses_manpage_with_negated_options() {
+        const FIXTURE: &str = r#".TH RAW 1
+.SH DESCRIPTION
+-p, --[no-]progress
+Forcibly show/hide the progress counter.
+
+--[no]asyncio
+Use asynchronous IO.
+"#;
+        let cmd = parse_manpage("raw", FIXTURE).unwrap();
+        let args = &cmd.args;
+
+        // --[no-]progress should expand to --progress and --no-progress
+        // Note: the negated variant --no-progress should NOT have a short flag.
+        let progress_base = args
+            .iter()
+            .find(|a| a.long.as_deref() == Some("--progress"))
+            .unwrap();
+        assert_eq!(progress_base.short.as_deref(), Some("-p"));
+
+        let progress_neg = args
+            .iter()
+            .find(|a| a.long.as_deref() == Some("--no-progress"))
+            .unwrap();
+        assert_eq!(progress_neg.short, None);
+
+        // --[no]asyncio should expand to --asyncio and --noasyncio
+        let asyncio_base = args
+            .iter()
+            .find(|a| a.long.as_deref() == Some("--asyncio"))
+            .unwrap();
+        let asyncio_neg = args
+            .iter()
+            .find(|a| a.long.as_deref() == Some("--noasyncio"))
+            .unwrap();
+        assert_eq!(asyncio_base.short, None);
+        assert_eq!(asyncio_neg.short, None);
+    }
+
+    #[test]
+    fn parses_real_ip_fixture() {
+        let cmd = parse_test_manpage("ip.8");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("address", "Protocol address management"),
+                ("addrlabel", "Label configuration"),
+                ("route", "Routing table management"),
+                ("rule", "Routing policy"),
+                ("neighbor", "Neighbor cache"),
+                ("ntable", "Neighbor table"),
+                ("tunnel", "IP tunnel"),
+                ("tuntap", "TUN/TAP device"),
+                ("maddr", "Multicast address"),
+                ("link", "Network device"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-V".to_string()),
+                        long: Some("--Version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Print the version",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: Some("--batch".to_string()),
+                        value_name: Some("<FILENAME>".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::FilePath,
+                        description: None,
+                    },
+                    description_contains: "Read commands from provided file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-o".to_string()),
+                        long: Some("--oneline".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "output each record on a single line",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--stats".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Output more information",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--details".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Output more detailed",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-j".to_string()),
+                        long: Some("--json".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Output results in JavaScript",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-p".to_string()),
+                        long: Some("--pretty".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "indentation for readability",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_docker_fixture() {
+        let cmd = parse_test_manpage("docker.1");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("run", "Run a command"),
+                ("exec", "Run a command in a running"),
+                ("ps", "List containers"),
+                ("build", "Build an image"),
+                ("images", "List images"),
+                ("pull", "Pull an image"),
+                ("push", "Push an image"),
+                ("rm", "Remove one or more"),
+                ("rmi", "Remove one or more"),
+                ("logs", "Fetch the logs"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-D".to_string()),
+                        long: Some("--debug".to_string()),
+                        value_name: Some("true".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Enable debug mode",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-H".to_string()),
+                        long: Some("--host".to_string()),
+                        value_name: Some("unix:".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "socket",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-l".to_string()),
+                        long: Some("--log-level".to_string()),
+                        value_name: Some("debug".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "logging level",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--version".to_string()),
+                        value_name: Some("true".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Print version",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--tlsverify".to_string()),
+                        value_name: Some("is".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Use TLS and verify",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_npm_fixture() {
+        let cmd = parse_test_manpage("npm.1");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("install", "Install a package"),
+                ("run", "Run an arbitrary"),
+                ("publish", "Publish a package"),
+                ("test", "Test a package"),
+                ("config", "Manage the npm"),
+                ("uninstall", "Uninstall a package"),
+                ("version", "Bump a package"),
+                ("search", "Search for packages"),
+                ("update", "Update packages"),
+                ("view", "View package registry"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-g".to_string()),
+                        long: Some("--global".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "globally",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--registry".to_string()),
+                        value_name: Some("URL".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Url,
+                        description: None,
+                    },
+                    description_contains: "specified npm registry URL",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--prefix".to_string()),
+                        value_name: Some("PATH".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::AnyPath,
+                        description: None,
+                    },
+                    description_contains: "install packages to",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "version",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "help",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--force".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Force",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_systemctl_fixture() {
+        let cmd = parse_test_manpage("systemctl.1");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("start", "Start one or more"),
+                ("stop", "Stop one or more"),
+                ("status", "Show runtime status"),
+                ("list-units", "List units"),
+                ("enable", "Enable one or more"),
+                ("disable", "Disable one or more"),
+                ("daemon-reload", "Reload daemon"),
+                ("restart", "Start or restart"),
+                ("reload", "Reload one or more"),
+                ("is-active", "Check whether units"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "help text",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--system".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "service manager",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--user".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "calling user",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-H".to_string()),
+                        long: Some("--host".to_string()),
+                        value_name: None,
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Hostname,
+                        description: None,
+                    },
+                    description_contains: "remotely",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: Some("--all".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "listing units",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-l".to_string()),
+                        long: Some("--full".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "ellipsize",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--recursive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "local containers",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-q".to_string()),
+                        long: Some("--quiet".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Suppress printing",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_apt_fixture() {
+        let cmd = parse_test_manpage("apt.8");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("install", "Install packages"),
+                ("remove", "Remove packages"),
+                ("update", "Update list"),
+                ("upgrade", "Upgrade the system"),
+                ("list", "List packages"),
+                ("search", "Search in package"),
+                ("show", "Show package details"),
+                ("autoremove", "Automatically remove"),
+                ("clean", "Clean package"),
+                ("purge", "Purge packages"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-y".to_string()),
+                        long: Some("--yes".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Automatic yes",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--config-file".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::FilePath,
+                        description: None,
+                    },
+                    description_contains: "configuration file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-o".to_string()),
+                        long: Some("--option".to_string()),
+                        value_name: Some("OPTION".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Set a configuration",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "help",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "version",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--download-only".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Download packages",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--simulate".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Simulate",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-q".to_string()),
+                        long: Some("--quiet".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Quiet",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_pip_fixture() {
+        let cmd = parse_test_manpage("pip.1");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("install", "Install packages"),
+                ("uninstall", "Uninstall packages"),
+                ("list", "List installed"),
+                ("show", "Show information"),
+                ("config", "Manage local"),
+                ("download", "Download packages"),
+                ("freeze", "Output installed"),
+                ("check", "Verify installed"),
+                ("search", "Search PyPI"),
+                ("cache", "Inspect and manage"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Give more output",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--requirement".to_string()),
+                        value_name: Some("<file>".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::FilePath,
+                        description: None,
+                    },
+                    description_contains: "requirements file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--log".to_string()),
+                        value_name: Some("<path>".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::AnyPath,
+                        description: None,
+                    },
+                    description_contains: "verbose appending log",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_go_fixture() {
+        let cmd = parse_test_manpage("go.1");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("build", "Compile packages"),
+                ("run", "Compile and run"),
+                ("test", "Test Go packages"),
+                ("clean", "Remove object files"),
+                ("doc", "Show documentation"),
+                ("env", "Print Go environment"),
+                ("fix", "Update packages"),
+                ("fmt", "gofmt"),
+                ("generate", "Generate Go files"),
+                ("get", "Add dependencies"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-x".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Print commands",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-o".to_string()),
+                        long: None,
+                        value_name: Some("OUTPUT".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::FilePath,
+                        description: None,
+                    },
+                    description_contains: "Write the resulting file to OUTPUT",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--work".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "temporary work directory",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Verbose",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Dry run",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: None,
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Force rebuilding",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-p".to_string()),
+                        long: None,
+                        value_name: Some("n".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "parallel",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--race".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "data race detection",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_gh_fixture() {
+        let cmd = parse_test_manpage("gh.1");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("auth", "Authenticate gh and git with GitHub"),
+                ("browse", "Open the repository in the browser"),
+                ("codespace", "Connect to and manage codespaces"),
+                ("gist", "Manage gists"),
+                ("issue", "Manage issues"),
+                ("org", "Manage organizations"),
+                ("pr", "Manage pull requests"),
+                ("project", "Work with GitHub Projects"),
+                ("release", "Manage releases"),
+                ("repo", "Manage repositories"),
+                ("cache", "Manage Github Actions caches"),
+                ("run", "View details about workflow runs"),
+                ("workflow", "View details about GitHub Actions workflows"),
+                ("alias", "Create command shortcuts"),
+                ("api", "Make an authenticated GitHub API request"),
+                ("completion", "Generate shell completion scripts"),
+                ("config", "Manage configuration for gh"),
+                ("extension", "Manage gh extensions"),
+                ("gpg-key", "Manage GPG keys"),
+                ("label", "Manage labels"),
+                ("ruleset", "View info about repo rulesets"),
+                (
+                    "search",
+                    "Search for repositories, issues, and pull requests",
+                ),
+                ("secret", "Manage GitHub secrets"),
+                ("ssh-key", "Manage SSH keys"),
+                ("status", "Print information about relevant issues"),
+                ("variable", "Manage GitHub Actions variables"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[ExpectedArg {
+                arg: Arg {
+                    short: None,
+                    long: Some("--version".to_string()),
+                    value_name: None,
+                    num_args: None,
+                    value_enum: None,
+                    value_hint: crate::ValueHint::Unknown,
+                    description: None,
+                },
+                description_contains: "Show gh version",
+            }],
+        );
+    }
+
+    #[test]
+    fn parses_real_curl_fixture() {
+        let cmd = parse_test_manpage("curl.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-g".to_string()),
+                        long: Some("--globoff".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "URL globbing parser",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-o".to_string()),
+                        long: Some("--output".to_string()),
+                        value_name: Some("<file>".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::FilePath,
+                        description: None,
+                    },
+                    description_contains: "Write output to <file>",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--abstract-unix-socket".to_string()),
+                        value_name: Some("<path>".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::AnyPath,
+                        description: None,
+                    },
+                    description_contains: "abstract Unix domain socket",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--silent".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Silent or quiet mode",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-A".to_string()),
+                        long: Some("--user-agent".to_string()),
+                        value_name: Some("<name>".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "User-Agent string",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: Some("--cookie".to_string()),
+                        value_name: Some("<data".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Pass the data to the HTTP server in the Cookie header",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--data".to_string()),
+                        value_name: Some("<data>".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Sends the specified data",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-H".to_string()),
+                        long: Some("--header".to_string()),
+                        value_name: Some("<header".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Extra header to include",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_tar_fixture() {
+        let cmd = parse_test_manpage("tar.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: Some("--auto-compress".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "compression program",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--file".to_string()),
+                        value_name: Some("ARCHIVE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::FilePath,
+                        description: None,
+                    },
+                    description_contains: "archive file or device ARCHIVE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "files processed",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-V".to_string()),
+                        long: Some("--label".to_string()),
+                        value_name: Some("TEXT".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "volume name TEXT",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-w".to_string()),
+                        long: Some("--interactive".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "confirmation",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-l".to_string()),
+                        long: Some("--check-links".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "links are dumped",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-T".to_string()),
+                        long: Some("--files-from".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::FilePath,
+                        description: None,
+                    },
+                    description_contains: "FILE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-X".to_string()),
+                        long: Some("--exclude-from".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::FilePath,
+                        description: None,
+                    },
+                    description_contains: "Exclude",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-P".to_string()),
+                        long: Some("--absolute-names".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "leading slashes",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--quoting-style".to_string()),
+                        value_name: Some("STYLE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: Some(vec![
+                            "literal".to_string(),
+                            "shell".to_string(),
+                            "shell-always".to_string(),
+                            "c".to_string(),
+                            "c-maybe".to_string(),
+                            "escape".to_string(),
+                            "locale".to_string(),
+                            "clocale".to_string(),
+                        ]),
+                        ..Default::default()
+                    },
+                    description_contains: "quoting style for file and member names",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--newer-mtime".to_string()),
+                        value_name: Some("DATE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Unknown,
+                        ..Default::default()
+                    },
+                    description_contains: "Work on files whose data changed after the DATE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-N".to_string()),
+                        long: Some("--newer".to_string()),
+                        value_name: Some("DATE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Unknown,
+                        ..Default::default()
+                    },
+                    description_contains: "Only store files newer than DATE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--suffix".to_string()),
+                        value_name: Some("STRING".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Unknown,
+                        ..Default::default()
+                    },
+                    description_contains: "Backup before removal, override usual suffix",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--transform".to_string()),
+                        value_name: Some("EXPRESSION".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::Unknown,
+                        ..Default::default()
+                    },
+                    description_contains: "Use sed replace EXPRESSION to transform file names",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_cargo_fixture() {
+        let cmd = parse_test_manpage("cargo.1");
+        assert_expected_subcommands(
+            &cmd,
+            &[
+                ("bench", "Execute benchmarks"),
+                ("build", "Compile a package"),
+                ("check", "Check a local package"),
+                ("clean", "Remove artifacts"),
+                ("doc", "Build a package"),
+                ("fetch", "Fetch dependencies"),
+                ("fix", "Automatically fix lint"),
+                ("run", "Run a binary"),
+                ("rustc", "Compile a package"),
+                ("rustdoc", "Build a package"),
+                ("test", "Execute unit"),
+                ("add", "Add dependencies"),
+                ("generate-lockfile", "Generate Cargo"),
+                ("info", "Display information"),
+                ("locate-project", "Print a JSON"),
+                ("metadata", "Output the resolved"),
+                ("pkgid", "Print a fully qualified"),
+                ("remove", "Remove dependencies"),
+                ("tree", "Display a tree"),
+                ("update", "Update dependencies"),
+                ("vendor", "Vendor all"),
+                ("init", "Create a new Cargo"),
+                ("install", "Build and install"),
+                ("new", "Create a new Cargo"),
+                ("search", "Search packages"),
+                ("uninstall", "Remove a Rust"),
+                ("login", "Save an API"),
+                ("logout", "Remove an API"),
+                ("owner", "Manage the owners"),
+                ("package", "Assemble the local"),
+                ("publish", "Upload a package"),
+                ("yank", "Remove a pushed"),
+                ("report", "Generate and display"),
+                ("report-future-incompatibilities", "Reports any crates"),
+                ("help", "Display help"),
+                ("version", "Show version"),
+            ],
+        );
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-V".to_string()),
+                        long: Some("--version".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Print version info",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--explain".to_string()),
+                        value_name: Some("code".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Run rustc --explain",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Use verbose output",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-q".to_string()),
+                        long: Some("--quiet".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Do not print cargo log messages",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--color".to_string()),
+                        value_name: Some("when".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Control when colored output is used",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--locked".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Asserts that the exact same dependencies",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--offline".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Prevents Cargo from accessing the network",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--frozen".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Equivalent to specifying both",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--config".to_string()),
+                        value_name: Some("KEY=VALUE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::AnyPath,
+                        description: None,
+                    },
+                    description_contains: "Overrides a Cargo configuration value",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-C".to_string()),
+                        long: None,
+                        value_name: Some("PATH".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::DirPath,
+                        description: None,
+                    },
+                    description_contains: "Changes the current working directory",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--help".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Prints help information",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-Z".to_string()),
+                        long: None,
+                        value_name: Some("flag".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Unstable (nightly-only) flags",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_manpage_recursive_fixture() {
+        // Test Cargo recursion: cargo -> cargo-build, cargo-check, cargo-clean
+        let cmd = parse_test_manpage_recursive("cargo.1", 5);
+
+        // Find the "build" subcommand of cargo
+        let build_sub = cmd
+            .subcommands
+            .iter()
+            .find(|s| s.name.as_deref() == Some("build"))
+            .expect("cargo should have 'build' subcommand");
+
+        // Asserts that the recursively parsed subcommand "build" has options from cargo-build.1
+        assert_contains_expected_args(
+            build_sub,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-p".to_string()),
+                        long: Some("--package".to_string()),
+                        value_name: Some("spec\\[u2026".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Build only the specified packages",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--release".to_string()),
+                        value_name: None,
+                        num_args: None,
+                        value_enum: None,
+                        value_hint: crate::ValueHint::Unknown,
+                        description: None,
+                    },
+                    description_contains: "Build optimized artifacts",
+                },
+            ],
+        );
+
+        // Find the "check" subcommand of cargo
+        let check_sub = cmd
+            .subcommands
+            .iter()
+            .find(|s| s.name.as_deref() == Some("check"))
+            .expect("cargo should have 'check' subcommand");
+
+        // Asserts check options are populated
+        assert!(
+            check_sub
+                .args
+                .iter()
+                .any(|a| a.long.as_deref() == Some("--profile"))
+        );
+
+        // Test GH recursion: gh -> gh-codespace -> gh-codespace-cp
+        let gh_cmd = parse_test_manpage_recursive("gh.1", 5);
+
+        let codespace_sub = gh_cmd
+            .subcommands
+            .iter()
+            .find(|s| s.name.as_deref() == Some("codespace"))
+            .expect("gh should have 'codespace' subcommand");
+
+        // Asserts gh-codespace options are populated from gh-codespace.1
+        assert_contains_expected_args(
+            codespace_sub,
+            &[ExpectedArg {
+                arg: Arg {
+                    short: Some("-c".to_string()),
+                    long: Some("--codespace".to_string()),
+                    value_name: Some("<name>".to_string()),
+                    num_args: Some("1".to_string()),
+                    value_enum: None,
+                    value_hint: crate::ValueHint::Unknown,
+                    description: None,
+                },
+                description_contains: "Name of the codespace",
+            }],
+        );
+
+        // gh-codespace should have nested subcommand "cp" from gh-codespace.1
+        let cp_sub = codespace_sub
+            .subcommands
+            .iter()
+            .find(|s| s.name.as_deref() == Some("cp"))
+            .expect("gh codespace should have 'cp' subcommand");
+
+        // gh codespace cp should have options from gh-codespace-cp.1 (recursive!)
+        assert_contains_expected_args(
+            cp_sub,
+            &[ExpectedArg {
+                arg: Arg {
+                    short: Some("-r".to_string()),
+                    long: Some("--recursive".to_string()),
+                    value_name: None,
+                    num_args: None,
+                    value_enum: None,
+                    value_hint: crate::ValueHint::Unknown,
+                    description: None,
+                },
+                description_contains: "Recursively copy directories",
+            }],
+        );
+    }
+
+    #[test]
+    fn parses_real_wc_fixture() {
+        let cmd = parse_test_manpage("wc.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: Some("--bytes".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the byte counts",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-m".to_string()),
+                        long: Some("--chars".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the character counts",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-l".to_string()),
+                        long: Some("--lines".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the newline counts",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--files0-from".to_string()),
+                        value_name: Some("F".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "read input from the files specified by NUL-terminated names",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-L".to_string()),
+                        long: Some("--max-line-length".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the maximum display width",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-w".to_string()),
+                        long: Some("--words".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the word counts",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--total".to_string()),
+                        value_name: Some("WHEN".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: Some(vec![
+                            "auto".to_string(),
+                            "always".to_string(),
+                            "only".to_string(),
+                            "never".to_string(),
+                        ]),
+                        ..Default::default()
+                    },
+                    description_contains: "when to print a line with total counts",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_ln_fixture() {
+        let cmd = parse_test_manpage("ln.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--backup".to_string()),
+                        value_name: Some("CONTROL".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "make a backup of each existing destination file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-b".to_string()),
+                        long: None,
+                        ..Default::default()
+                    },
+                    description_contains: "like --backup but does not accept an argument",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: None,
+                        ..Default::default()
+                    },
+                    description_contains: "allow the superuser to attempt to hard link directories",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-F".to_string()),
+                        long: Some("--directory".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "allow the superuser to attempt to hard link directories",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--force".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "remove existing destination files",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--interactive".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "prompt whether to remove destinations",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-L".to_string()),
+                        long: Some("--logical".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "dereference TARGETs that are symbolic links",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: Some("--no-dereference".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "treat LINK_NAME as a normal file if it is a symbolic link to a directory",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-P".to_string()),
+                        long: Some("--physical".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "make hard links directly to symbolic links",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--relative".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "with -s, create links relative to link location",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--symbolic".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "make symbolic links instead of hard links",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-S".to_string()),
+                        long: Some("--suffix".to_string()),
+                        value_name: Some("SUFFIX".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "override the usual backup suffix",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-t".to_string()),
+                        long: Some("--target-directory".to_string()),
+                        value_name: Some("DIRECTORY".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::DirPath,
+                        ..Default::default()
+                    },
+                    description_contains: "specify the DIRECTORY in which to create the links",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-T".to_string()),
+                        long: Some("--no-target-directory".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "treat LINK_NAME as a normal file always",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print name of each linked file",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_env_fixture() {
+        let cmd = parse_test_manpage("env.1");
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--ignore-environment".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "start with an empty environment",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-0".to_string()),
+                        long: Some("--null".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "end each output line with NUL",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-u".to_string()),
+                        long: Some("--unset".to_string()),
+                        value_name: Some("NAME".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::EnvVar,
+                        ..Default::default()
+                    },
+                    description_contains: "remove variable from the environment",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-C".to_string()),
+                        long: Some("--chdir".to_string()),
+                        value_name: Some("DIR".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::DirPath,
+                        ..Default::default()
+                    },
+                    description_contains: "change working directory to DIR",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-S".to_string()),
+                        long: Some("--split-string".to_string()),
+                        value_name: Some("S".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "process and split S into separate arguments",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--block-signal".to_string()),
+                        value_name: Some("SIG".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "block delivery of SIG",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--default-signal".to_string()),
+                        value_name: Some("SIG".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "reset handling of SIG",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--ignore-signal".to_string()),
+                        value_name: Some("SIG".to_string()),
+                        num_args: Some("?".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "set handling of SIG",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--list-signal-handling".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "list non default signal handling",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--debug".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print verbose information",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_h5dump_fixture() {
+        let cmd = parse_test_manpage("h5dump.1");
+        assert_eq!(cmd.name.as_deref(), Some("h5dump"));
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print a usage message and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-B".to_string()),
+                        long: Some("--bootblock".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the content of the boot block",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-H".to_string()),
+                        long: Some("--header".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the header only; no data is displayed",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-A".to_string()),
+                        long: None,
+                        ..Default::default()
+                    },
+                    description_contains: "Print the header and value of attributes",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--object-ids".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the object ids",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--string".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print 1-bytes integer datasets as ASCII",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-V".to_string()),
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print version number and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: Some("--attribute".to_string()),
+                        value_name: Some("P".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the specified attribute",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--dataset".to_string()),
+                        value_name: Some("P".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the specified dataset",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--filedriver".to_string()),
+                        value_name: Some("D".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Specify which driver to open the file with",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-g".to_string()),
+                        long: Some("--group".to_string()),
+                        value_name: Some("P".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the specified group and all members",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-l".to_string()),
+                        long: Some("--soft-link".to_string()),
+                        value_name: Some("P".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the value(s) of the specified soft link",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-o".to_string()),
+                        long: Some("--output".to_string()),
+                        value_name: Some("F".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Output raw data into file F",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-t".to_string()),
+                        long: Some("--datatype".to_string()),
+                        value_name: Some("T".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the specified named datatype",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-w".to_string()),
+                        long: Some("--width".to_string()),
+                        value_name: Some("N".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "Set the number of columns of output",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-x".to_string()),
+                        long: Some("--xml".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Output XML using XML schema",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-u".to_string()),
+                        long: Some("--use-dtd".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Output XML using XML DTD",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-D".to_string()),
+                        long: Some("--xml-dtd".to_string()),
+                        value_name: Some("U".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "refer to the DTD or schema",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-X".to_string()),
+                        long: Some("--xml-dns".to_string()),
+                        value_name: Some("S".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "use qualified names in the XML",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--start".to_string()),
+                        value_name: Some("L".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Offset of start of subsetting selection",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-S".to_string()),
+                        long: Some("--stride".to_string()),
+                        value_name: Some("L".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Hyperslab stride",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: Some("--count".to_string()),
+                        value_name: Some("L".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "Number of blocks to include in the selection",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-k".to_string()),
+                        long: Some("--block".to_string()),
+                        value_name: Some("L".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Size of block in hyperslab",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_h5ls_fixture() {
+        let cmd = parse_test_manpage("h5ls.1");
+        assert_eq!(cmd.name.as_deref(), Some("h5ls"));
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print a usage message and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: Some("--address".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print addresses for raw data",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--data".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the values of datasets",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-e".to_string()),
+                        long: Some("--errors".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Show all HDF5 error reporting",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--full".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print full path names instead of base names",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-g".to_string()),
+                        long: Some("--group".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Show information about a group, not its contents",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-l".to_string()),
+                        long: Some("--label".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Label members of compound datasets",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--recursive".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "List all groups recursively, avoiding cycles",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--string".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print 1-bytes integer datasets as ASCII",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-S".to_string()),
+                        long: Some("--simple".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Use a machine-readable output format",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-w".to_string()),
+                        long: Some("--width".to_string()),
+                        value_name: Some("N".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "Set the number of columns of output",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Generate more verbose output",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-V".to_string()),
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print version number and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-x".to_string()),
+                        long: Some("--hexdump".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Show raw data in hexadecimal format",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_uname_fixture() {
+        let cmd = parse_test_manpage("uname.1");
+        assert_eq!(cmd.description.as_deref(), Some("print system information"));
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: Some("--all".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print all information",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--kernel-name".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the kernel name",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: Some("--nodename".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the network node hostname",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--kernel-release".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the kernel release",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--kernel-version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the kernel version",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-m".to_string()),
+                        long: Some("--machine".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the machine hardware name",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-p".to_string()),
+                        long: Some("--processor".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the processor type",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--hardware-platform".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the hardware platform",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-o".to_string()),
+                        long: Some("--operating-system".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the operating system",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_touch_fixture() {
+        let cmd = parse_test_manpage("touch.1");
+        assert_eq!(cmd.description.as_deref(), Some("change file timestamps"));
+        assert_expected_subcommands(&cmd, &[]);
+        assert_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-a".to_string()),
+                        long: None,
+                        ..Default::default()
+                    },
+                    description_contains: "change only the access time",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: Some("--no-create".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "do not create any files",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-d".to_string()),
+                        long: Some("--date".to_string()),
+                        value_name: Some("STRING".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "parse STRING and use it instead",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: None,
+                        ..Default::default()
+                    },
+                    description_contains: "(ignored)",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--no-dereference".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "affect each symbolic link",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-m".to_string()),
+                        long: None,
+                        ..Default::default()
+                    },
+                    description_contains: "change only the modification time",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--reference".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: crate::ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "use this file's times instead",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-t".to_string()),
+                        long: None,
+                        value_name: Some("STAMP".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "use [[CC]YY]MMDDhhmm",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--time".to_string()),
+                        value_name: Some("WORD".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "change the specified time",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_head_fixture() {
+        let cmd = parse_test_manpage("head.1");
+        assert_eq!(
+            cmd.description.as_deref(),
+            Some("output the first part of files")
+        );
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: Some("--bytes".to_string()),
+                        value_name: Some("[-]NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the first NUM bytes",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: Some("--lines".to_string()),
+                        value_name: Some("[-]NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "print the first NUM lines",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-q".to_string()),
+                        long: Some("--quiet".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "never print headers",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--silent".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "never print headers",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-v".to_string()),
+                        long: Some("--verbose".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "always print headers",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-z".to_string()),
+                        long: Some("--zero-terminated".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "line delimiter is NUL",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "display this help and exit",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "output version information and exit",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_real_hyperfine_fixture() {
+        let cmd = parse_test_manpage("hyperfine.1");
+        assert_eq!(
+            cmd.description.as_deref(),
+            Some("command-line benchmarking tool")
+        );
+        assert_expected_subcommands(&cmd, &[]);
+        assert_contains_expected_args(
+            &cmd,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-w".to_string()),
+                        long: Some("--warmup".to_string()),
+                        value_name: Some("NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "Perform NUM warmup runs before the actual benchmark",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-m".to_string()),
+                        long: Some("--min-runs".to_string()),
+                        value_name: Some("NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "Perform at least NUM runs for each command",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-M".to_string()),
+                        long: Some("--max-runs".to_string()),
+                        value_name: Some("NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "Perform at most NUM runs for each command",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-r".to_string()),
+                        long: Some("--runs".to_string()),
+                        value_name: Some("NUM".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::Integral,
+                        ..Default::default()
+                    },
+                    description_contains: "Perform exactly NUM runs for each command",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-s".to_string()),
+                        long: Some("--setup".to_string()),
+                        value_name: Some("CMD".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::CommandName,
+                        ..Default::default()
+                    },
+                    description_contains: "Execute CMD once before each set of timing runs",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-p".to_string()),
+                        long: Some("--prepare".to_string()),
+                        value_name: Some("CMD".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::CommandName,
+                        ..Default::default()
+                    },
+                    description_contains: "Execute CMD before each timing run",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--conclude".to_string()),
+                        value_name: Some("CMD".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::CommandName,
+                        ..Default::default()
+                    },
+                    description_contains: "Execute CMD after each timing run",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-c".to_string()),
+                        long: Some("--cleanup".to_string()),
+                        value_name: Some("CMD".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::CommandName,
+                        ..Default::default()
+                    },
+                    description_contains: "Execute CMD after the completion of all benchmarking runs",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-P".to_string()),
+                        long: Some("--parameter-scan".to_string()),
+                        value_name: Some("VAR".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Perform benchmark runs for each value in the range MIN",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-D".to_string()),
+                        long: Some("--parameter-step-size".to_string()),
+                        value_name: Some("DELTA".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "This argument requires --parameter-scan to be specified as well",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-L".to_string()),
+                        long: Some("--parameter-list".to_string()),
+                        value_name: Some("VAR".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Perform benchmark runs for each value in the comma-separated list",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-S".to_string()),
+                        long: Some("--shell".to_string()),
+                        value_name: Some("SHELL".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::CommandString,
+                        ..Default::default()
+                    },
+                    description_contains: "Set the shell to use for executing benchmarked commands",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-N".to_string()),
+                        long: None,
+                        ..Default::default()
+                    },
+                    description_contains: "An alias for '--shell=none'",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-i".to_string()),
+                        long: Some("--ignore-failure".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Ignore non-zero exit codes of the benchmarked programs",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--style".to_string()),
+                        value_name: Some("TYPE".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Set output style TYPE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--sort".to_string()),
+                        value_name: Some("METHOD".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Specify the sort order of the speed comparison summary",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-u".to_string()),
+                        long: Some("--time-unit".to_string()),
+                        value_name: Some("UNIT".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_enum: Some(vec![
+                            "microsecond".to_string(),
+                            "millisecond".to_string(),
+                            "second".to_string(),
+                        ]),
+                        ..Default::default()
+                    },
+                    description_contains: "Set the time unit to be used",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--export-asciidoc".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "Export the timing summary statistics as an AsciiDoc table",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--export-csv".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "Export the timing summary statistics as CSV to the given FILE",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--export-json".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "Export the timing summary statistics and timings of individual runs as JSON",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--export-markdown".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "Export the timing summary statistics as a Markdown table",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--export-orgmode".to_string()),
+                        value_name: Some("FILE".to_string()),
+                        num_args: Some("1".to_string()),
+                        value_hint: ValueHint::FilePath,
+                        ..Default::default()
+                    },
+                    description_contains: "Export the timing summary statistics as an Emacs org-mode table",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--show-output".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print the stdout and stderr of the benchmark instead of suppressing it",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--output".to_string()),
+                        value_name: Some("WHERE".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Control where the output of the benchmark is redirected",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--input".to_string()),
+                        value_name: Some("WHERE".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Control where the input of the benchmark comes from",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-n".to_string()),
+                        long: Some("--command-name".to_string()),
+                        value_name: Some("NAME".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Give a meaningful NAME to a command",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-h".to_string()),
+                        long: Some("--help".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print help",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-V".to_string()),
+                        long: Some("--version".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "Print version",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_git_recursive_with_git_push() {
+        use crate::test_helpers::ExpectedArg;
+        use crate::test_helpers::assert_contains_expected_args;
+        let cmd = parse_test_manpage_recursive("git.1", 5);
+
+        let push_sub = cmd
+            .subcommands
+            .iter()
+            .find(|s| s.name.as_deref() == Some("push"))
+            .expect("git should have 'push' subcommand");
+
+        assert_contains_expected_args(
+            push_sub,
+            &[
+                ExpectedArg {
+                    arg: Arg {
+                        short: Some("-f".to_string()),
+                        long: Some("--force".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "refuses to update a remote ref",
+                },
+                ExpectedArg {
+                    arg: Arg {
+                        short: None,
+                        long: Some("--repo".to_string()),
+                        value_name: Some("<repository>".to_string()),
+                        num_args: Some("1".to_string()),
+                        ..Default::default()
+                    },
+                    description_contains: "command-line argument takes precedence",
+                },
+            ],
+        );
+    }
+}

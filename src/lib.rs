@@ -54,6 +54,7 @@ mod settings;
 pub(crate) use settings::settings;
 pub mod shell;
 mod shell_integration;
+mod strftime;
 pub(crate) mod subshell_ipc;
 pub mod term_info;
 mod tutorial;

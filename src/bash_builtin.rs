@@ -261,6 +261,8 @@ fn flyline_load_common() -> c_int {
 
     crate::history::ignorespace::note_histcontrol();
 
+    pin_library_in_memory();
+
     // When do we want to set up flyline's input stream?
     // shell.c:main:792:set_bash_input: sets up readline if interactive && no_line_editing
 
@@ -476,6 +478,38 @@ struct Dl_info {
 
 unsafe extern "C" {
     fn dladdr(addr: *const libc::c_void, info: *mut Dl_info) -> libc::c_int;
+}
+
+/// Keeps this library mapped after `enable -d flyline`.
+///
+/// Bash `dlclose`s a builtin's library when it is deleted, but flyline leaves
+/// code behind that the process can still jump into: termina's SIGWINCH
+/// handler (signal-hook never uninstalls the `sigaction` it set) and
+/// thread-local destructors. glibc happens to keep such a library loaded;
+/// Bionic unmaps it, so the next resize after an unload (on Termux, switching
+/// apps) crashed bash with SIGSEGV (HalFrgrd/flyline#1040). On Linux and
+/// Android the library is linked with `-z nodelete` (build.rs); this second,
+/// never-released reference covers loaders that ignore that flag. A later
+/// `enable -f` gets the same, still-initialised copy.
+fn pin_library_in_memory() {
+    use std::sync::Once;
+    static PINNED: Once = Once::new();
+    PINNED.call_once(|| unsafe {
+        let mut info = std::mem::zeroed::<Dl_info>();
+        let addr = flyline_load_common as *const libc::c_void;
+        if dladdr(addr, &mut info) == 0 || info.dli_fname.is_null() {
+            log::warn!("dladdr failed; flyline cannot pin itself in memory");
+            return;
+        }
+        let handle = libc::dlopen(info.dli_fname, libc::RTLD_LAZY | libc::RTLD_NODELETE);
+        if handle.is_null() {
+            log::warn!("dlopen(RTLD_NODELETE) failed; flyline cannot pin itself in memory");
+        } else {
+            // The handle is leaked on purpose: it is the reference that keeps
+            // the library loaded.
+            log::debug!("Pinned flyline in memory");
+        }
+    });
 }
 
 fn get_library_directory() -> Option<std::path::PathBuf> {

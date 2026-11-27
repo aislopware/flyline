@@ -345,7 +345,7 @@ enum Commands {
 
     ///
     /// With no flags, prints nanoseconds since the Unix epoch.
-    /// With --format, formats the current local time using a Chrono strftime
+    /// With --format, formats the current local time using a strftime
     /// format string (e.g. "%Y-%m-%dT%H:%M:%S").
     ///
     /// To display elapsed time since the last command, use the
@@ -357,7 +357,7 @@ enum Commands {
     ///   flyline time --format "%Y-%m-%dT%H:%M:%S"
     #[command(name = "time", verbatim_doc_comment)]
     Time {
-        /// Format string passed to Chrono's `strftime` formatter.
+        /// strftime format string (formatted by jiff, C-locale `%c`/`%x`/`%X`/`%r`).
         /// When omitted, prints nanoseconds since the Unix epoch.
         #[arg(long = "format", value_name = "FORMAT")]
         format: Option<String>,
@@ -1711,15 +1711,20 @@ pub(crate) fn call(words: *const bash_symbols::WordList) -> c_int {
                 }
                 Some(Commands::Time { format }) => {
                     if let Some(fmt) = format {
-                        let has_error = chrono::format::strftime::StrftimeItems::new(&fmt)
-                            .any(|item| matches!(item, chrono::format::Item::Error));
-                        if has_error {
-                            return_usage_error!(
-                                "flyline time: invalid Chrono format string: {:?}",
-                                fmt
-                            );
+                        let c_locale = crate::strftime::c_locale_format(&fmt);
+                        match jiff::fmt::strtime::format(
+                            c_locale.as_ref(),
+                            &crate::strftime::local_now(),
+                        ) {
+                            Ok(formatted) => println!("{formatted}"),
+                            Err(e) => {
+                                return_usage_error!(
+                                    "flyline time: invalid strftime format string {:?}: {}",
+                                    fmt,
+                                    e
+                                );
+                            }
                         }
-                        println!("{}", chrono::Local::now().format(&fmt));
                     } else {
                         let ns = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

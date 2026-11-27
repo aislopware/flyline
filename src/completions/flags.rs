@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::grammar::{QuoteType, find_quote_type};
 
@@ -156,8 +155,12 @@ fn should_infer_filename_completion(completions: &[String], flags: &CompletionFl
     }
 
     completions.iter().all(|completion| {
-        !completion.contains('\t')
-            && Path::new(&crate::shell::backend().expand_path(completion)).exists()
+        !completion.is_empty()
+            && !completion.contains('\t')
+            && crate::shell::backend()
+                .resolve_completion_path(completion)
+                .symlink_metadata()
+                .is_ok()
     })
 }
 

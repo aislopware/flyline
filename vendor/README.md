@@ -6,8 +6,9 @@ update them itself.
 
 | Directory | Upstream | Base commit | flyline's changes |
 |---|---|---|---|
-| `ratatui/` | [ratatui/ratatui](https://github.com/ratatui/ratatui) `main` | `5a28bec1` | An inline viewport positioned relative to its top row: cursor tracked in memory and never queried, resizable height, `viewport_top` for mapping mouse rows, synchronized output, autowrap off while drawing, erase instead of spaces, cells hidden behind wide glyphs skipped, no redundant cursor show/hide (HalFrgrd/ratatui `inline_viewport_improvments`, merged with upstream; see below) |
+| `ratatui/` | [ratatui/ratatui](https://github.com/ratatui/ratatui) `main` | `5a28bec1` | An inline viewport positioned relative to its top row: cursor tracked in memory and never queried, resizable height, `viewport_top` for mapping mouse rows, synchronized output, autowrap off while drawing, erase instead of spaces (a changed row is drawn up to its last visible cell, then `EL`; a run of blanks is one `ECH n`), cells hidden behind wide glyphs skipped, no redundant cursor show/hide (HalFrgrd/ratatui `inline_viewport_improvments`, merged with upstream; see below) |
 | `termina/` | [helix-editor/termina](https://github.com/helix-editor/termina) `master` | `7be7389f` (v0.4.0) | Raw device-attribute responses and no parser deadlock on DA2/DA3 or unhandled CSI (upstream PR #32), OSC 52 replies as `Paste`, the kitty base-layout key, `PlatformTerminal::with_reader` (upstream PR #31), an event buffer that keeps arrival order, `TCSANOW` so typed-ahead input survives entering raw mode, and an 80x24 fallback when the terminal reports a 0x0 size |
+| `flycomp/` | [HalFrgrd/flycomp](https://github.com/HalFrgrd/flycomp) `master` | `34e8e6e7` (1.1.2) | jiff instead of the unmaintained chrono for its two timestamps, and a build script without a date crate |
 | `skim/` | [skim-rs/skim](https://github.com/skim-rs/skim) `master` | `2160abbd` (5.9.0) | A `tui` feature, so `default-features = false, features = ["algos_only"]` builds only the matchers, without the TUI and runtime stack (HalFrgrd/skim, 1 commit) |
 
 Each directory is a `git subtree --squash`. It holds upstream's tree at the
@@ -27,6 +28,7 @@ workspace `exclude`s `vendor/`. The crates keep their own workspaces, lints and
 git subtree pull --prefix vendor/termina https://github.com/helix-editor/termina.git master --squash
 git subtree pull --prefix vendor/skim    https://github.com/skim-rs/skim.git        master --squash
 git subtree pull --prefix vendor/ratatui https://github.com/ratatui/ratatui.git     main   --squash
+git subtree pull --prefix vendor/flycomp https://github.com/HalFrgrd/flycomp.git    master --squash
 ```
 
 1. Resolve conflicts in favour of keeping flyline's behaviour.

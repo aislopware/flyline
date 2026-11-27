@@ -1,0 +1,4133 @@
+//! Parse a `--help` string into a [`Command`] structure.
+//!
+//! The entry point is [`parse_help`].  It tries to identify which help format
+//! the text comes from (clap, Python argparse, or an unknown generic format)
+//! and dispatches to the appropriate sub-parser.
+use anyhow::Context;
+use regex_lite as regex;
+use strum::IntoStaticStr;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static MAN_PAGES_READ: AtomicUsize = AtomicUsize::new(0);
+static HELP_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn increment_man_pages_read() {
+    MAN_PAGES_READ.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn increment_help_runs() {
+    HELP_RUNS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn get_man_pages_read() -> usize {
+    MAN_PAGES_READ.load(Ordering::Relaxed)
+}
+
+pub fn get_help_runs() -> usize {
+    HELP_RUNS.load(Ordering::Relaxed)
+}
+
+pub fn reset_stats() {
+    MAN_PAGES_READ.store(0, Ordering::Relaxed);
+    HELP_RUNS.store(0, Ordering::Relaxed);
+}
+
+pub fn is_sandboxing_available() -> Option<String> {
+    // Test if bwrap exists in PATH by trying to spawn it with --version
+    match std::process::Command::new("bwrap")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let _ = child.wait();
+            Some(
+                "bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --unshare-all --"
+                    .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
+mod bash_with_descriptions;
+mod parse_help;
+pub mod parse_man;
+
+use bash_with_descriptions::try_apply_bash_descriptions;
+pub use parse_help::{parse_help, parse_help_argparse, parse_help_clap, parse_help_generic};
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    IntoStaticStr,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[value(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum SynthesisStrategy {
+    ManPageThenRunHelp,
+    ManPage,
+    RunHelp,
+    #[default]
+    ManPageOrRunHelp,
+}
+
+/// Settings and configuration options for flycomp synthesis.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::Args)]
+pub struct FlycompSettings {
+    /// Enable or disable flycomp for synthesizing shell completions.
+    #[arg(long = "enabled", default_missing_value = "true", num_args = 0..=1)]
+    pub enabled: Option<bool>,
+
+    /// Parsing strategy (man-page-then-run-help, man-page, run-help, man-page-or-run-help).
+    #[arg(long = "strategy", value_enum)]
+    pub strategy: Option<SynthesisStrategy>,
+
+    /// Enable or disable sandboxing (bubblewrap/bwrap).
+    #[arg(long = "sandbox", default_missing_value = "true", num_args = 0..=1)]
+    pub sandbox: Option<bool>,
+
+    /// Run execution unsandboxed (bypass bubblewrap/bwrap sandboxing).
+    #[arg(long = "no-sandbox", overrides_with = "sandbox")]
+    pub no_sandbox: bool,
+
+    /// Timeout in milliseconds for running commands during synthesis.
+    #[arg(long = "timeout-ms")]
+    pub timeout_ms: Option<u64>,
+
+    /// Maximum depth for recursive subcommand synthesis/exploration.
+    #[arg(long = "recurse-limit")]
+    pub recurse_limit: Option<usize>,
+
+    /// Directory where flycomp output should be saved.
+    #[arg(long = "output-dir", value_name = "DIR")]
+    pub output_dir: Option<String>,
+
+    /// Blacklist of command words for which flycomp prompt should be bypassed.
+    #[arg(long = "blacklist", value_name = "COMMANDS", num_args = 1..)]
+    pub blacklist: Option<Vec<String>>,
+}
+
+impl Default for FlycompSettings {
+    fn default() -> Self {
+        Self {
+            enabled: Some(true),
+            strategy: Some(SynthesisStrategy::ManPageOrRunHelp),
+            sandbox: Some(true),
+            no_sandbox: false,
+            timeout_ms: Some(5000),
+            recurse_limit: Some(2),
+            output_dir: None,
+            blacklist: Some(Vec::new()),
+        }
+    }
+}
+
+/// The status and reasoning for whether bubblewrap sandboxing will be used.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SandboxStatus {
+    /// Sandboxing is enabled and bubblewrap command is available.
+    Sandboxed(String),
+    /// Sandboxing was explicitly disabled via settings (`--no-sandbox` / `--sandbox false`).
+    DisabledInSettings,
+    /// Sandboxing is enabled in settings, but `bwrap` executable was not found in PATH.
+    BwrapNotFound,
+}
+
+impl SandboxStatus {
+    /// Returns true if sandboxing is active.
+    pub fn is_sandboxed(&self) -> bool {
+        matches!(self, SandboxStatus::Sandboxed(_))
+    }
+
+    /// Short label ("sandboxed" or "unsandboxed").
+    pub fn label(&self) -> &'static str {
+        if self.is_sandboxed() {
+            "sandboxed"
+        } else {
+            "unsandboxed"
+        }
+    }
+
+    /// Detailed description explaining why sandboxing is or isn't active.
+    pub fn description(&self) -> &str {
+        match self {
+            SandboxStatus::Sandboxed(cmd) => cmd.as_str(),
+            SandboxStatus::DisabledInSettings => {
+                "Sandboxing disabled in flycomp settings (`--no-sandbox`)."
+            }
+            SandboxStatus::BwrapNotFound => {
+                "bubblewrap (bwrap) not found in PATH; running completion check unsandboxed."
+            }
+        }
+    }
+}
+
+impl FlycompSettings {
+    pub fn empty() -> Self {
+        Self {
+            enabled: None,
+            strategy: None,
+            sandbox: None,
+            no_sandbox: false,
+            timeout_ms: None,
+            recurse_limit: None,
+            output_dir: None,
+            blacklist: None,
+        }
+    }
+
+    pub fn update(&mut self, other: FlycompSettings) {
+        if let Some(enabled) = other.enabled {
+            self.enabled = Some(enabled);
+        }
+        if let Some(strategy) = other.strategy {
+            self.strategy = Some(strategy);
+        }
+        if other.no_sandbox {
+            self.sandbox = Some(false);
+            self.no_sandbox = true;
+        } else if let Some(sandbox) = other.sandbox {
+            self.sandbox = Some(sandbox);
+            self.no_sandbox = !sandbox;
+        }
+        if let Some(timeout_ms) = other.timeout_ms {
+            self.timeout_ms = Some(timeout_ms);
+        }
+        if let Some(recurse_limit) = other.recurse_limit {
+            self.recurse_limit = Some(recurse_limit);
+        }
+        if let Some(output_dir) = other.output_dir {
+            self.output_dir = Some(output_dir);
+        }
+        if let Some(blacklist) = other.blacklist {
+            self.blacklist = Some(blacklist);
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn strategy(&self) -> SynthesisStrategy {
+        self.strategy.unwrap_or(SynthesisStrategy::ManPageOrRunHelp)
+    }
+
+    pub fn sandbox(&self) -> bool {
+        if self.no_sandbox || self.sandbox == Some(false) {
+            false
+        } else {
+            self.sandbox.unwrap_or(true)
+        }
+    }
+
+    /// Resolves the current sandbox status considering settings and host system capabilities.
+    pub fn sandbox_status(&self) -> SandboxStatus {
+        if !self.sandbox() {
+            SandboxStatus::DisabledInSettings
+        } else if let Some(cmd) = is_sandboxing_available() {
+            SandboxStatus::Sandboxed(cmd)
+        } else {
+            SandboxStatus::BwrapNotFound
+        }
+    }
+
+    /// Returns the bwrap sandbox command string if sandboxing is enabled in settings
+    /// AND bwrap is available on the system. Returns `None` otherwise.
+    pub fn resolved_sandbox(&self) -> Option<String> {
+        match self.sandbox_status() {
+            SandboxStatus::Sandboxed(cmd) => Some(cmd),
+            _ => None,
+        }
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.unwrap_or(5000)
+    }
+
+    pub fn recurse_limit(&self) -> usize {
+        self.recurse_limit.unwrap_or(2)
+    }
+
+    pub fn output_dir(&self) -> Option<&str> {
+        self.output_dir.as_deref()
+    }
+
+    pub fn is_blacklisted(&self, command: &str) -> bool {
+        self.blacklist
+            .as_ref()
+            .map_or(false, |bl| bl.iter().any(|cmd| cmd == command))
+    }
+
+    pub fn add_to_blacklist(&mut self, command: String) {
+        let mut list = self.blacklist.take().unwrap_or_default();
+        if !list.contains(&command) {
+            list.push(command);
+        }
+        self.blacklist = Some(list);
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[value(rename_all = "lower")]
+pub enum OutputFormat {
+    Bash,
+    #[value(
+        name = "bash-with-descriptions",
+        alias = "bashwithdescriptions",
+        alias = "bash_with_descriptions"
+    )]
+    BashWithDescriptions,
+    Elvish,
+    Fish,
+    Powershell,
+    Zsh,
+    Json,
+}
+
+impl OutputFormat {
+    fn shell(&self) -> Option<clap_complete::Shell> {
+        match self {
+            OutputFormat::Bash | OutputFormat::BashWithDescriptions => {
+                Some(clap_complete::Shell::Bash)
+            }
+            OutputFormat::Elvish => Some(clap_complete::Shell::Elvish),
+            OutputFormat::Fish => Some(clap_complete::Shell::Fish),
+            OutputFormat::Powershell => Some(clap_complete::Shell::PowerShell),
+            OutputFormat::Zsh => Some(clap_complete::Shell::Zsh),
+            OutputFormat::Json => None,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Public data structures
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ValueHint {
+    #[default]
+    Unknown,
+    Other,
+    AnyPath,
+    FilePath,
+    DirPath,
+    ExecutablePath,
+    CommandName,
+    CommandString,
+    CommandWithArguments,
+    Username,
+    Hostname,
+    Url,
+    EmailAddress,
+    EnvVar,
+    NetworkInterface,
+    GitBranch,
+    GitRevision,
+    SystemdUnit,
+    Integral,
+}
+
+/// A single command-line argument / flag.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct Arg {
+    /// Long flag name, e.g. `--verbose`.
+    pub long: Option<String>,
+    /// Short flag name, e.g. `-v`.
+    pub short: Option<String>,
+    /// Human-readable description.
+    pub description: Option<String>,
+    /// Meta-variable / value name hint (e.g. `<PATH>`, `<N>`).
+    pub value_name: Option<String>,
+    /// Number of values accepted (e.g. `*`, `+`, `?`, or a count like `"1"`).
+    pub num_args: Option<String>,
+    /// Possible values for the option.
+    pub value_enum: Option<Vec<String>>,
+    /// Completion hint for the option value.
+    pub value_hint: ValueHint,
+}
+
+impl Arg {
+    pub fn takes_value(&self) -> bool {
+        self.value_name.is_some()
+            || self.num_args.is_some()
+            || self.short.as_ref().map_or(false, |s| s.ends_with('#'))
+            || self.long.as_ref().map_or(false, |l| l.ends_with('#'))
+    }
+}
+
+/// A parsed command (or sub-command).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct Command {
+    /// Name of the command, if known.
+    pub name: Option<String>,
+    /// Subcommand aliases.
+    pub aliases: Vec<String>,
+    /// Author / maintainer information, if present.
+    pub author: Option<String>,
+    /// Short description / about line.
+    pub description: Option<String>,
+    /// Recognised arguments / flags.
+    pub args: Vec<Arg>,
+    /// Recognised sub-commands.
+    pub subcommands: Vec<Command>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, IntoStaticStr)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+enum SynthesisMethod {
+    ManPage,
+    RunHelp,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SynthesisOutcome {
+    command: Command,
+    strategy_used: SynthesisMethod,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct JsonMetadata {
+    flycomp_version: &'static str,
+    git_hash: &'static str,
+    build_time: &'static str,
+    generated_at: String,
+    output_format: &'static str,
+    requested_strategy: &'static str,
+    strategy_used: &'static str,
+    sandboxed: bool,
+    timeout_ms: u64,
+    command_path: String,
+    man_pages_read: usize,
+    help_runs: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct JsonCompletionOutput {
+    metadata: JsonMetadata,
+    command: Command,
+}
+
+impl Command {
+    pub fn expand_no_options(&mut self) {
+        let mut expanded_args = Vec::new();
+        for arg in std::mem::take(&mut self.args) {
+            if let Some(long) = &arg.long {
+                if long.contains("[no-]") {
+                    let base = long.replace("[no-]", "");
+                    let no_variant = long.replace("[no-]", "no-");
+
+                    let mut arg1 = arg.clone();
+                    arg1.long = Some(base);
+                    expanded_args.push(arg1);
+
+                    let mut arg2 = arg.clone();
+                    arg2.long = Some(no_variant);
+                    arg2.short = None;
+                    expanded_args.push(arg2);
+                } else if long.contains("[no]") {
+                    let base = long.replace("[no]", "");
+                    let no_variant = long.replace("[no]", "no");
+
+                    let mut arg1 = arg.clone();
+                    arg1.long = Some(base);
+                    expanded_args.push(arg1);
+
+                    let mut arg2 = arg.clone();
+                    arg2.long = Some(no_variant);
+                    arg2.short = None;
+                    expanded_args.push(arg2);
+                } else {
+                    expanded_args.push(arg);
+                }
+            } else {
+                expanded_args.push(arg);
+            }
+        }
+        self.args = expanded_args;
+
+        for sub in &mut self.subcommands {
+            sub.expand_no_options();
+        }
+    }
+
+    pub fn resolve_alias_args(&mut self) {
+        let mut aliases_to_merge = Vec::new();
+        let mut i = 0;
+        while i < self.args.len() {
+            let arg = &self.args[i];
+            if arg.short.is_some() && arg.long.is_none() {
+                if let Some(desc) = &arg.description {
+                    let desc_lower = desc.to_lowercase();
+                    if let Some(pos) = desc_lower.find("alias for --") {
+                        let target_long = &desc_lower[pos + "alias for --".len()..];
+                        let target_long =
+                            target_long.split_whitespace().next().unwrap_or("").trim();
+                        let target_long = target_long.trim_end_matches(|c: char| {
+                            c.is_ascii_punctuation() && c != '_' && c != '-'
+                        });
+                        if !target_long.is_empty() {
+                            aliases_to_merge.push((i, format!("--{}", target_long)));
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        let mut to_remove = std::collections::HashSet::new();
+        for (alias_idx, target_long) in aliases_to_merge {
+            if let Some(target_idx) = self
+                .args
+                .iter()
+                .position(|a| a.long.as_ref() == Some(&target_long))
+            {
+                let short_val = self.args[alias_idx].short.clone();
+                self.args[target_idx].short = short_val;
+                to_remove.insert(alias_idx);
+            }
+        }
+
+        if !to_remove.is_empty() {
+            let mut new_args = Vec::new();
+            for (idx, arg) in self.args.drain(..).enumerate() {
+                if !to_remove.contains(&idx) {
+                    new_args.push(arg);
+                }
+            }
+            self.args = new_args;
+        }
+
+        for sub in &mut self.subcommands {
+            sub.resolve_alias_args();
+        }
+    }
+
+    pub fn deduplicate_args(&mut self) {
+        self.resolve_alias_args();
+        let mut unique_args: Vec<Arg> = Vec::new();
+        for arg in std::mem::take(&mut self.args) {
+            let mut found_idx = None;
+            if let Some(ref long) = arg.long {
+                found_idx = unique_args
+                    .iter()
+                    .position(|a| a.long.as_ref() == Some(long));
+            }
+            if found_idx.is_none() {
+                if let Some(ref short) = arg.short {
+                    found_idx = unique_args
+                        .iter()
+                        .position(|a| a.short.as_ref() == Some(short));
+                }
+            }
+
+            if let Some(idx) = found_idx {
+                let existing = &mut unique_args[idx];
+                if existing.short.is_none() {
+                    existing.short = arg.short;
+                }
+                if existing.long.is_none() {
+                    existing.long = arg.long;
+                }
+                if existing.value_name.is_none() {
+                    existing.value_name = arg.value_name;
+                }
+                if existing.num_args.is_none() {
+                    existing.num_args = arg.num_args;
+                }
+                if existing.value_hint == ValueHint::Unknown {
+                    existing.value_hint = arg.value_hint;
+                }
+                if let (Some(d1), Some(d2)) = (&existing.description, &arg.description) {
+                    if d1 != d2 && !d1.contains(d2) {
+                        existing.description = Some(format!("{} {}", d1, d2));
+                    }
+                } else if existing.description.is_none() {
+                    existing.description = arg.description;
+                }
+                match (&mut existing.value_enum, arg.value_enum) {
+                    (Some(v1), Some(v2)) => {
+                        for val in v2 {
+                            if !v1.contains(&val) {
+                                v1.push(val);
+                            }
+                        }
+                    }
+                    (None, Some(v2)) => {
+                        existing.value_enum = Some(v2);
+                    }
+                    _ => {}
+                }
+            } else {
+                unique_args.push(arg);
+            }
+        }
+        self.args = unique_args;
+
+        for sub in &mut self.subcommands {
+            sub.deduplicate_args();
+        }
+    }
+
+    pub fn populate_possible_values(&mut self) {
+        for arg in &mut self.args {
+            if arg.value_enum.is_none() {
+                let should_parse = if arg.takes_value() {
+                    true
+                } else {
+                    arg.description
+                        .as_ref()
+                        .map_or(false, |desc| desc.contains("/="))
+                };
+                if should_parse {
+                    arg.value_enum = parse_possible_values(
+                        arg.value_name.as_deref(),
+                        arg.description.as_deref(),
+                    );
+                }
+            }
+            if arg.value_hint == ValueHint::Unknown {
+                if arg.takes_value() {
+                    arg.value_hint =
+                        extract_value_hint(arg.value_name.as_deref(), arg.description.as_deref());
+                }
+            }
+        }
+        for sub in &mut self.subcommands {
+            sub.populate_possible_values();
+        }
+    }
+}
+
+pub fn extract_value_hint(value_name: Option<&str>, description: Option<&str>) -> ValueHint {
+    let name_lower = value_name.map(|s| s.to_lowercase());
+    let desc_lower = description.map(|s| s.to_lowercase());
+
+    // Helper to check if name contains a substring
+    let name_contains = |substring: &str| {
+        if let Some(ref name) = name_lower {
+            name.contains(substring)
+        } else {
+            false
+        }
+    };
+
+    // Helper to check if desc contains a substring
+    let desc_contains = |substring: &str| {
+        if let Some(ref desc) = desc_lower {
+            desc.contains(substring)
+        } else {
+            false
+        }
+    };
+
+    // Helper to check if name contains a specific word (boundary-aware)
+    let name_has_word = |word: &str| -> bool {
+        if let Some(ref name) = name_lower {
+            let mut start = 0;
+            while let Some(pos) = name[start..].find(word) {
+                let actual_pos = start + pos;
+                let char_before_ok = if actual_pos > 0 {
+                    if let Some(prev_char) = name[..actual_pos].chars().next_back() {
+                        !prev_char.is_alphanumeric()
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                let char_after_ok = if actual_pos + word.len() < name.len() {
+                    if let Some(next_char) = name[actual_pos + word.len()..].chars().next() {
+                        !next_char.is_alphanumeric()
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if char_before_ok && char_after_ok {
+                    return true;
+                }
+                if let Some((offset, _)) = name[actual_pos..].char_indices().nth(1) {
+                    start = actual_pos + offset;
+                } else {
+                    break;
+                }
+            }
+        }
+        false
+    };
+
+    // Helper to check if desc contains a specific word (boundary-aware)
+    let desc_has_word = |word: &str| -> bool {
+        if let Some(ref desc) = desc_lower {
+            let mut start = 0;
+            while let Some(pos) = desc[start..].find(word) {
+                let actual_pos = start + pos;
+                let char_before_ok = if actual_pos > 0 {
+                    if let Some(prev_char) = desc[..actual_pos].chars().next_back() {
+                        !prev_char.is_alphanumeric()
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                let char_after_ok = if actual_pos + word.len() < desc.len() {
+                    if let Some(next_char) = desc[actual_pos + word.len()..].chars().next() {
+                        !next_char.is_alphanumeric()
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
+                if char_before_ok && char_after_ok {
+                    return true;
+                }
+                if let Some((offset, _)) = desc[actual_pos..].char_indices().nth(1) {
+                    start = actual_pos + offset;
+                } else {
+                    break;
+                }
+            }
+        }
+        false
+    };
+
+    // 1. Check value_name first (high precision)
+    if name_has_word("int")
+        || name_contains("integer")
+        || name_has_word("num")
+        || name_contains("number")
+        || name_contains("count")
+        || name_contains("index")
+        || name_contains("port")
+        || name_has_word("pid")
+        || name_has_word("uid")
+        || name_has_word("gid")
+        || name_has_word("offset")
+        || name_has_word("limit")
+        || name_has_word("n")
+    {
+        return ValueHint::Integral;
+    }
+    if name_has_word("url") || name_has_word("uri") {
+        return ValueHint::Url;
+    }
+    if name_has_word("email") {
+        return ValueHint::EmailAddress;
+    }
+    if name_contains("hostname")
+        || name_has_word("host")
+        || name_has_word("domain")
+        || name_lower.as_ref().map_or(false, |n| n.ends_with("domain"))
+        || name_has_word("address")
+        || name_lower
+            .as_ref()
+            .map_or(false, |n| n.ends_with("address"))
+    {
+        return ValueHint::Hostname;
+    }
+    if name_contains("username") || name_contains("user_name") || name_contains("user-name") {
+        return ValueHint::Username;
+    }
+    if name_contains("command")
+        || name_has_word("cmd")
+        || name_lower.as_ref().map_or(false, |n| n.ends_with("cmd"))
+    {
+        if name_contains("line") || name_contains("string") {
+            return ValueHint::CommandString;
+        }
+        return ValueHint::CommandName;
+    }
+    if name_has_word("executable") || name_has_word("binary") {
+        return ValueHint::ExecutablePath;
+    }
+    if name_has_word("dir")
+        || name_contains("directory")
+        || name_contains("folder")
+        || name_lower.as_ref().map_or(false, |n| n.ends_with("dir"))
+    {
+        return ValueHint::DirPath;
+    }
+    if name_contains("env-var") || name_contains("envvar") || name_contains("env_var") {
+        return ValueHint::EnvVar;
+    }
+    if name_has_word("interface") || name_has_word("iface") {
+        return ValueHint::NetworkInterface;
+    }
+    if name_has_word("branch") {
+        return ValueHint::GitBranch;
+    }
+    if name_has_word("revision") || name_has_word("commit") {
+        return ValueHint::GitRevision;
+    }
+    if name_has_word("service")
+        || (name_has_word("unit")
+            && !desc_contains("time")
+            && !desc_contains("size")
+            && !desc_contains("bytes")
+            && !desc_contains("speed")
+            && !desc_contains("duration")
+            && !desc_contains("interval")
+            && !desc_contains("format")
+            && !desc_contains("measure"))
+    {
+        return ValueHint::SystemdUnit;
+    }
+    // Dict, Log, Archive, and File are FilePaths
+    if name_has_word("file")
+        || name_lower
+            .as_ref()
+            .map_or(false, |n| n.ends_with("file") && n != "profile")
+        || name_contains("filename")
+        || name_contains("filepath")
+        || name_has_word("dict")
+        || name_contains("dictionary")
+        || name_has_word("log")
+        || name_contains("logfile")
+        || name_has_word("archive")
+    {
+        // Exclude "level" to avoid "log-level" or "log_level" matching file
+        if !name_contains("level") {
+            return ValueHint::FilePath;
+        }
+    }
+    if name_has_word("path") || name_lower.as_ref().map_or(false, |n| n.ends_with("path")) {
+        if desc_contains("directory") || desc_contains("folder") {
+            return ValueHint::DirPath;
+        }
+        if desc_contains("file") && !desc_contains("files") {
+            return ValueHint::FilePath;
+        }
+        return ValueHint::AnyPath;
+    }
+    if name_contains("unix:") || name_contains("socket") {
+        return ValueHint::AnyPath;
+    }
+
+    // 2. Check description (lower precision, needs more specific phrases)
+    if desc_contains("http://")
+        || desc_contains("https://")
+        || desc_has_word("url")
+        || desc_has_word("uri")
+        || desc_contains("endpoint")
+    {
+        return ValueHint::Url;
+    }
+    if desc_has_word("email") || desc_has_word("e-mail") {
+        return ValueHint::EmailAddress;
+    }
+    if desc_contains("hostname")
+        || desc_contains("host name")
+        || desc_contains("domain name")
+        || desc_contains("ip address")
+        || desc_contains("ipv4")
+        || desc_contains("ipv6")
+        || desc_contains("dns name")
+        || desc_contains("target host")
+        || desc_contains("remote host")
+        || desc_contains("server address")
+    {
+        return ValueHint::Hostname;
+    }
+    if desc_contains("username") || desc_contains("user name") || desc_contains("login name") {
+        return ValueHint::Username;
+    }
+    if (desc_contains("command line") || desc_contains("command-line"))
+        && !desc_contains("command line file")
+        && !desc_contains("command-line file")
+        && !desc_contains("command line directory")
+        && !desc_contains("command-line directory")
+        && !desc_contains("command line dir")
+        && !desc_contains("command-line dir")
+        && !desc_contains("command line arg")
+        && !desc_contains("command-line arg")
+        && !desc_contains("command line option")
+        && !desc_contains("command-line option")
+        && !desc_contains("command line flag")
+        && !desc_contains("command-line flag")
+        && !desc_contains("command line parameter")
+        && !desc_contains("command-line parameter")
+        && !desc_contains("command line param")
+        && !desc_contains("command-line param")
+    {
+        return ValueHint::CommandString;
+    }
+    if desc_contains("command name") || desc_contains("cmd name") {
+        return ValueHint::CommandName;
+    }
+    if desc_contains("path to executable")
+        || desc_contains("path to binary")
+        || desc_contains("path to command")
+        || desc_contains("executable file")
+        || desc_contains("binary file")
+    {
+        return ValueHint::ExecutablePath;
+    }
+    if desc_contains("environment variable")
+        || desc_contains("env variable")
+        || desc_contains("env-var")
+        || (desc_contains("variable") && desc_contains("environment"))
+    {
+        let is_non_env_var_name = if let Some(ref name) = name_lower {
+            name == "string"
+                || name == "suffix"
+                || name == "prefix"
+                || name == "pattern"
+                || name == "glob"
+                || name == "command"
+                || name == "cmd"
+                || name == "file"
+                || name == "dir"
+                || name == "directory"
+                || name == "path"
+                || name == "format"
+                || name == "date"
+                || name == "time"
+        } else {
+            false
+        };
+        if !is_non_env_var_name {
+            return ValueHint::EnvVar;
+        }
+    }
+    if desc_contains("network interface") {
+        return ValueHint::NetworkInterface;
+    }
+    if desc_contains("git branch") {
+        return ValueHint::GitBranch;
+    }
+    if desc_contains("git revision") || desc_contains("git commit") {
+        return ValueHint::GitRevision;
+    }
+    if desc_contains("systemd service") || desc_contains("systemd unit") {
+        return ValueHint::SystemdUnit;
+    }
+    if desc_contains("port number")
+        || desc_contains("process id")
+        || desc_contains("user id")
+        || desc_contains("group id")
+        || desc_contains("number of")
+        || desc_has_word("port")
+        || desc_has_word("int")
+        || desc_has_word("integer")
+        || desc_has_word("count")
+    {
+        return ValueHint::Integral;
+    }
+
+    let is_known_non_path_value = if let Some(ref name) = name_lower {
+        name == "when"
+            || name == "mode"
+            || name == "type"
+            || name == "format"
+            || name == "how"
+            || name == "value"
+            || name == "val"
+            || name == "values"
+            || name == "key"
+            || name == "lang"
+            || name == "language"
+            || name == "locale"
+            || name == "encoding"
+            || name == "charset"
+            || name == "bool"
+            || name == "boolean"
+            || name == "level"
+            || name == "width"
+            || name == "height"
+            || name == "size"
+            || name == "count"
+            || name == "num"
+            || name == "number"
+            || name == "color"
+            || name == "colour"
+            || name == "speed"
+            || name == "rate"
+            || name == "delay"
+            || name == "timeout"
+            || name == "pattern"
+            || name == "patterns"
+            || name == "glob"
+            || name == "action"
+            || name == "actions"
+            || name == "sep"
+            || name == "separator"
+            || name == "date"
+            || name == "time"
+            || name == "datetime"
+            || name == "timestamp"
+            || name == "expression"
+            || name == "expr"
+            || name == "string"
+            || name == "suffix"
+            || name == "prefix"
+            || name == "ext"
+            || name == "extension"
+            || name == "style"
+            || name == "keyword"
+            || name == "name"
+            || name == "regex"
+            || name == "regexp"
+            || name == "symbol"
+            || name == "token"
+    } else {
+        false
+    };
+
+    // Paths/Directories/Files in description
+    if !is_known_non_path_value {
+        if desc_contains("directory path")
+            || desc_contains("folder path")
+            || desc_contains("path to directory")
+            || desc_contains("path to folder")
+        {
+            return ValueHint::DirPath;
+        }
+        if desc_contains("file path")
+            || desc_contains("path to file")
+            || desc_contains("filename")
+            || desc_contains("file name")
+            || desc_contains("dictionary file")
+            || desc_contains("log file")
+        {
+            return ValueHint::FilePath;
+        }
+        if desc_contains("path to the chosen file") || desc_contains("write traces to") {
+            return ValueHint::FilePath;
+        }
+        if desc_contains("path to") {
+            return ValueHint::AnyPath;
+        }
+    }
+
+    // Specific heuristics:
+    // If the name is "output" or "input" or "filelist" or "list" or "destination" or "source", and description mentions "file"
+    if let Some(ref name) = name_lower {
+        if name == "output"
+            || name == "input"
+            || name == "filelist"
+            || name == "list"
+            || name == "destination"
+            || name == "source"
+            || name == "rfile"
+            || name == "debug-file"
+        {
+            if desc_contains("directory") || desc_contains("folder") || desc_has_word("dir") {
+                return ValueHint::DirPath;
+            }
+            if desc_has_word("file")
+                || desc_has_word("path")
+                || desc_has_word("write")
+                || desc_has_word("read")
+            {
+                return ValueHint::FilePath;
+            }
+        }
+        if name == "dir" || name == "directory" || name == "folder" || name == "path" {
+            return ValueHint::DirPath;
+        }
+    }
+
+    ValueHint::Unknown
+}
+
+fn parse_bulleted_list_values(desc: &str) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+
+    // Pattern 1: Bullet + value + separator (like ':' or ' - ' or 2+ spaces)
+    static RE_BULLET_SEP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re_bullet_sep = RE_BULLET_SEP.get_or_init(|| {
+        regex::Regex::new(r"(?:^|\s)[-*+o•]\s+([a-zA-Z0-9_-]+)(?:\s*:\s+|\s+-\s+|[ \t]{2,})")
+            .unwrap()
+    });
+    for caps in re_bullet_sep.captures_iter(desc) {
+        let val = caps.get(1).unwrap().as_str().to_string();
+        if !values.contains(&val) {
+            values.push(val);
+        }
+    }
+
+    if !values.is_empty() {
+        return Some(values);
+    }
+
+    // Pattern 2: Pure bullet + word lines anywhere in the description
+    static RE_BULLET_PURE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re_bullet_pure = RE_BULLET_PURE
+        .get_or_init(|| regex::Regex::new(r"^\s*[-*+o•]\s+([a-zA-Z0-9_-]+)\s*$").unwrap());
+    let mut pure_vals = Vec::new();
+    for line in desc.lines() {
+        if let Some(caps) = re_bullet_pure.captures(line) {
+            let val = caps.get(1).unwrap().as_str().to_string();
+            if !pure_vals.contains(&val) {
+                pure_vals.push(val);
+            }
+        }
+    }
+
+    if pure_vals.len() >= 2 {
+        return Some(pure_vals);
+    }
+
+    None
+}
+
+fn has_path_slash(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i] == '/' {
+            let preceded_by_space = i == 0 || chars[i - 1].is_whitespace();
+            let followed_by_non_space = i + 1 < chars.len() && !chars[i + 1].is_whitespace();
+            if preceded_by_space && followed_by_non_space {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn is_placeholder_value_name(name: &str) -> bool {
+    let clean = name.to_ascii_lowercase();
+    let clean = clean.trim_matches(|c: char| {
+        c == '<' || c == '>' || c == '[' || c == ']' || c == '_' || c == '-'
+    });
+
+    if clean.is_empty() {
+        return true;
+    }
+
+    // Single letter value names (like 'n', 'x', 'y') are typically mathematical placeholders.
+    if clean.len() == 1 {
+        return true;
+    }
+
+    // Common generic value name placeholders
+    let generic_words = [
+        "file",
+        "files",
+        "path",
+        "paths",
+        "dir",
+        "dirs",
+        "directory",
+        "directories",
+        "folder",
+        "folders",
+        "name",
+        "names",
+        "num",
+        "nums",
+        "number",
+        "numbers",
+        "count",
+        "counts",
+        "size",
+        "sizes",
+        "val",
+        "vals",
+        "value",
+        "values",
+        "command",
+        "commands",
+        "cmd",
+        "cmds",
+        "program",
+        "programs",
+        "binary",
+        "binaries",
+        "user",
+        "users",
+        "group",
+        "groups",
+        "host",
+        "hosts",
+        "port",
+        "ports",
+        "addr",
+        "addrs",
+        "ip",
+        "ips",
+        "format",
+        "formats",
+        "type",
+        "types",
+        "mode",
+        "modes",
+        "style",
+        "styles",
+        "string",
+        "strings",
+        "text",
+        "str",
+        "strs",
+        "arg",
+        "args",
+        "param",
+        "params",
+        "parameter",
+        "parameters",
+        "option",
+        "options",
+        "opt",
+        "opts",
+        "key",
+        "keys",
+        "pattern",
+        "patterns",
+        "regexp",
+        "regex",
+        "regexes",
+        "suffix",
+        "suffixes",
+        "prefix",
+        "prefixes",
+        "char",
+        "chars",
+        "character",
+        "characters",
+        "line",
+        "lines",
+        "sec",
+        "second",
+        "seconds",
+        "min",
+        "minute",
+        "minutes",
+        "hour",
+        "hours",
+        "day",
+        "days",
+        "ms",
+        "millisecond",
+        "milliseconds",
+        "script",
+        "scriptfile",
+        "action",
+        "actions",
+        "id",
+        "ids",
+        "uuid",
+        "uuids",
+        "code",
+        "codes",
+        "when",
+        "flag",
+        "flags",
+        "opts",
+        "spec",
+        "specs",
+        "triple",
+        "triples",
+        "fmt",
+        "fs",
+        "class",
+        "classes",
+        "list",
+        "lists",
+        "prompt",
+        "prompts",
+        "role",
+        "roles",
+        "timeout",
+        "timeouts",
+        "features",
+        "is",
+        "lib",
+        "libs",
+        "destination",
+        "destinations",
+        "dest",
+        "tag",
+        "tags",
+        "limit",
+        "limits",
+        "acclist",
+        "rejlist",
+        "urlregex",
+        "regextype",
+        "identifier",
+        "flow",
+        "interval",
+        "interface",
+        "preload",
+        "mark",
+        "tos",
+        "ttl",
+        "timestamp",
+        "deadline",
+        "example",
+        "nostalgia",
+        "image",
+        "images",
+        "policy",
+        "policies",
+        "logfile",
+        "logfiles",
+        "backup",
+        "backups",
+        "amount",
+        "amounts",
+        "quota",
+        "quotas",
+        "password",
+        "passwords",
+        "encoding",
+        "encodings",
+        "protocol",
+        "protocols",
+        "depth",
+        "depths",
+        "buf",
+        "bufs",
+        "buffer",
+        "buffers",
+        "sndbuf",
+        "rcvbuf",
+        "and",
+        "or",
+        "configfile",
+        "configfiles",
+        "pkcs11",
+        "color",
+        "colors",
+        "url",
+        "urls",
+        "debugopts",
+    ];
+
+    if generic_words.contains(&clean.as_ref()) {
+        return true;
+    }
+
+    // Check suffixes
+    let suffixes = [
+        "file",
+        "dir",
+        "path",
+        "name",
+        "list",
+        "address",
+        "addr",
+        "interface",
+        "option",
+        "value",
+        "type",
+        "mode",
+        "limit",
+        "timeout",
+        "size",
+        "count",
+        "spec",
+        "text",
+        "char",
+        "cmd",
+        "line",
+        "string",
+        "opt",
+        "opts",
+    ];
+
+    for suffix in suffixes {
+        if clean.ends_with(suffix) && clean.len() > suffix.len() {
+            let prev_char = clean.chars().nth(clean.len() - suffix.len() - 1).unwrap();
+            if prev_char == '-' || prev_char == '_' {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub fn parse_possible_values(
+    value_name: Option<&str>,
+    description: Option<&str>,
+) -> Option<Vec<String>> {
+    static RANGE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static DWARF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RE_PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BOUNDARY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static TOKEN_SEP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RE_DEFAULT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RE_DEFAULT_SEP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RE_DEFAULT_LABEL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+    // 1. Try to parse from value_name (e.g. {info,debug} or info|debug or {physical|logical} or 0..5)
+    if let Some(vt) = value_name {
+        let clean_type = vt.trim_matches(|c| c == '[' || c == ']' || c == '<' || c == '>');
+
+        // Try range syntax like 0..5 or 1-5
+        let range_re =
+            RANGE_RE.get_or_init(|| regex::Regex::new(r"^(\d+)(?:\.\.|-)(\d+)$").unwrap());
+        if let Some(caps) = range_re.captures(clean_type) {
+            let start: usize = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
+            let end: usize = caps.get(2).unwrap().as_str().parse().unwrap_or(0);
+            if start < end && end - start <= 20 {
+                let range_values: Vec<String> = (start..=end).map(|val| val.to_string()).collect();
+                return Some(range_values);
+            }
+        }
+
+        if clean_type.starts_with('{') && clean_type.ends_with('}') {
+            let inner = &clean_type[1..clean_type.len() - 1];
+            let parts: Vec<String> = inner
+                .split(|c| c == ',' || c == '|')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parts.is_empty() {
+                return Some(parts);
+            }
+        } else if clean_type.contains('|') {
+            let parts: Vec<String> = clean_type
+                .split('|')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() > 1
+                && parts.iter().all(|s| {
+                    s.chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                })
+            {
+                return Some(parts);
+            }
+        }
+    }
+
+    // 2. Try to parse from description
+    if let Some(desc) = description {
+        // Try to parse DWARF selector format like a/=abbrev, A/=addr, etc. from description
+        let dwarf_re = DWARF_RE.get_or_init(|| {
+            regex::Regex::new(r"([a-zA-Z0-9_-]+)\s*/=\s*([a-zA-Z0-9_-]+)").unwrap()
+        });
+        let mut dwarf_vals = Vec::new();
+        for caps in dwarf_re.captures_iter(desc) {
+            let val = caps.get(2).unwrap().as_str().to_string();
+            if !dwarf_vals.contains(&val) {
+                dwarf_vals.push(val);
+            }
+        }
+        if !dwarf_vals.is_empty() {
+            return Some(dwarf_vals);
+        }
+
+        if let Some(list_vals) = parse_bulleted_list_values(desc) {
+            return Some(list_vals);
+        }
+
+        // Try to parse parenthesized shortcut choices like (s)witch, (i)gnore, (w)ipe
+        static RE_PAREN_SHORTCUTS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re_paren_shortcuts = RE_PAREN_SHORTCUTS
+            .get_or_init(|| regex::Regex::new(r"\(([a-zA-Z0-9])\)[a-zA-Z0-9_-]+").unwrap());
+        let mut shortcut_vals = Vec::new();
+        for caps in re_paren_shortcuts.captures_iter(desc) {
+            let val = caps.get(1).unwrap().as_str().to_string();
+            if !shortcut_vals.contains(&val) {
+                shortcut_vals.push(val);
+            }
+        }
+        if shortcut_vals.len() >= 2 {
+            return Some(shortcut_vals);
+        }
+
+        // Try to parse brace-enclosed choices like {all,none,older(default)}
+        static RE_BRACES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re_braces = RE_BRACES.get_or_init(|| {
+            regex::Regex::new(r"\{([a-zA-Z0-9_\-]+(?:\([a-zA-Z0-9_\-]+\))?(?:\s*,\s*[a-zA-Z0-9_\-]+(?:\([a-zA-Z0-9_\-]+\))?)+)\}").unwrap()
+        });
+        if let Some(caps) = re_braces.captures(desc) {
+            let inner = caps.get(1).unwrap().as_str();
+            let mut values = Vec::new();
+            for part in inner.split(',') {
+                let mut clean = part.trim();
+                if let Some(idx) = clean.find('(') {
+                    clean = &clean[..idx];
+                }
+                let clean = clean.trim();
+                if !clean.is_empty()
+                    && clean
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                {
+                    if !(clean.starts_with('-') && clean.chars().any(|c| c.is_alphabetic())) {
+                        values.push(clean.to_string());
+                    }
+                }
+            }
+            if values.len() >= 2 {
+                return Some(values);
+            }
+        }
+        // regex to find the prefix
+        let re_prefix = RE_PREFIX.get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)\b(?:possible\s+values|choices|allowed\s+values|valid\s+values|one\s+of|accepts|can\s+be|selected\s+from)\s*(?:for\s+(?:[a-zA-Z0-9_-]+\s+){1,2})?(?:=|:|\bare\b|\bis\b)?\s*|\bmust\s+be\s+(?:either\s+|one\s+of\s+)?(?:=|:)?\s*"
+            ).unwrap()
+        });
+
+        if let Some(mat) = re_prefix.find(desc) {
+            let mut remaining = &desc[mat.end()..];
+
+            // If it starts with a bracket or brace, extract the inner content
+            if remaining.starts_with('[') {
+                if let Some(end_idx) = remaining.find(']') {
+                    remaining = &remaining[1..end_idx];
+                }
+            } else if remaining.starts_with('{') {
+                if let Some(end_idx) = remaining.find('}') {
+                    remaining = &remaining[1..end_idx];
+                }
+            } else {
+                // Otherwise, take up to the next clause boundary: a period (if followed by space/end), a semicolon,
+                // or a bracket, or maybe parenthesis.
+                let boundary_re = BOUNDARY_RE
+                    .get_or_init(|| regex::Regex::new(r"(?:\.(?:\s|$)|\;|\]|\))").unwrap());
+                if let Some(mat_boundary) = boundary_re.find(remaining) {
+                    remaining = &remaining[..mat_boundary.start()];
+                }
+            }
+
+            let mut remaining_str = remaining.trim();
+            if let Some(stripped) = remaining_str.strip_prefix("either ") {
+                remaining_str = stripped.trim();
+            }
+            if let Some(stripped) = remaining_str.strip_prefix("the following:") {
+                remaining_str = stripped.trim();
+            }
+
+            // Split the remaining string into tokens.
+            let has_path = has_path_slash(remaining_str);
+            let raw_tokens: Vec<&str> = if has_path {
+                static TOKEN_SEP_NO_SLASH: std::sync::OnceLock<regex::Regex> =
+                    std::sync::OnceLock::new();
+                let sep = TOKEN_SEP_NO_SLASH.get_or_init(|| {
+                    regex::Regex::new(r"\s*(?:,\s*(?:or|and)?|\s+(?:or|and)\s+|\|)\s*").unwrap()
+                });
+                sep.split(remaining_str).collect()
+            } else {
+                let token_sep = TOKEN_SEP.get_or_init(|| {
+                    regex::Regex::new(r"\s*(?:,\s*(?:or|and)?|\s+(?:or|and)\s+|\||/)\s*").unwrap()
+                });
+                token_sep.split(remaining_str).collect()
+            };
+
+            let mut values = Vec::new();
+            for token in raw_tokens {
+                let clean = token
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"' || c == '`');
+                let clean = clean.trim();
+                if !clean.is_empty()
+                    && clean
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                {
+                    if !(clean.starts_with('-') && clean.chars().any(|c| c.is_alphabetic())) {
+                        values.push(clean.to_string());
+                    }
+                }
+            }
+
+            if !values.is_empty() {
+                return Some(values);
+            }
+        }
+    }
+
+    // 3. Heuristic: if we find a list and a mention of "default: x" where x is in that list.
+    if let Some(desc) = description {
+        let re_default = RE_DEFAULT.get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)[(\[]?\bdefault\s*(?::|is)\s*['"`]?([a-zA-Z0-9\-_]+)['"`]?[)\]]?"#,
+            )
+            .unwrap()
+        });
+
+        for caps in re_default.captures_iter(desc) {
+            let default_val = caps.get(1).unwrap().as_str();
+
+            let segments: Vec<&str> = desc
+                .split(|c| c == '.' || c == ';' || c == '(' || c == ')' || c == '[' || c == ']')
+                .collect();
+
+            // Also split by "default" itself if it's not already a separator
+            let mut all_clauses = Vec::new();
+            for s in segments {
+                let re_default_sep = RE_DEFAULT_SEP
+                    .get_or_init(|| regex::Regex::new(r"(?i)\bdefault\s*(?::|is)\b").unwrap());
+                for part in re_default_sep.split(s) {
+                    all_clauses.push(part);
+                }
+            }
+
+            for mut clause in all_clauses {
+                clause = clause.trim();
+                if clause.is_empty() {
+                    continue;
+                }
+
+                // Strip common prefixes followed by a colon (e.g. "mode: ")
+                if let Some(pos) = clause.find(':') {
+                    let prefix = &clause[..pos];
+                    if prefix.split_whitespace().count() <= 3 {
+                        clause = clause[pos + 1..].trim();
+                    }
+                }
+
+                // Remove "default:" label to avoid interfering with list parsing.
+                let re_default_label = RE_DEFAULT_LABEL
+                    .get_or_init(|| regex::Regex::new(r"(?i)\bdefault\s*(?::|is)\s*").unwrap());
+                let clause_cleaned = re_default_label.replace_all(clause, " ");
+                clause = clause_cleaned.trim();
+                if clause.is_empty() {
+                    continue;
+                }
+
+                let has_path = has_path_slash(clause);
+                let raw_tokens: Vec<&str> = if has_path {
+                    static TOKEN_SEP_NO_SLASH: std::sync::OnceLock<regex::Regex> =
+                        std::sync::OnceLock::new();
+                    let sep = TOKEN_SEP_NO_SLASH.get_or_init(|| {
+                        regex::Regex::new(r"\s*(?:,\s*(?:or|and)?|\s+(?:or|and)\s+|\|)\s*").unwrap()
+                    });
+                    sep.split(clause).collect()
+                } else {
+                    let token_sep = TOKEN_SEP.get_or_init(|| {
+                        regex::Regex::new(r"\s*(?:,\s*(?:or|and)?|\s+(?:or|and)\s+|\||/)\s*")
+                            .unwrap()
+                    });
+                    token_sep.split(clause).collect()
+                };
+
+                if raw_tokens.len() >= 2 {
+                    let mut values = Vec::new();
+                    for (idx, token) in raw_tokens.iter().enumerate() {
+                        let mut clean = token
+                            .trim()
+                            .trim_matches(|c| c == '\'' || c == '"' || c == '`' || c == ',')
+                            .trim();
+
+                        if idx == 0 {
+                            if let Some(last) = clean.split_whitespace().last() {
+                                clean = last;
+                            }
+                        } else if idx == raw_tokens.len() - 1 {
+                            if let Some(first) = clean.split_whitespace().next() {
+                                clean = first;
+                            }
+                        }
+
+                        if !clean.is_empty()
+                            && clean
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                        {
+                            if idx > 0 && idx < raw_tokens.len() - 1 {
+                                if token.trim().contains(char::is_whitespace) {
+                                    values.clear();
+                                    break;
+                                }
+                            }
+                            values.push(clean.to_string());
+                        } else {
+                            values.clear();
+                            break;
+                        }
+                    }
+
+                    if values.len() >= 2 && values.iter().any(|v| v == default_val) {
+                        return Some(values);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: Check if value_name is a literal lowercase value (like links, follow-links, lz4)
+    if let Some(vt) = value_name {
+        if !vt.starts_with('<') && !vt.starts_with('[') && !vt.ends_with('>') && !vt.ends_with(']')
+        {
+            let clean_type = vt.trim_matches(|c| c == '[' || c == ']' || c == '<' || c == '>');
+            if !clean_type.is_empty()
+                && clean_type
+                    .chars()
+                    .all(|c| c.is_lowercase() || c.is_numeric() || c == '-' || c == '_')
+                && !is_placeholder_value_name(clean_type)
+            {
+                return Some(vec![clean_type.to_string()]);
+            }
+        }
+    }
+
+    None
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Clap command conversion
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Convert a parsed [`Command`] tree into a [`clap::Command`] that can be used
+/// to generate shell completion scripts via [`clap_complete`].
+///
+/// Argument names are derived from the long flag (stripping the leading `--`),
+/// falling back to the short flag (stripping `-`), and finally `"arg"` for
+/// purely positional arguments. Short and long flags are attached when present.
+/// `value_type` is used as the `value_name` meta-variable and also implies
+/// `num_args(1)` unless `num_args` overrides it explicitly.
+///
+/// This uses clap's `string` feature to dynamically allocate and assign owned
+/// strings to avoid any memory leakages.
+pub fn to_clap_command(cmd: &Command) -> clap::Command {
+    let name = cmd.name.clone().unwrap_or_else(|| "unknown".to_string());
+    let mut clap_cmd = clap::Command::new(name)
+        // The parsed args already include `--help`/`--version` when present, so
+        // disable clap's auto-generated help/version surfaces to avoid
+        // duplicate-name panics when the parsed help already includes them.
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .disable_version_flag(true);
+
+    for alias in &cmd.aliases {
+        clap_cmd = clap_cmd.visible_alias(alias.clone());
+    }
+
+    if let Some(desc) = &cmd.description {
+        clap_cmd = clap_cmd.about(desc.clone());
+    }
+
+    let mut used_short_flags = std::collections::HashSet::new();
+    let mut used_long_flags = std::collections::HashSet::new();
+    let mut used_arg_ids = std::collections::HashSet::new();
+
+    for arg in &cmd.args {
+        // Strip leading dashes from the long flag once; reuse for both the
+        // argument identifier and the `.long()` call.
+        let long_bare: Option<String> = arg
+            .long
+            .as_deref()
+            .map(|l| l.trim_start_matches('-').to_string());
+
+        if let Some(long) = &long_bare {
+            if !used_long_flags.insert(long.clone()) {
+                log::debug!("flycomp: dropping duplicate long flag '--{}'", long);
+                continue;
+            }
+        }
+
+        // Derive a stable identifier for the argument, then make it unique for
+        // clap even when the parsed help contains repeated or unnamed args.
+        let base_id = long_bare
+            .clone()
+            .or_else(|| {
+                arg.short
+                    .as_deref()
+                    .map(|s| s.trim_start_matches('-').to_string())
+            })
+            .unwrap_or_else(|| "arg".to_string());
+
+        let mut id = base_id.clone();
+        let mut suffix = 2;
+        while !used_arg_ids.insert(id.clone()) {
+            id = format!("{}-{}", base_id, suffix);
+            suffix += 1;
+        }
+
+        let mut clap_arg = clap::Arg::new(id.clone());
+
+        if !arg.takes_value() {
+            clap_arg = clap_arg.action(clap::ArgAction::SetTrue);
+        }
+
+        if let Some(long) = &long_bare {
+            clap_arg = clap_arg.long(long.clone());
+        }
+
+        if let Some(short) = &arg.short {
+            if let Some(c) = short.trim_start_matches('-').chars().next() {
+                if used_short_flags.insert(c) {
+                    clap_arg = clap_arg.short(c);
+                } else {
+                    log::debug!(
+                        "flycomp: dropping duplicate short flag '-{}' for arg {:?}",
+                        c,
+                        id
+                    );
+                }
+            }
+        }
+
+        if let Some(desc) = &arg.description {
+            clap_arg = clap_arg.help(desc.clone());
+        }
+
+        if let Some(value_name) = &arg.value_name {
+            // Strip surrounding angle-brackets if present (e.g. `<PATH>` → `PATH`).
+            let meta = value_name
+                .trim_matches(|c| c == '<' || c == '>')
+                .to_string();
+            clap_arg = clap_arg.value_name(meta);
+            // A value name implies the flag accepts exactly one value by default;
+            // this may be overridden below by an explicit `num_args`.
+            clap_arg = clap_arg.num_args(1);
+        }
+
+        if let Some(num_args_str) = &arg.num_args {
+            clap_arg = match num_args_str.as_str() {
+                "*" => clap_arg.num_args(0..),
+                "+" => clap_arg.num_args(1..),
+                "?" => clap_arg.num_args(0..=1),
+                s => {
+                    if let Ok(n) = s.parse::<usize>() {
+                        clap_arg.num_args(n)
+                    } else {
+                        clap_arg
+                    }
+                }
+            };
+        }
+
+        if let Some(value_enum) = &arg.value_enum {
+            clap_arg =
+                clap_arg.value_parser(clap::builder::PossibleValuesParser::new(value_enum.clone()));
+        }
+
+        if arg.value_hint != ValueHint::Unknown && arg.value_enum.is_none() {
+            let clap_hint = match arg.value_hint {
+                ValueHint::Unknown => clap::ValueHint::Unknown,
+                ValueHint::Other => clap::ValueHint::Other,
+                ValueHint::AnyPath => clap::ValueHint::AnyPath,
+                ValueHint::FilePath => clap::ValueHint::FilePath,
+                ValueHint::DirPath => clap::ValueHint::DirPath,
+                ValueHint::ExecutablePath => clap::ValueHint::ExecutablePath,
+                ValueHint::CommandName => clap::ValueHint::CommandName,
+                ValueHint::CommandString => clap::ValueHint::CommandString,
+                ValueHint::CommandWithArguments => clap::ValueHint::CommandWithArguments,
+                ValueHint::Username => clap::ValueHint::Username,
+                ValueHint::Hostname => clap::ValueHint::Hostname,
+                ValueHint::Url => clap::ValueHint::Url,
+                ValueHint::EmailAddress => clap::ValueHint::EmailAddress,
+                ValueHint::EnvVar
+                | ValueHint::NetworkInterface
+                | ValueHint::GitBranch
+                | ValueHint::GitRevision
+                | ValueHint::SystemdUnit
+                | ValueHint::Integral => clap::ValueHint::Other,
+            };
+            clap_arg = clap_arg.value_hint(clap_hint);
+        }
+
+        clap_cmd = clap_cmd.arg(clap_arg);
+    }
+
+    for sub in &cmd.subcommands {
+        clap_cmd = clap_cmd.subcommand(to_clap_command(sub));
+    }
+
+    clap_cmd
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Synthesis: run a command and build its completion spec
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Invoke `help_runner` to obtain help text, parse it, and flesh out each
+/// discovered subcommand by calling `help_runner` again with the subcommand
+/// path.  Subcommands are explored iteratively using a work-stack so that
+/// nested subcommands (sub-sub-commands, etc.) are also populated, up to a
+/// maximum nesting depth of [`MAX_SUBCOMMAND_DEPTH`].
+///
+/// The `name` field of the returned [`Command`] is always set to the basename
+/// of `command_path` so that the generated completion script uses the correct
+/// name regardless of what the help text says.
+///
+/// `help_runner` is called with the subcommand path (e.g. `&["remote", "add"]`)
+/// and must return the corresponding `--help` output.  For the top-level
+/// command the slice is empty (`&[]`).
+pub fn synthesize_completion<F>(
+    command_path: &str,
+    help_runner: F,
+    strategy: SynthesisStrategy,
+    recurse_limit: usize,
+) -> anyhow::Result<Command>
+where
+    F: Fn(&[&str]) -> anyhow::Result<String> + Sync + Send,
+{
+    Ok(synthesize_completion_with(command_path, &help_runner, strategy, recurse_limit)?.command)
+}
+
+fn merge_commands(help_cmd: Command, man_cmd: Command) -> Command {
+    let mut merged = help_cmd.clone();
+
+    if merged.description.is_none() {
+        merged.description = man_cmd.description.clone();
+    }
+    if merged.author.is_none() {
+        merged.author = man_cmd.author.clone();
+    }
+    for alias in man_cmd.aliases {
+        if !merged.aliases.contains(&alias) {
+            merged.aliases.push(alias);
+        }
+    }
+
+    let mut matched_man_indices = std::collections::HashSet::new();
+
+    for arg in &mut merged.args {
+        if let Some((idx, man_arg)) = man_cmd.args.iter().enumerate().find(|&(_, a)| {
+            (a.long.is_some() && a.long == arg.long) || (a.short.is_some() && a.short == arg.short)
+        }) {
+            matched_man_indices.insert(idx);
+            if arg.description.is_none()
+                || arg.description.as_deref().unwrap_or("").trim().is_empty()
+            {
+                arg.description = man_arg.description.clone();
+            }
+            if arg.value_name.is_none() {
+                arg.value_name = man_arg.value_name.clone();
+            }
+            if arg.num_args.is_none() {
+                arg.num_args = man_arg.num_args.clone();
+            }
+            if arg.value_enum.is_none() {
+                arg.value_enum = man_arg.value_enum.clone();
+            }
+            if arg.value_hint == ValueHint::Unknown {
+                arg.value_hint = man_arg.value_hint;
+            }
+        }
+    }
+
+    for (idx, man_arg) in man_cmd.args.iter().enumerate() {
+        if !matched_man_indices.contains(&idx) {
+            merged.args.push(man_arg.clone());
+        }
+    }
+
+    let mut matched_man_subs = std::collections::HashSet::new();
+
+    for sub in &mut merged.subcommands {
+        if let Some((idx, man_sub)) = man_cmd
+            .subcommands
+            .iter()
+            .enumerate()
+            .find(|&(_, s)| s.name.is_some() && s.name == sub.name)
+        {
+            matched_man_subs.insert(idx);
+            *sub = merge_commands(sub.clone(), man_sub.clone());
+        }
+    }
+
+    for (idx, man_sub) in man_cmd.subcommands.iter().enumerate() {
+        if !matched_man_subs.contains(&idx) {
+            merged.subcommands.push(man_sub.clone());
+        }
+    }
+
+    merged
+}
+
+fn synthesize_completion_with<F>(
+    command_path: &str,
+    help_runner: &F,
+    strategy: SynthesisStrategy,
+    recurse_limit: usize,
+) -> anyhow::Result<SynthesisOutcome>
+where
+    F: Fn(&[&str]) -> anyhow::Result<String> + Sync + Send,
+{
+    match strategy {
+        SynthesisStrategy::RunHelp => Ok(SynthesisOutcome {
+            command: synthesize_from_help(command_path, help_runner, recurse_limit)?,
+            strategy_used: SynthesisMethod::RunHelp,
+        }),
+        SynthesisStrategy::ManPage => Ok(SynthesisOutcome {
+            command: load_manpage_command(command_path, recurse_limit)?,
+            strategy_used: SynthesisMethod::ManPage,
+        }),
+        SynthesisStrategy::ManPageThenRunHelp => {
+            match load_manpage_command(command_path, recurse_limit) {
+                Ok(man_command) => {
+                    match synthesize_from_help(command_path, help_runner, recurse_limit) {
+                        Ok(help_command) => Ok(SynthesisOutcome {
+                            command: merge_commands(help_command, man_command),
+                            strategy_used: SynthesisMethod::ManPage,
+                        }),
+                        Err(_) => Ok(SynthesisOutcome {
+                            command: man_command,
+                            strategy_used: SynthesisMethod::ManPage,
+                        }),
+                    }
+                }
+                Err(error) => {
+                    log::debug!(
+                        "flycomp: falling back to --help for '{}': {}",
+                        command_path,
+                        error
+                    );
+                    Ok(SynthesisOutcome {
+                        command: synthesize_from_help(command_path, help_runner, recurse_limit)?,
+                        strategy_used: SynthesisMethod::RunHelp,
+                    })
+                }
+            }
+        }
+        SynthesisStrategy::ManPageOrRunHelp => {
+            match load_manpage_command(command_path, recurse_limit) {
+                Ok(man_command)
+                    if !man_command.args.is_empty() || !man_command.subcommands.is_empty() =>
+                {
+                    Ok(SynthesisOutcome {
+                        command: man_command,
+                        strategy_used: SynthesisMethod::ManPage,
+                    })
+                }
+                res => {
+                    if let Err(ref e) = res {
+                        log::debug!(
+                            "flycomp: man page failed for '{}': {}. Falling back to --help",
+                            command_path,
+                            e
+                        );
+                    } else {
+                        log::debug!(
+                            "flycomp: man page for '{}' returned empty command. Falling back to --help",
+                            command_path
+                        );
+                    }
+                    Ok(SynthesisOutcome {
+                        command: synthesize_from_help(command_path, help_runner, recurse_limit)?,
+                        strategy_used: SynthesisMethod::RunHelp,
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn render_json_output(
+    command_path: &str,
+    requested_strategy: SynthesisStrategy,
+    strategy_used: SynthesisMethod,
+    sandboxed: bool,
+    timeout_ms: u64,
+    command: Command,
+) -> anyhow::Result<String> {
+    let payload = JsonCompletionOutput {
+        metadata: JsonMetadata {
+            flycomp_version: env!("CARGO_PKG_VERSION"),
+            git_hash: env!("GIT_HASH"),
+            build_time: env!("BUILD_TIME"),
+            generated_at: rfc3339_now(),
+            output_format: "json",
+            requested_strategy: requested_strategy.into(),
+            strategy_used: strategy_used.into(),
+            sandboxed,
+            timeout_ms,
+            command_path: command_path.to_string(),
+            man_pages_read: get_man_pages_read(),
+            help_runs: get_help_runs(),
+        },
+        command,
+    };
+
+    serde_json::to_string_pretty(&payload).map_err(Into::into)
+}
+
+fn command_basename(command_path: &str) -> String {
+    std::path::Path::new(command_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command_path)
+        .to_string()
+}
+
+fn load_manpage_command(command_path: &str, recurse_limit: usize) -> anyhow::Result<Command> {
+    let cmd_name = command_basename(command_path).replace(' ', "-");
+    log::info!("flycomp: loading man page for '{}'", cmd_name);
+    let manpage_path = locate_manpage(&cmd_name)?;
+    let manpage_content = read_manpage_source(&manpage_path)?;
+
+    let loader = |name: &str| -> Option<String> {
+        log::info!("flycomp: loading subcommand man page for '{}'", name);
+        let path = locate_manpage(name).ok()?;
+        read_manpage_source(&path).ok()
+    };
+
+    parse_man::parse_manpage_recursive(&cmd_name, &manpage_content, recurse_limit, &loader)
+        .ok_or_else(|| anyhow::anyhow!("failed to parse man page for '{}'", cmd_name))
+}
+
+fn get_man_paths() -> &'static Vec<std::path::PathBuf> {
+    static MAN_PATHS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+    MAN_PATHS.get_or_init(|| {
+        let mut paths = Vec::new();
+        if let Ok(output) = std::process::Command::new("manpath").output() {
+            if output.status.success() {
+                let s = String::from_utf8_lossy(&output.stdout);
+                for p in s.split(':') {
+                    let trimmed = p.trim();
+                    if !trimmed.is_empty() {
+                        paths.push(std::path::PathBuf::from(trimmed));
+                    }
+                }
+            }
+        }
+        if paths.is_empty() {
+            // Fallbacks
+            paths.push(std::path::PathBuf::from("/usr/share/man"));
+            paths.push(std::path::PathBuf::from("/usr/local/share/man"));
+        }
+        paths
+    })
+}
+
+fn locate_manpage(command_name: &str) -> anyhow::Result<String> {
+    log::info!("flycomp: locating man page for '{}'", command_name);
+    let man_paths = get_man_paths();
+    let sections = ["1", "8", "6"];
+    let extensions = [".gz", ".zst", ".xz", "", ".z", ".bz2"];
+
+    for base_path in man_paths {
+        for section in &sections {
+            let sub_dir = base_path.join(format!("man{}", section));
+            if sub_dir.exists() {
+                for ext in &extensions {
+                    let file_path = sub_dir.join(format!("{}.{}{}", command_name, section, ext));
+                    if file_path.exists() {
+                        let path_str = file_path.to_string_lossy().into_owned();
+                        log::info!("flycomp: found man page at '{}' (fast search)", path_str);
+                        return Ok(path_str);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to calling `man -w` if fast search failed
+    let output = std::process::Command::new("man")
+        .args(["-w", command_name])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to locate man page for '{}': {}", command_name, e))?;
+
+    if !output.status.success() {
+        anyhow::bail!("man page not found for '{}'", command_name);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("man page path missing for '{}'", command_name))?;
+
+    log::info!("flycomp: found man page at '{}' (fallback)", path);
+    Ok(path.to_string())
+}
+
+fn read_manpage_source(manpage_path: &str) -> anyhow::Result<String> {
+    increment_man_pages_read();
+    if manpage_path.ends_with(".gz") {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let file = std::fs::File::open(manpage_path)
+            .with_context(|| format!("failed to open man page '{}'", manpage_path))?;
+        let mut decoder = GzDecoder::new(file);
+        let mut content = String::new();
+        decoder
+            .read_to_string(&mut content)
+            .with_context(|| format!("failed to decompress gzip man page '{}'", manpage_path))?;
+        Ok(content)
+    } else if manpage_path.ends_with(".zst") {
+        let output = std::process::Command::new("zstd")
+            .args(["-cd", manpage_path])
+            .output()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read compressed man page '{}': {}",
+                    manpage_path,
+                    e
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!("failed to decompress man page '{}'", manpage_path);
+        }
+        String::from_utf8(output.stdout)
+            .with_context(|| format!("man page '{}' is not valid UTF-8", manpage_path))
+    } else if manpage_path.ends_with(".xz") {
+        let output = std::process::Command::new("xz")
+            .args(["-cd", manpage_path])
+            .output()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read compressed man page '{}': {}",
+                    manpage_path,
+                    e
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!("failed to decompress man page '{}'", manpage_path);
+        }
+        String::from_utf8(output.stdout)
+            .with_context(|| format!("man page '{}' is not valid UTF-8", manpage_path))
+    } else {
+        std::fs::read_to_string(manpage_path)
+            .with_context(|| format!("failed to read man page '{}'", manpage_path))
+    }
+}
+
+fn synthesize_from_help<F>(
+    command_path: &str,
+    help_runner: &F,
+    recurse_limit: usize,
+) -> anyhow::Result<Command>
+where
+    F: Fn(&[&str]) -> anyhow::Result<String> + Sync + Send,
+{
+    // ── top-level help ───────────────────────────────────────────────────────
+    let top_help = help_runner(&[])?;
+    let mut root = parse_help(&top_help);
+
+    // Always use the basename of the supplied path as the canonical name.
+    let cmd_name = command_basename(command_path).replace(' ', "-");
+    root.name = Some(cmd_name);
+
+    if recurse_limit == 0 {
+        return Ok(root);
+    }
+
+    // ── parallel subcommand exploration ─────────────────────────────────────
+    // Seed the queue with every top-level subcommand.
+    let initial_tasks: Vec<Vec<String>> = root
+        .subcommands
+        .iter()
+        .filter_map(|s| s.name.clone().map(|n| vec![n]))
+        .collect();
+
+    if initial_tasks.is_empty() {
+        return Ok(root);
+    }
+
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Condvar, Mutex};
+
+    struct WorkState {
+        queue: VecDeque<Vec<String>>,
+        pending_tasks: usize,
+        shutdown: bool,
+    }
+
+    struct TaskQueue {
+        state: Mutex<WorkState>,
+        condvar: Condvar,
+    }
+
+    let task_queue = TaskQueue {
+        state: Mutex::new(WorkState {
+            pending_tasks: initial_tasks.len(),
+            queue: VecDeque::from(initial_tasks),
+            shutdown: false,
+        }),
+        condvar: Condvar::new(),
+    };
+
+    let results = Mutex::new(HashMap::<Vec<String>, Command>::new());
+
+    // Determine the number of worker threads, capping at 12 by default unless FLYCOMP_THREADS is set.
+    let mut num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    if let Ok(val) = std::env::var("FLYCOMP_THREADS") {
+        if let Ok(parsed) = val.parse::<usize>() {
+            num_threads = parsed;
+        }
+    } else {
+        num_threads = num_threads.min(12);
+    }
+
+    let shared_help_runs = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        for _ in 0..num_threads {
+            s.spawn(|| {
+                loop {
+                    let mut state = task_queue.state.lock().unwrap();
+                    while state.queue.is_empty() && !state.shutdown && state.pending_tasks > 0 {
+                        state = task_queue.condvar.wait(state).unwrap();
+                    }
+
+                    if state.shutdown || (state.queue.is_empty() && state.pending_tasks == 0) {
+                        break;
+                    }
+
+                    let path = state.queue.pop_front().unwrap();
+                    drop(state);
+
+                    // Build the argv slice for the help invocation.
+                    let path_strs: Vec<&str> = path.iter().map(String::as_str).collect();
+                    let help_output_res = help_runner(&path_strs);
+
+                    let mut next_tasks = Vec::new();
+                    let mut parsed_cmd = None;
+
+                    match help_output_res {
+                        Ok(s) if !s.trim().is_empty() => {
+                            let parsed = parse_help(&s);
+                            // If we can recurse deeper, find next subcommands
+                            if path.len() < recurse_limit {
+                                for child in &parsed.subcommands {
+                                    if let Some(child_name) = &child.name {
+                                        let mut child_path = path.clone();
+                                        child_path.push(child_name.clone());
+                                        next_tasks.push(child_path);
+                                    }
+                                }
+                            }
+                            parsed_cmd = Some(parsed);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::debug!("flycomp: skipping '{}': {}", path_strs.join(" "), e);
+                        }
+                    }
+
+                    let mut state = task_queue.state.lock().unwrap();
+                    if let Some(parsed) = parsed_cmd {
+                        results.lock().unwrap().insert(path, parsed);
+                    }
+
+                    let new_len = next_tasks.len();
+                    state.queue.extend(next_tasks);
+                    state.pending_tasks += new_len;
+                    state.pending_tasks -= 1;
+
+                    if state.pending_tasks == 0 {
+                        task_queue.condvar.notify_all();
+                    } else if new_len > 0 {
+                        task_queue.condvar.notify_all();
+                    }
+                }
+                let worker_runs = get_help_runs();
+                shared_help_runs.fetch_add(worker_runs, std::sync::atomic::Ordering::Relaxed);
+                reset_stats();
+            });
+        }
+    });
+
+    let total_worker_runs = shared_help_runs.into_inner();
+    for _ in 0..total_worker_runs {
+        increment_help_runs();
+    }
+
+    let results = results.into_inner().unwrap();
+
+    // ── sequential tree reconstruction ─────────────────────────────────────
+    fn update_node(
+        node: &mut Command,
+        path: &mut Vec<String>,
+        results: &HashMap<Vec<String>, Command>,
+        recurse_limit: usize,
+    ) {
+        if path.len() > recurse_limit {
+            return;
+        }
+        if let Some(parsed) = results.get(path) {
+            node.args = parsed.args.clone();
+            node.subcommands = parsed.subcommands.clone();
+            if node.description.is_none() {
+                node.description = parsed.description.clone();
+            }
+        }
+        for child in &mut node.subcommands {
+            if let Some(name) = &child.name {
+                path.push(name.clone());
+                update_node(child, path, results, recurse_limit);
+                path.pop();
+            }
+        }
+    }
+
+    let mut path = Vec::new();
+    for child in &mut root.subcommands {
+        if let Some(name) = &child.name {
+            path.push(name.clone());
+            update_node(child, &mut path, &results, recurse_limit);
+            path.pop();
+        }
+    }
+
+    Ok(root)
+}
+
+/// Navigate the [`Command`] tree following `path` (a slice of subcommand
+/// names) and return a mutable reference to the deepest node, or `None` if
+/// any step along the path cannot be found.
+#[allow(dead_code)]
+fn find_subcommand_mut<'a>(root: &'a mut Command, path: &[String]) -> Option<&'a mut Command> {
+    let mut current = root;
+    for name in path {
+        current = current
+            .subcommands
+            .iter_mut()
+            .find(|s| s.name.as_deref() == Some(name.as_str()))?;
+    }
+    Some(current)
+}
+
+/// Invoke `command_path [extra_args...] --help` and return the combined output.
+///
+/// Many tools print their help to *stderr* rather than *stdout*; this function
+/// returns whichever stream is non-empty (preferring stdout).
+fn run_help_attempt(
+    command_path: &str,
+    extra_args: &[&str],
+    help_arg: &str,
+    sandbox: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<String> {
+    increment_help_runs();
+
+    let parts: Vec<&str> = command_path.split_whitespace().collect();
+    let (binary, subcommands) = parts
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty command string"))?;
+
+    let mut actual_command = binary.to_string();
+
+    // If binary is a simple name (no path separators), check CWD.
+    if !binary.contains(std::path::MAIN_SEPARATOR) {
+        let cwd_path = std::env::current_dir()?.join(binary);
+        if cwd_path.exists() {
+            use is_executable::IsExecutable;
+            if cwd_path.is_executable() {
+                actual_command = cwd_path.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    let use_sandbox = sandbox && is_sandboxing_available().is_some();
+    if sandbox && !use_sandbox {
+        log::warn!("bubblewrap (bwrap) not found in PATH; running completion check unsandboxed.");
+    }
+
+    let mut child = if use_sandbox {
+        let mut cmd = std::process::Command::new("bwrap");
+        cmd.args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--unshare-all",
+            "--",
+            &actual_command,
+        ]);
+        cmd
+    } else {
+        std::process::Command::new(&actual_command)
+    };
+
+    let mut all_args = subcommands.to_vec();
+    all_args.extend(extra_args.iter());
+
+    let cmd_args_str = if all_args.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", all_args.join(" "))
+    };
+    if use_sandbox {
+        log::info!(
+            "flycomp: running command (sandboxed): bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --unshare-all -- {} {}{}",
+            actual_command,
+            cmd_args_str,
+            help_arg
+        );
+    } else {
+        log::info!(
+            "flycomp: running command: {} {}{}",
+            actual_command,
+            cmd_args_str,
+            help_arg
+        );
+    }
+
+    let mut child = child
+        .args(&all_args)
+        .arg(help_arg)
+        .env("PAGER", "cat")
+        .env("MANPAGER", "cat")
+        .env("SYSTEMD_PAGER", "cat")
+        .env("GIT_PAGER", "cat")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("command '{}' not found in PATH or CWD", actual_command)
+            } else {
+                anyhow::anyhow!("failed to spawn '{}': {}", actual_command, e)
+            }
+        })?;
+
+    let mut stdout_handle = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture stdout"))?;
+    let mut stderr_handle = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture stderr"))?;
+
+    let stdout_thread = std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout_handle, &mut out);
+        out
+    });
+
+    let stderr_thread = std::thread::spawn(move || {
+        let mut err = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr_handle, &mut err);
+        err
+    });
+
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let start = std::time::Instant::now();
+    let mut exit_status = None;
+    let mut exited = false;
+    while start.elapsed() < timeout {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| anyhow::anyhow!("failed to wait: {}", e))?
+        {
+            exit_status = Some(status);
+            exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!("command '{}' timed out", command_path);
+    }
+
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout thread panicked"))?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr thread panicked"))?;
+
+    if use_sandbox {
+        if let Some(status) = exit_status {
+            if !status.success() {
+                if stderr.contains("bwrap:") || stderr.contains("bubblewrap:") {
+                    let code = status.code().unwrap_or(-1);
+                    eprintln!("bubblewrap error (exit code {}): {}", code, stderr);
+                    anyhow::bail!("bubblewrap exited with error code {}: {}", code, stderr);
+                }
+            }
+        }
+    }
+
+    if let Some(status) = exit_status {
+        if !status.success() {
+            let code = status.code().unwrap_or(-1);
+            anyhow::bail!(
+                "command '{}' failed with exit code {}.\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                actual_command,
+                code,
+                stdout,
+                stderr
+            );
+        }
+    }
+
+    // Some tools (e.g. git) write help to stdout when `--help` is passed as a
+    // flag, but others write to stderr.  Prefer stdout when it has content.
+    Ok(if stdout.trim().is_empty() {
+        stderr
+    } else {
+        stdout
+    })
+}
+
+pub fn run_help(
+    command_path: &str,
+    extra_args: &[&str],
+    sandbox: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<String> {
+    match run_help_attempt(command_path, extra_args, "--help", sandbox, timeout_ms) {
+        Ok(output) => Ok(output),
+        Err(e) => {
+            let err_msg = e.to_string();
+            if err_msg.contains("not found in PATH or CWD") {
+                return Err(e);
+            }
+            log::info!(
+                "flycomp: --help failed for '{}' ({}). Trying 'help' subcommand...",
+                command_path,
+                err_msg
+            );
+            run_help_attempt(command_path, extra_args, "help", sandbox, timeout_ms).map_err(
+                |second_err| {
+                    anyhow::anyhow!(
+                        "Both --help and help failed.\nFirst error: {}\nSecond error: {}",
+                        err_msg,
+                        second_err
+                    )
+                },
+            )
+        }
+    }
+}
+
+/// Run `command_path --help`, synthesize its completion model, and render a
+/// shell completion script.
+
+/// Run `command_path --help`, synthesize its completion model, and render a
+/// shell completion script.
+pub fn generate_completion_script(
+    command_path: &str,
+    shell: clap_complete::Shell,
+    strategy: SynthesisStrategy,
+    sandbox: bool,
+    timeout_ms: u64,
+    recurse_limit: usize,
+) -> anyhow::Result<String> {
+    let output_format = match shell {
+        clap_complete::Shell::Bash => OutputFormat::Bash,
+        clap_complete::Shell::Elvish => OutputFormat::Elvish,
+        clap_complete::Shell::Fish => OutputFormat::Fish,
+        clap_complete::Shell::PowerShell => OutputFormat::Powershell,
+        clap_complete::Shell::Zsh => OutputFormat::Zsh,
+        _ => OutputFormat::Bash,
+    };
+    generate_completion_output(
+        command_path,
+        output_format,
+        strategy,
+        sandbox,
+        timeout_ms,
+        recurse_limit,
+    )
+}
+
+/// Generate completion output for a command as either a shell script or JSON.
+pub fn generate_completion_output(
+    command_path: &str,
+    output: OutputFormat,
+    strategy: SynthesisStrategy,
+    sandbox: bool,
+    timeout_ms: u64,
+    recurse_limit: usize,
+) -> anyhow::Result<String> {
+    reset_stats();
+    if matches!(output, OutputFormat::Json) {
+        let outcome = synthesize_completion_with(
+            command_path,
+            &|extra_args| run_help(command_path, extra_args, sandbox, timeout_ms),
+            strategy,
+            recurse_limit,
+        )?;
+        render_json_output(
+            command_path,
+            strategy,
+            outcome.strategy_used,
+            sandbox,
+            timeout_ms,
+            outcome.command,
+        )
+    } else {
+        let outcome = synthesize_completion_with(
+            command_path,
+            &|args| run_help(command_path, args, sandbox, timeout_ms),
+            strategy,
+            recurse_limit,
+        )?;
+        let cmd_name = command_basename(command_path).replace(' ', "-");
+
+        let mut clap_cmd = to_clap_command(&outcome.command);
+        let mut output_bytes = Vec::new();
+        let shell = output.shell().expect("non-JSON output has shell mapping");
+        clap_complete::generate(shell, &mut clap_cmd, &cmd_name, &mut output_bytes);
+
+        let mut script = std::str::from_utf8(&output_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to encode completion script: {}", e))?
+            .to_string();
+
+        if matches!(output, OutputFormat::BashWithDescriptions) {
+            if let Some(transformed) = try_apply_bash_descriptions(&script, &outcome.command) {
+                script = transformed;
+            } else {
+                log::warn!(
+                    "flycomp: generated script format unexpected for BashWithDescriptions; falling back to standard Bash script"
+                );
+            }
+        }
+
+        let output_format_str = match output {
+            OutputFormat::Bash => "bash",
+            OutputFormat::BashWithDescriptions => "bash-with-descriptions",
+            OutputFormat::Elvish => "elvish",
+            OutputFormat::Fish => "fish",
+            OutputFormat::Powershell => "powershell",
+            OutputFormat::Zsh => "zsh",
+            OutputFormat::Json => "json",
+        };
+
+        let comment_char = "#";
+        let metadata_header = format!(
+            "{comment} Generated by flycomp version {version} ({git_hash}) built {build_time}\n\
+             {comment} Generated at: {generated_at}\n\
+             {comment} Output format: {output_format}\n\
+             {comment} Requested strategy: {requested_strategy}\n\
+             {comment} Strategy used: {strategy_used}\n\
+             {comment} Sandboxed: {sandboxed}\n\
+             {comment} Timeout (ms): {timeout_ms}\n\
+             {comment} Command path: {command_path}\n\
+             {comment} Man pages read: {man_pages_read}\n\
+             {comment} Help runs: {help_runs}\n\n",
+            comment = comment_char,
+            version = env!("CARGO_PKG_VERSION"),
+            git_hash = env!("GIT_HASH"),
+            build_time = env!("BUILD_TIME"),
+            generated_at = rfc3339_now(),
+            output_format = output_format_str,
+            requested_strategy = Into::<&'static str>::into(strategy),
+            strategy_used = Into::<&'static str>::into(outcome.strategy_used),
+            sandboxed = sandbox,
+            timeout_ms = timeout_ms,
+            command_path = command_path,
+            man_pages_read = get_man_pages_read(),
+            help_runs = get_help_runs(),
+        );
+
+        let mut final_script = String::new();
+        let lines: Vec<&str> = script.lines().collect();
+        if !lines.is_empty() && (lines[0].starts_with("#compdef") || lines[0].starts_with("#!")) {
+            final_script.push_str(lines[0]);
+            final_script.push('\n');
+            final_script.push_str(&metadata_header);
+            for line in lines.iter().skip(1) {
+                final_script.push_str(line);
+                final_script.push('\n');
+            }
+        } else {
+            final_script.push_str(&metadata_header);
+            final_script.push_str(&script);
+        }
+
+        Ok(final_script)
+    }
+}
+
+/// Generate completion output for a command using [`FlycompSettings`].
+pub fn generate_completion_output_with_settings(
+    command_path: &str,
+    output: OutputFormat,
+    settings: &FlycompSettings,
+) -> anyhow::Result<String> {
+    generate_completion_output(
+        command_path,
+        output,
+        settings.strategy(),
+        settings.sandbox(),
+        settings.timeout_ms(),
+        settings.recurse_limit(),
+    )
+}
+
+#[cfg(test)]
+pub mod test_helpers {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    pub struct ExpectedArg<'a> {
+        pub arg: Arg,
+        pub description_contains: &'a str,
+    }
+
+    pub fn normalize_desc(desc: Option<&str>) -> String {
+        desc.unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn find_arg<'a>(cmd: &'a Command, expected: &ExpectedArg<'_>) -> &'a Arg {
+        cmd.args
+            .iter()
+            .find(|arg| arg.short == expected.arg.short && arg.long == expected.arg.long)
+            .or_else(|| {
+                cmd.args.iter().find(|arg| {
+                    (expected.arg.short.is_some() && arg.short == expected.arg.short)
+                        || (expected.arg.long.is_some() && arg.long == expected.arg.long)
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "Could not find argument matching expected: short={:?}, long={:?}",
+                    expected.arg.short, expected.arg.long
+                );
+            })
+    }
+
+    pub fn assert_expected_args(cmd: &Command, expected: &[ExpectedArg<'_>]) {
+        assert_eq!(
+            cmd.args.len(),
+            expected.len(),
+            "Number of arguments mismatch: expected {}, got {}. Args in cmd: {:#?}",
+            expected.len(),
+            cmd.args.len(),
+            cmd.args
+        );
+        assert_contains_expected_args(cmd, expected);
+    }
+
+    pub fn assert_contains_expected_args(cmd: &Command, expected: &[ExpectedArg<'_>]) {
+        for expected_arg in expected {
+            let arg = find_arg(cmd, expected_arg);
+            assert_eq!(
+                arg.short, expected_arg.arg.short,
+                "short mismatch for arg {:?}",
+                expected_arg.arg
+            );
+            assert_eq!(
+                arg.long, expected_arg.arg.long,
+                "long mismatch for arg {:?}",
+                expected_arg.arg
+            );
+            assert_eq!(
+                arg.value_name, expected_arg.arg.value_name,
+                "value_name mismatch for arg {:?}",
+                expected_arg.arg
+            );
+            assert_eq!(
+                arg.num_args, expected_arg.arg.num_args,
+                "num_args mismatch for arg {:?}",
+                expected_arg.arg
+            );
+            if expected_arg.arg.value_hint != ValueHint::Unknown {
+                assert_eq!(
+                    arg.value_hint, expected_arg.arg.value_hint,
+                    "value_hint mismatch for arg {:?}",
+                    expected_arg.arg
+                );
+            } else {
+                let expected_hint = if arg.takes_value() {
+                    crate::extract_value_hint(arg.value_name.as_deref(), arg.description.as_deref())
+                } else {
+                    ValueHint::Unknown
+                };
+                assert_eq!(
+                    arg.value_hint, expected_hint,
+                    "ValueHint mismatch for arg {:?} / {:?}",
+                    arg.short, arg.long
+                );
+            }
+            if let Some(expected_enum) = &expected_arg.arg.value_enum {
+                assert_eq!(
+                    arg.value_enum.as_ref(),
+                    Some(expected_enum),
+                    "value_enum mismatch for arg {:?}",
+                    expected_arg.arg
+                );
+            }
+            let description = normalize_desc(arg.description.as_deref());
+            assert!(
+                description.contains(expected_arg.description_contains),
+                "Expected description of {:?}/{:?} to contain {:?}, but got {:?}",
+                expected_arg.arg.short,
+                expected_arg.arg.long,
+                expected_arg.description_contains,
+                description
+            );
+        }
+    }
+
+    pub fn assert_expected_subcommands(cmd: &Command, expected: &[(&str, &str)]) {
+        assert_eq!(
+            cmd.subcommands.len(),
+            expected.len(),
+            "Number of subcommands mismatch: expected {}, got {}. Subcommands: {:#?}",
+            expected.len(),
+            cmd.subcommands.len(),
+            cmd.subcommands
+        );
+        assert_contains_subcommands(cmd, expected);
+    }
+
+    pub fn assert_contains_subcommands(cmd: &Command, expected: &[(&str, &str)]) {
+        for (name, description_contains) in expected {
+            let subcommand = cmd
+                .subcommands
+                .iter()
+                .find(|subcommand| subcommand.name.as_deref() == Some(*name))
+                .unwrap_or_else(|| {
+                    panic!("Could not find subcommand matching: {:?}", name);
+                });
+            let description = normalize_desc(subcommand.description.as_deref());
+            assert!(!description.is_empty());
+            assert!(
+                description.contains(description_contains),
+                "Expected subcommand {:?} description to contain {:?}, but got {:?}",
+                name,
+                description_contains,
+                description
+            );
+        }
+    }
+}
+
+/// The current UTC time as RFC 3339 with whole seconds, e.g. `2026-11-27T10:00:00Z`.
+fn rfc3339_now() -> String {
+    jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── to_clap_command ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_clap_command_basic() {
+        let cmd = Command {
+            name: Some("mytool".to_string()),
+            description: Some("A test tool.".to_string()),
+            args: vec![
+                Arg {
+                    long: Some("--verbose".to_string()),
+                    short: Some("-v".to_string()),
+                    description: Some("Enable verbose output.".to_string()),
+                    value_name: None,
+                    num_args: None,
+                    ..Default::default()
+                },
+                Arg {
+                    long: Some("--output".to_string()),
+                    short: None,
+                    description: Some("Output file.".to_string()),
+                    value_name: Some("<PATH>".to_string()),
+                    num_args: None,
+                    ..Default::default()
+                },
+                Arg {
+                    long: Some("--port".to_string()),
+                    short: Some("-p".to_string()),
+                    description: Some("Port number.".to_string()),
+                    value_name: Some("<PORT>".to_string()),
+                    value_hint: ValueHint::Integral,
+                    num_args: Some("1".to_string()),
+                    ..Default::default()
+                },
+            ],
+            subcommands: vec![Command {
+                name: Some("sub".to_string()),
+                description: Some("A subcommand.".to_string()),
+                ..Command::default()
+            }],
+            ..Command::default()
+        };
+
+        let clap_cmd = to_clap_command(&cmd);
+
+        assert_eq!(clap_cmd.get_name(), "mytool");
+
+        // Check args are present.
+        let arg_ids: Vec<&str> = clap_cmd
+            .get_arguments()
+            .map(|a| a.get_id().as_str())
+            .collect();
+        assert!(
+            arg_ids.contains(&"verbose"),
+            "verbose arg missing: {arg_ids:?}"
+        );
+        assert!(
+            arg_ids.contains(&"output"),
+            "output arg missing: {arg_ids:?}"
+        );
+        assert!(arg_ids.contains(&"port"), "port arg missing: {arg_ids:?}");
+
+        let port_arg = clap_cmd
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "port")
+            .unwrap();
+        assert_eq!(port_arg.get_value_hint(), clap::ValueHint::Other);
+        assert_eq!(format!("{:?}", port_arg.get_action()), "Set");
+
+        let verbose_arg = clap_cmd
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "verbose")
+            .unwrap();
+        assert_eq!(format!("{:?}", verbose_arg.get_action()), "SetTrue");
+
+        let output_arg = clap_cmd
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == "output")
+            .unwrap();
+        assert_eq!(format!("{:?}", output_arg.get_action()), "Set");
+
+        // Check subcommand is present.
+        let sub_names: Vec<&str> = clap_cmd.get_subcommands().map(|s| s.get_name()).collect();
+        assert!(
+            sub_names.contains(&"sub"),
+            "sub subcommand missing: {sub_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_to_clap_command_generates_bash_completion() {
+        // Parse a simple clap-style help and verify that the generated Bash
+        // completion script is non-empty and references the command name.
+        const HELP: &str = r#"Usage: greet [OPTIONS]
+
+Options:
+  -n, --name <NAME>  Name to greet
+  -h, --help         Print help
+"#;
+        let cmd = parse_help(HELP);
+        let mut clap_cmd = to_clap_command(&cmd);
+        let bin_name = clap_cmd.get_name().to_string();
+        let mut out = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut clap_cmd,
+            &bin_name,
+            &mut out,
+        );
+        let script = String::from_utf8(out).expect("completion output is valid utf-8");
+        assert!(!script.is_empty());
+        assert!(script.contains("greet"));
+    }
+
+    #[test]
+    fn test_to_clap_command_drops_duplicate_short_flags() {
+        let cmd = Command {
+            name: Some("readelf".to_string()),
+            description: Some("A test tool with duplicate short flags.".to_string()),
+            args: vec![
+                Arg {
+                    long: Some("--debug-dump[a/".to_string()),
+                    short: Some("-w".to_string()),
+                    description: Some("DWARF debug dump selector.".to_string()),
+                    value_name: None,
+                    num_args: None,
+                    ..Default::default()
+                },
+                Arg {
+                    long: Some("--debug-dump".to_string()),
+                    short: Some("-w".to_string()),
+                    description: Some("DWARF debug dump mode.".to_string()),
+                    value_name: Some("links".to_string()),
+                    num_args: None,
+                    ..Default::default()
+                },
+            ],
+            ..Command::default()
+        };
+
+        let mut clap_cmd = to_clap_command(&cmd);
+        let bin_name = clap_cmd.get_name().to_string();
+        let mut out = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut clap_cmd,
+            &bin_name,
+            &mut out,
+        );
+        let script = String::from_utf8(out).expect("completion output is valid utf-8");
+        assert!(!script.is_empty());
+        assert!(script.contains("readelf"));
+    }
+
+    #[test]
+    fn test_to_clap_command_drops_duplicate_long_flags() {
+        let cmd = Command {
+            name: Some("readelf".to_string()),
+            description: Some("A test tool with duplicate long flags.".to_string()),
+            args: vec![
+                Arg {
+                    long: Some("--debug-dump".to_string()),
+                    short: Some("-w".to_string()),
+                    description: Some("DWARF debug dump selector.".to_string()),
+                    value_name: Some("a/".to_string()),
+                    num_args: None,
+                    ..Default::default()
+                },
+                Arg {
+                    long: Some("--debug-dump".to_string()),
+                    short: None,
+                    description: Some("DWARF debug dump links mode.".to_string()),
+                    value_name: Some("links".to_string()),
+                    num_args: None,
+                    ..Default::default()
+                },
+            ],
+            ..Command::default()
+        };
+
+        let mut clap_cmd = to_clap_command(&cmd);
+        let bin_name = clap_cmd.get_name().to_string();
+        let mut out = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut clap_cmd,
+            &bin_name,
+            &mut out,
+        );
+        let script = String::from_utf8(out).expect("completion output is valid utf-8");
+        assert!(!script.is_empty());
+        assert!(script.contains("readelf"));
+    }
+
+    // ── find_subcommand_mut ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_find_subcommand_mut_nested() {
+        // Build a two-level tree: root → child → grandchild.
+        let mut root = Command {
+            name: Some("root".to_string()),
+            subcommands: vec![Command {
+                name: Some("child".to_string()),
+                subcommands: vec![Command {
+                    name: Some("grandchild".to_string()),
+                    ..Command::default()
+                }],
+                ..Command::default()
+            }],
+            ..Command::default()
+        };
+
+        // Navigate to grandchild via find_subcommand_mut.
+        let path = vec!["child".to_string(), "grandchild".to_string()];
+        let node = find_subcommand_mut(&mut root, &path).expect("grandchild should be found");
+        assert_eq!(node.name.as_deref(), Some("grandchild"));
+
+        // Populate it with an arg.
+        node.args.push(Arg {
+            long: Some("--verbose".to_string()),
+            short: Some("-v".to_string()),
+            description: Some("Be verbose".to_string()),
+            value_name: None,
+            num_args: None,
+            ..Default::default()
+        });
+
+        // Verify through the tree.
+        let grandchild = root
+            .subcommands
+            .first()
+            .and_then(|c| c.subcommands.first())
+            .expect("grandchild should exist");
+        assert_eq!(grandchild.args.len(), 1);
+        assert_eq!(grandchild.args[0].long.as_deref(), Some("--verbose"));
+    }
+
+    #[test]
+    fn test_find_subcommand_mut_missing() {
+        let mut root = Command {
+            name: Some("root".to_string()),
+            ..Command::default()
+        };
+        // A path that doesn't exist should return None.
+        let path = vec!["nonexistent".to_string()];
+        assert!(find_subcommand_mut(&mut root, &path).is_none());
+    }
+
+    #[test]
+    fn test_read_manpage_source_compressed() {
+        use std::process::Command;
+        // Create a temporary directory in target
+        let temp_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_temp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let base_path = temp_dir.join("test_manpage");
+        let content = ".TH TEST 1\n.SH NAME\ntest - a test tool";
+        std::fs::write(&base_path, content).unwrap();
+
+        // Compress with gzip
+        let gz_path = temp_dir.join("test_manpage.gz");
+        let _ = Command::new("gzip")
+            .args(["-c"])
+            .stdout(std::fs::File::create(&gz_path).unwrap())
+            .stdin(std::fs::File::open(&base_path).unwrap())
+            .status();
+
+        // Compress with zstd if zstd is available
+        let zst_path = temp_dir.join("test_manpage.zst");
+        let zstd_ok = Command::new("zstd")
+            .args(["-c", "-q"])
+            .stdout(std::fs::File::create(&zst_path).unwrap())
+            .stdin(std::fs::File::open(&base_path).unwrap())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        // Compress with xz if xz is available
+        let xz_path = temp_dir.join("test_manpage.xz");
+        let xz_ok = Command::new("xz")
+            .args(["-c", "-q"])
+            .stdout(std::fs::File::create(&xz_path).unwrap())
+            .stdin(std::fs::File::open(&base_path).unwrap())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        // Test read_manpage_source for gz
+        if gz_path.exists() {
+            let res = read_manpage_source(gz_path.to_str().unwrap()).unwrap();
+            assert_eq!(res, content);
+        }
+
+        // Test read_manpage_source for zst
+        if zstd_ok && zst_path.exists() {
+            let res = read_manpage_source(zst_path.to_str().unwrap()).unwrap();
+            assert_eq!(res, content);
+        }
+
+        // Test read_manpage_source for xz
+        if xz_ok && xz_path.exists() {
+            let res = read_manpage_source(xz_path.to_str().unwrap()).unwrap();
+            assert_eq!(res, content);
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_run_help_in_cwd() {
+        let _guard = CWD_MUTEX.lock().unwrap();
+        use std::io::Write;
+        let temp_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_run_help_cwd");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cmd_path = temp_dir.join("dummy_cmd");
+
+        let script = "#!/bin/sh\necho \"Usage: dummy_cmd [OPTIONS]\n\nOptions:\n  --foo  bar\"";
+        {
+            let mut f = std::fs::File::create(&cmd_path).unwrap();
+            f.write_all(script.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&cmd_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&cmd_path, perms).unwrap();
+        }
+
+        // Sleep briefly to ensure the OS/filesystem has fully released any write handles,
+        // avoiding "Text file busy (os error 26)" when executing it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        let res = run_help("dummy_cmd", &[], false, 5000);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let output = res.expect("run_help should succeed");
+        assert!(output.contains("--foo"));
+    }
+
+    #[test]
+    fn test_run_help_non_zero_exit() {
+        use std::io::Write;
+        let temp_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_run_help_exit_fail");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cmd_path = temp_dir.join("failing_cmd");
+
+        let script = "#!/bin/sh\necho \"some stdout\"\necho \"some stderr\" >&2\nexit 42";
+        {
+            let mut f = std::fs::File::create(&cmd_path).unwrap();
+            f.write_all(script.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&cmd_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&cmd_path, perms).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let res = run_help(cmd_path.to_str().unwrap(), &[], false, 5000);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let err = res.expect_err("should fail with non-zero exit status");
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("exit code 42"));
+        assert!(err_msg.contains("some stdout"));
+        assert!(err_msg.contains("some stderr"));
+    }
+
+    #[test]
+    fn test_run_help_fallback_to_help() {
+        use std::io::Write;
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let folder_name = format!("test_run_help_fallback_{id}_{}", std::process::id());
+        let temp_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(&folder_name);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cmd_path = temp_dir.join("fallback_cmd");
+
+        let script = r#"#!/bin/sh
+if [ "$1" = "--help" ] || [ "$2" = "--help" ]; then
+    echo "invalid option --help" >&2
+    exit 1
+elif [ "$1" = "help" ] || [ "$2" = "help" ]; then
+    echo "Usage: fallback_cmd [options]"
+    exit 0
+else
+    echo "unknown args: $@" >&2
+    exit 1
+fi
+"#;
+        {
+            let mut f = std::fs::File::create(&cmd_path).unwrap();
+            f.write_all(script.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&cmd_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&cmd_path, perms).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let res = run_help(cmd_path.to_str().unwrap(), &[], false, 5000);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let output = res.expect("should successfully fallback to 'help'");
+        assert!(output.contains("Usage: fallback_cmd [options]"));
+    }
+
+    #[test]
+    fn test_to_clap_command_subcommand_aliases() {
+        let cmd = Command {
+            name: Some("cargo".to_string()),
+            subcommands: vec![Command {
+                name: Some("build".to_string()),
+                aliases: vec!["b".to_string()],
+                ..Command::default()
+            }],
+            ..Command::default()
+        };
+        let clap_cmd = to_clap_command(&cmd);
+        let sub = clap_cmd.find_subcommand("build").unwrap();
+        let visible_aliases: Vec<&str> = sub.get_visible_aliases().collect();
+        assert_eq!(visible_aliases, vec!["b"]);
+    }
+
+    #[test]
+    fn test_render_json_output_includes_metadata() {
+        reset_stats();
+        let json = render_json_output(
+            "cargo",
+            SynthesisStrategy::ManPageThenRunHelp,
+            SynthesisMethod::RunHelp,
+            true,
+            15000,
+            Command {
+                name: Some("cargo".to_string()),
+                description: Some("Rust package manager".to_string()),
+                ..Command::default()
+            },
+        )
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["metadata"]["flycomp_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(value["metadata"]["git_hash"], env!("GIT_HASH"));
+        assert_eq!(value["metadata"]["build_time"], env!("BUILD_TIME"));
+        assert_eq!(value["metadata"]["output_format"], "json");
+        assert_eq!(
+            value["metadata"]["requested_strategy"],
+            "man-page-then-run-help"
+        );
+        assert_eq!(value["metadata"]["strategy_used"], "run-help");
+        assert_eq!(value["metadata"]["sandboxed"], true);
+        assert_eq!(value["metadata"]["timeout_ms"], 15000);
+        assert_eq!(value["metadata"]["command_path"], "cargo");
+        assert_eq!(value["metadata"]["man_pages_read"], 0);
+        assert_eq!(value["metadata"]["help_runs"], 0);
+        assert_eq!(value["command"]["name"], "cargo");
+        assert!(value["metadata"]["generated_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_generate_completion_script_includes_metadata() {
+        let _guard = CWD_MUTEX.lock().unwrap();
+        let script_zsh = generate_completion_script(
+            "cargo",
+            clap_complete::Shell::Zsh,
+            SynthesisStrategy::RunHelp,
+            true,
+            15000,
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            script_zsh.starts_with("#compdef cargo\n# Generated by flycomp version"),
+            "Zsh script does not start with correct #compdef or metadata comment. Script preview:\n{}",
+            &script_zsh[..std::cmp::min(script_zsh.len(), 500)]
+        );
+        assert!(script_zsh.contains("# Output format: zsh"));
+        assert!(script_zsh.contains("# Requested strategy: run-help"));
+        assert!(script_zsh.contains("# Command path: cargo"));
+
+        let script_bash = generate_completion_script(
+            "cargo",
+            clap_complete::Shell::Bash,
+            SynthesisStrategy::RunHelp,
+            true,
+            15000,
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            script_bash.starts_with("# Generated by flycomp version"),
+            "Bash script does not start with metadata comment. Script preview:\n{}",
+            &script_bash[..std::cmp::min(script_bash.len(), 500)]
+        );
+        assert!(script_bash.contains("# Output format: bash"));
+    }
+
+    #[test]
+    fn test_parse_possible_values_extraction() {
+        // Test parsing from value_name
+        assert_eq!(
+            parse_possible_values(Some("{info,debug,trace}"), None),
+            Some(vec![
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(Some("info|debug|trace"), None),
+            Some(vec![
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(Some("[info|debug|trace]"), None),
+            Some(vec![
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(Some("0..5"), None),
+            Some(vec![
+                "0".to_string(),
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string(),
+                "5".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(Some("<1-3>"), None),
+            Some(vec!["1".to_string(), "2".to_string(), "3".to_string()])
+        );
+        assert_eq!(
+            parse_possible_values(Some("0..100"), None), // too large, should be None
+            None
+        );
+
+        // Test parsing from description
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("Set the logging level [possible values: error, warn, info, debug, trace]")
+            ),
+            Some(vec![
+                "error".to_string(),
+                "warn".to_string(),
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("Choices: info, debug, trace")),
+            Some(vec![
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("allowed values are 'info', 'debug', or 'trace'.")
+            ),
+            Some(vec![
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("must be either info or debug")),
+            Some(vec!["info".to_string(), "debug".to_string()])
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("valid values: info/debug/trace")),
+            Some(vec![
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("one of: info, debug, trace")),
+            Some(vec![
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("accepts: \"info\", \"debug\", \"trace\"")),
+            Some(vec![
+                "info".to_string(),
+                "debug".to_string(),
+                "trace".to_string()
+            ])
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("can be either fast or slow")),
+            Some(vec!["fast".to_string(), "slow".to_string()])
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("selected from: apple, banana")),
+            Some(vec!["apple".to_string(), "banana".to_string()])
+        );
+
+        // Test bulleted list parsing
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("Supported formats:\n  - json: JSON format\n  - yaml: YAML format")
+            ),
+            Some(vec!["json".to_string(), "yaml".to_string()])
+        );
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("Supported formats: - json: JSON format - yaml: YAML format")
+            ),
+            Some(vec!["json".to_string(), "yaml".to_string()])
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("Modes:\n  * fast\n  * slow")),
+            Some(vec!["fast".to_string(), "slow".to_string()])
+        );
+
+        // Test parenthesized shortcut choice parsing
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some(
+                    "Default action when a path already exists: (s)witch, (i)gnore, (w)ipe, (b)ackup, (a)bort"
+                )
+            ),
+            Some(vec![
+                "s".to_string(),
+                "i".to_string(),
+                "w".to_string(),
+                "b".to_string(),
+                "a".to_string()
+            ])
+        );
+
+        // Test none when no matches or junk
+        assert_eq!(
+            parse_possible_values(None, Some("This option can be specified multiple times.")),
+            None
+        );
+
+        // Test hyphenated values containing 'or'
+        assert_eq!(
+            parse_possible_values(
+                Some("[man-page-then-run-help|man-page|run-help|man-page-or-run-help]"),
+                None
+            ),
+            Some(vec![
+                "man-page-then-run-help".to_string(),
+                "man-page".to_string(),
+                "run-help".to_string(),
+                "man-page-or-run-help".to_string()
+            ])
+        );
+
+        // Test path slash ignoring
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("WHERE can be: null: Redirect output to /dev/null (the default)")
+            ),
+            None
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("allowed values: /bin/sh, /bin/bash")),
+            None
+        );
+        assert_eq!(
+            parse_possible_values(None, Some("choices: yes/no")),
+            Some(vec!["yes".to_string(), "no".to_string()])
+        );
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("Valid values for STYLE are literal, shell, shell-always")
+            ),
+            Some(vec![
+                "literal".to_string(),
+                "shell".to_string(),
+                "shell-always".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_possible_values_heuristic_default() {
+        // Test: list + default: x
+        assert_eq!(
+            parse_possible_values(None, Some("mode: fast, slow, or medium. default: fast")),
+            Some(vec![
+                "fast".to_string(),
+                "slow".to_string(),
+                "medium".to_string()
+            ])
+        );
+
+        // Test: list + default is x
+        assert_eq!(
+            parse_possible_values(None, Some("color: red|green|blue (default is green)")),
+            Some(vec![
+                "red".to_string(),
+                "green".to_string(),
+                "blue".to_string()
+            ])
+        );
+
+        // Test: list + [default: x]
+        assert_eq!(
+            parse_possible_values(None, Some("type: apple/banana/cherry [default: banana]")),
+            Some(vec![
+                "apple".to_string(),
+                "banana".to_string(),
+                "cherry".to_string()
+            ])
+        );
+
+        // Test: list + (default: x)
+        assert_eq!(
+            parse_possible_values(None, Some("strategy: eager, lazy (default: eager)")),
+            Some(vec!["eager".to_string(), "lazy".to_string()])
+        );
+
+        // Test: default value NOT in the list (should return None)
+        assert_eq!(
+            parse_possible_values(None, Some("mode: fast, slow. default: medium")),
+            None
+        );
+
+        // Test: default value with no obvious list (should return None)
+        assert_eq!(
+            parse_possible_values(None, Some("Set the timeout in seconds. default: 30")),
+            None
+        );
+
+        // Test: multiple lists, default matches one
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("format: json, xml, yaml. output: file, stdout. default: xml")
+            ),
+            Some(vec![
+                "json".to_string(),
+                "xml".to_string(),
+                "yaml".to_string()
+            ])
+        );
+
+        // Test: list with 'and' conjunction
+        assert_eq!(
+            parse_possible_values(None, Some("choose from red, green and blue. default: red")),
+            Some(vec![
+                "red".to_string(),
+                "green".to_string(),
+                "blue".to_string()
+            ])
+        );
+
+        // Test: quoted values in list and default
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("modes: 'active', 'inactive'. default is 'active'")
+            ),
+            Some(vec!["active".to_string(), "inactive".to_string()])
+        );
+
+        // Test: values with dashes and underscores
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("use: my-value, other_value. default: other_value")
+            ),
+            Some(vec!["my-value".to_string(), "other_value".to_string()])
+        );
+
+        // Test: default at the beginning
+        assert_eq!(
+            parse_possible_values(None, Some("default: fast. choices are fast, slow.")),
+            Some(vec!["fast".to_string(), "slow".to_string()])
+        );
+
+        // Test: list in parentheses
+        assert_eq!(
+            parse_possible_values(None, Some("the mode (fast, slow, medium). default: slow")),
+            Some(vec![
+                "fast".to_string(),
+                "slow".to_string(),
+                "medium".to_string()
+            ])
+        );
+
+        // Test: default is x, where x is in the list with other text
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("Available options are: first, second, third. The default is second.")
+            ),
+            Some(vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ])
+        );
+
+        // Test: multiple potential lists, should pick the one containing default
+        assert_eq!(
+            parse_possible_values(
+                None,
+                Some("birds: eagle, hawk. fish: shark, trout. default: shark")
+            ),
+            Some(vec!["shark".to_string(), "trout".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_extract_value_hint() {
+        // Test URL
+        assert_eq!(extract_value_hint(Some("url"), None), ValueHint::Url);
+        assert_eq!(
+            extract_value_hint(None, Some("the API endpoint")),
+            ValueHint::Url
+        );
+
+        // Test Hostname
+        assert_eq!(extract_value_hint(Some("host"), None), ValueHint::Hostname);
+        assert_eq!(
+            extract_value_hint(None, Some("bind to the server ip address")),
+            ValueHint::Hostname
+        );
+        assert_eq!(
+            extract_value_hint(None, Some("target host remote name")),
+            ValueHint::Hostname
+        );
+
+        // Test ExecutablePath
+        assert_eq!(
+            extract_value_hint(Some("executable"), None),
+            ValueHint::ExecutablePath
+        );
+        assert_eq!(
+            extract_value_hint(None, Some("path to executable command")),
+            ValueHint::ExecutablePath
+        );
+        assert_eq!(
+            extract_value_hint(None, Some("path to binary")),
+            ValueHint::ExecutablePath
+        );
+
+        // Test DirPath vs FilePath in output/input specific heuristic
+        assert_eq!(
+            extract_value_hint(Some("output"), Some("write output to directory")),
+            ValueHint::DirPath
+        );
+        assert_eq!(
+            extract_value_hint(Some("output"), Some("write output to file")),
+            ValueHint::FilePath
+        );
+
+        // Test EnvVar
+        assert_eq!(extract_value_hint(Some("env-var"), None), ValueHint::EnvVar);
+        assert_eq!(
+            extract_value_hint(None, Some("read from environment variable")),
+            ValueHint::EnvVar
+        );
+        assert_eq!(
+            extract_value_hint(Some("NAME"), Some("remove variable from the environment")),
+            ValueHint::EnvVar
+        );
+
+        // Test NetworkInterface
+        assert_eq!(
+            extract_value_hint(Some("iface"), None),
+            ValueHint::NetworkInterface
+        );
+        assert_eq!(
+            extract_value_hint(None, Some("bind network interface")),
+            ValueHint::NetworkInterface
+        );
+
+        // Test GitBranch / GitRevision
+        assert_eq!(
+            extract_value_hint(Some("branch"), None),
+            ValueHint::GitBranch
+        );
+        assert_eq!(
+            extract_value_hint(None, Some("git commit hash")),
+            ValueHint::GitRevision
+        );
+
+        // Test SystemdUnit
+        assert_eq!(
+            extract_value_hint(Some("service"), None),
+            ValueHint::SystemdUnit
+        );
+        assert_eq!(
+            extract_value_hint(None, Some("systemd unit service")),
+            ValueHint::SystemdUnit
+        );
+
+        // Test Integral
+        assert_eq!(extract_value_hint(Some("port"), None), ValueHint::Integral);
+        assert_eq!(extract_value_hint(Some("count"), None), ValueHint::Integral);
+        assert_eq!(
+            extract_value_hint(None, Some("the process id of target")),
+            ValueHint::Integral
+        );
+        assert_eq!(
+            extract_value_hint(None, Some("number of connections")),
+            ValueHint::Integral
+        );
+        assert_eq!(
+            extract_value_hint(Some("NUM"), Some("print NUM lines of leading context")),
+            ValueHint::Integral
+        );
+
+        // Test false positive avoidance (boundary-aware matching)
+        assert_eq!(extract_value_hint(Some("curl"), None), ValueHint::Unknown);
+        assert_eq!(
+            extract_value_hint(Some("profile"), None),
+            ValueHint::Unknown
+        );
+        assert_eq!(
+            extract_value_hint(Some("redirect"), None),
+            ValueHint::Unknown
+        );
+        assert_eq!(extract_value_hint(Some("login"), None), ValueHint::Unknown);
+        assert_eq!(
+            extract_value_hint(Some("community"), None),
+            ValueHint::Unknown
+        );
+
+        // Description false positives
+        assert_eq!(
+            extract_value_hint(None, Some("during normal operation")),
+            ValueHint::Unknown
+        );
+        assert_eq!(
+            extract_value_hint(None, Some("security guidelines")),
+            ValueHint::Unknown
+        );
+        assert_eq!(
+            extract_value_hint(Some("output"), Some("number of threads to spawn")),
+            ValueHint::Integral
+        );
+        assert_eq!(
+            extract_value_hint(Some("output"), Some("direct output to stdout")),
+            ValueHint::Unknown
+        );
+        assert_eq!(
+            extract_value_hint(Some("output"), Some("already existing headers")),
+            ValueHint::Unknown
+        );
+    }
+
+    #[test]
+    fn test_merge_commands() {
+        let help_cmd = Command {
+            name: Some("test".to_string()),
+            description: None,
+            author: Some("Help Author".to_string()),
+            aliases: vec!["t".to_string()],
+            args: vec![
+                Arg {
+                    long: Some("--config".to_string()),
+                    description: Some("Config path".to_string()),
+                    value_name: Some("PATH".to_string()),
+                    value_hint: ValueHint::Unknown,
+                    ..Default::default()
+                },
+                Arg {
+                    long: Some("--only-in-help".to_string()),
+                    description: Some("Help only option".to_string()),
+                    ..Default::default()
+                },
+            ],
+            subcommands: vec![Command {
+                name: Some("help-sub".to_string()),
+                ..Default::default()
+            }],
+            ..Command::default()
+        };
+
+        let man_cmd = Command {
+            name: Some("test".to_string()),
+            description: Some("A parsed test tool description".to_string()),
+            author: None,
+            aliases: vec!["test-alias".to_string()],
+            args: vec![
+                Arg {
+                    long: Some("--config".to_string()),
+                    description: None,
+                    value_name: Some("PATH".to_string()),
+                    value_hint: ValueHint::FilePath,
+                    value_enum: Some(vec!["config.toml".to_string()]),
+                    ..Default::default()
+                },
+                Arg {
+                    long: Some("--only-in-man".to_string()),
+                    description: Some("Man only option".to_string()),
+                    ..Default::default()
+                },
+            ],
+            subcommands: vec![Command {
+                name: Some("man-sub".to_string()),
+                ..Default::default()
+            }],
+            ..Command::default()
+        };
+
+        let merged = merge_commands(help_cmd, man_cmd);
+
+        assert_eq!(
+            merged.description,
+            Some("A parsed test tool description".to_string())
+        );
+        assert_eq!(merged.author, Some("Help Author".to_string()));
+        assert_eq!(
+            merged.aliases,
+            vec!["t".to_string(), "test-alias".to_string()]
+        );
+
+        // Verify arguments (union)
+        assert_eq!(merged.args.len(), 3);
+
+        let config_arg = merged
+            .args
+            .iter()
+            .find(|a| a.long.as_deref() == Some("--config"))
+            .unwrap();
+        assert_eq!(config_arg.value_hint, ValueHint::FilePath);
+        assert_eq!(config_arg.value_enum, Some(vec!["config.toml".to_string()]));
+        assert_eq!(config_arg.description, Some("Config path".to_string()));
+
+        let help_only_arg = merged
+            .args
+            .iter()
+            .find(|a| a.long.as_deref() == Some("--only-in-help"))
+            .unwrap();
+        assert_eq!(
+            help_only_arg.description,
+            Some("Help only option".to_string())
+        );
+
+        let man_only_arg = merged
+            .args
+            .iter()
+            .find(|a| a.long.as_deref() == Some("--only-in-man"))
+            .unwrap();
+        assert_eq!(
+            man_only_arg.description,
+            Some("Man only option".to_string())
+        );
+
+        // Verify subcommands (union)
+        assert_eq!(merged.subcommands.len(), 2);
+        assert!(
+            merged
+                .subcommands
+                .iter()
+                .any(|s| s.name.as_deref() == Some("help-sub"))
+        );
+        assert!(
+            merged
+                .subcommands
+                .iter()
+                .any(|s| s.name.as_deref() == Some("man-sub"))
+        );
+    }
+
+    #[test]
+    fn test_sandbox_status() {
+        let mut settings = FlycompSettings::default();
+        settings.no_sandbox = true;
+        let status = settings.sandbox_status();
+        assert_eq!(status, SandboxStatus::DisabledInSettings);
+        assert_eq!(status.label(), "unsandboxed");
+        assert_eq!(
+            status.description(),
+            "Sandboxing disabled in flycomp settings (`--no-sandbox`)."
+        );
+    }
+
+    #[test]
+    fn test_strategy_man_page_or_run_help() {
+        let help_called = std::sync::atomic::AtomicBool::new(false);
+        let help_runner = |_args: &[&str]| -> anyhow::Result<String> {
+            help_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("Usage: non_existent_cmd\n\nOptions:\n  --foo  bar".to_string())
+        };
+
+        let res = synthesize_completion_with(
+            "non_existent_cmd",
+            &help_runner,
+            SynthesisStrategy::ManPageOrRunHelp,
+            5,
+        );
+        let outcome = res.expect("synthesis should succeed");
+        assert!(help_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(outcome.strategy_used, SynthesisMethod::RunHelp);
+        assert_eq!(outcome.command.name.as_deref(), Some("non_existent_cmd"));
+        assert!(
+            outcome
+                .command
+                .args
+                .iter()
+                .any(|a| a.long.as_deref() == Some("--foo"))
+        );
+    }
+
+    #[test]
+    fn test_is_sandboxing_available() {
+        let res = is_sandboxing_available();
+        if let Some(s) = res {
+            assert_eq!(
+                s,
+                "bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --unshare-all --"
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_help_with_subcommands() {
+        use std::io::Write;
+        let temp_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test_run_help_subcommands");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cmd_path = temp_dir.join("subcmd_test_cmd");
+
+        let script = r#"#!/bin/sh
+echo "Args: $@"
+"#;
+        {
+            let mut f = std::fs::File::create(&cmd_path).unwrap();
+            f.write_all(script.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&cmd_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&cmd_path, perms).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let _guard = CWD_MUTEX.lock().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        let res = run_help("subcmd_test_cmd foo bar", &["extra"], false, 5000);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let output = res.expect("run_help should succeed");
+        assert!(output.contains("Args: foo bar extra --help"));
+    }
+}
