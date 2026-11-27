@@ -1297,7 +1297,13 @@ fn spawn_widget_child(command: &[String]) -> Result<std::process::Child, WidgetF
         args
     );
     let mut cmd = std::process::Command::new(prog);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // stdin is /dev/null: the widget runs in its own (background) process group,
+    // so reading the terminal would stop it with SIGTTIN, and before that it
+    // competed with flyline for keystrokes.
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
