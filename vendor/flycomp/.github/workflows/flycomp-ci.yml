@@ -1,0 +1,40 @@
+name: Flycomp CI
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ "**" ]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+concurrency:
+  group: flycomp-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Flycomp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo Test
+        run: cargo test -p flycomp
