@@ -66,6 +66,9 @@ pub struct Annotations {
     pub bracket_depth: Option<usize>,
     /// Whether this token is part of a glob expression.
     pub is_glob: bool,
+    /// Whether this token is syntactically invalid (e.g. malformed redirection or
+    /// control operator sequences such as `&|`, `>>&`, `>>>`, `<|`).
+    pub is_invalid: bool,
 }
 
 impl Annotations {
@@ -569,11 +572,13 @@ impl DParser {
                 }
                 TokenKind::HereDoc { delimiter, quoted }
                 | TokenKind::HereDocDash { delimiter, quoted } => {
-                    let depth = nestings.len();
-                    self.tokens[idx].annotations.opening = Some(OpeningState::Unmatched);
-                    self.tokens[idx].annotations.bracket_depth = Some(depth);
+                    if !delimiter.is_empty() {
+                        let depth = nestings.len();
+                        self.tokens[idx].annotations.opening = Some(OpeningState::Unmatched);
+                        self.tokens[idx].annotations.bracket_depth = Some(depth);
 
-                    heredocs.push_back((idx, delimiter.clone(), *quoted, depth));
+                        heredocs.push_back((idx, delimiter.clone(), *quoted, depth));
+                    }
                 }
                 TokenKind::RParen
                 | TokenKind::DoubleRParen
@@ -708,16 +713,19 @@ impl DParser {
                     }
                 }
 
-                // Redirection operators (`<`, `>`, `>>`, `<&`, `>&`, `<>`, `>|`).
+                // Redirection operators (`<`, `>`, `>>`, `&>`, `&>>`, `<&`, `>&`, `<>`, `>|`, `<<<`).
                 // They never act as a command word and never start a new command;
                 // they just extend the current command range if one exists.
                 TokenKind::Less
                 | TokenKind::Great
                 | TokenKind::DGreat
+                | TokenKind::AndGreat
+                | TokenKind::AndDGreat
                 | TokenKind::InputDup
                 | TokenKind::OutputDup
                 | TokenKind::ReadWrite
-                | TokenKind::Clobber => {
+                | TokenKind::Clobber
+                | TokenKind::HereString => {
                     if let Some(range) = &mut self.current_command_range {
                         *range = *range.start()..=idx;
                     }
@@ -740,11 +748,14 @@ impl DParser {
                 }
                 // These keywords and operators introduce a new command; reset the command
                 // context so the first word after them receives the command_word annotation.
-                TokenKind::And
+                TokenKind::PipeAnd
+                | TokenKind::And
                 | TokenKind::Or
                 | TokenKind::Semicolon
                 | TokenKind::Background
                 | TokenKind::DoubleSemicolon
+                | TokenKind::SemiAnd
+                | TokenKind::DoubleSemiAnd
                 | TokenKind::Do
                 | TokenKind::Then
                 | TokenKind::Elif
@@ -942,6 +953,281 @@ impl DParser {
         }
 
         self.annotate_globs();
+        self.annotate_invalid_operators();
+    }
+
+    /// Detect syntactically invalid redirection and control operator sequences
+    /// (such as `&|`, `>>&`, `>>>`, `<<<<`, `<|`, `<&>`, `>&<`, `>|&`, `>>|`,
+    /// `&&&`, `|||`, `;&` outside `case`, or a leading control operator) and
+    /// flag them with [`Annotations::is_invalid`] (#962).
+    fn annotate_invalid_operators(&mut self) {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum PrevState {
+            CommandStart,
+            Normal,
+            RedirNeedsTarget,
+            ControlContinuation,
+            ControlTerminator,
+            CaseTerminator,
+        }
+
+        let n = self.tokens.len();
+        let mut invalid = vec![false; n];
+        let mut prev_state = PrevState::CommandStart;
+        let mut prev_idx: Option<usize> = None;
+        let mut case_depth: usize = 0;
+        // FIFO queue of active heredocs: (opener_line, optional_closing_token_idx).
+        let mut active_heredocs: VecDeque<(usize, Option<usize>)> = VecDeque::new();
+
+        let mut i = 0;
+        while i < n {
+            let tok = &self.tokens[i];
+            let ann = &tok.annotations;
+            let kind = &tok.token.kind;
+
+            // Skip heredoc body lines (between the newline after the `<<EOF` header
+            // and the matching closing delimiter line).
+            if let Some(&(opener_line, close_idx)) = active_heredocs.front()
+                && tok.token.position.line > opener_line
+            {
+                if close_idx == Some(i) {
+                    active_heredocs.pop_front();
+                    prev_state = PrevState::CommandStart;
+                    prev_idx = None;
+                }
+                i += 1;
+                continue;
+            }
+
+            // Record newly opened heredocs with a non-empty delimiter so their
+            // body lines (starting on the next line) are skipped.
+            if matches!(
+                kind,
+                TokenKind::HereDoc { delimiter, .. } | TokenKind::HereDocDash { delimiter, .. }
+                    if !delimiter.is_empty()
+            ) && let Some(opening) = &ann.opening
+            {
+                let close_idx = match opening {
+                    OpeningState::Matched(c) => Some(*c),
+                    OpeningState::Unmatched => None,
+                };
+                active_heredocs.push_back((tok.token.position.line, close_idx));
+            }
+
+            // Quoted strings, heredoc bodies, and comments do not follow command
+            // operator syntax.
+            if ann.is_inside_single_quotes || ann.is_inside_double_quotes {
+                prev_state = PrevState::Normal;
+                prev_idx = Some(i);
+                i += 1;
+                continue;
+            }
+            if ann.is_comment || matches!(kind, TokenKind::Whitespace(_) | TokenKind::Comment) {
+                i += 1;
+                continue;
+            }
+
+            // Skip regions whose internal grammar is not regular command/redirection
+            // syntax (arithmetic expressions, parameter expansions, `[[ ... ]]`,
+            // and extglob patterns).
+            if matches!(
+                kind,
+                TokenKind::ArithSubst
+                    | TokenKind::ArithCommand
+                    | TokenKind::ParamExpansion
+                    | TokenKind::DoubleLBracket
+                    | TokenKind::ExtGlob(_)
+            ) && let Some(opening) = &ann.opening
+            {
+                let is_word_like = !matches!(kind, TokenKind::ArithCommand | TokenKind::DoubleLBracket);
+                prev_state = if is_word_like || prev_state != PrevState::RedirNeedsTarget {
+                    PrevState::Normal
+                } else {
+                    // `echo > ((1))` or `echo > [[ a ]]`: invalid target
+                    invalid[i] = true;
+                    if prev_idx == Some(i.saturating_sub(1)) && i > 0 {
+                        invalid[i - 1] = true;
+                    }
+                    PrevState::Normal
+                };
+                match opening {
+                    OpeningState::Matched(close_idx) => {
+                        prev_idx = Some(*close_idx);
+                        i = *close_idx + 1;
+                    }
+                    OpeningState::Unmatched => break,
+                }
+                continue;
+            }
+
+            if matches!(kind, TokenKind::Case) && ann.opening.is_some() {
+                case_depth += 1;
+                prev_state = PrevState::Normal;
+                prev_idx = Some(i);
+                i += 1;
+                continue;
+            }
+            if matches!(kind, TokenKind::Esac) && ann.closing.is_some() {
+                case_depth = case_depth.saturating_sub(1);
+                prev_state = PrevState::Normal;
+                prev_idx = Some(i);
+                i += 1;
+                continue;
+            }
+
+            if matches!(kind, TokenKind::Newline) {
+                // Newlines after `|`, `|&`, `||`, `&&` continue the compound
+                // expression; after anything else they start a fresh command.
+                if prev_state != PrevState::ControlContinuation {
+                    prev_state = PrevState::CommandStart;
+                    prev_idx = None;
+                }
+                i += 1;
+                continue;
+            }
+
+            let is_redir_needs_target = matches!(
+                kind,
+                TokenKind::Less
+                    | TokenKind::Great
+                    | TokenKind::DGreat
+                    | TokenKind::AndGreat
+                    | TokenKind::AndDGreat
+                    | TokenKind::InputDup
+                    | TokenKind::OutputDup
+                    | TokenKind::ReadWrite
+                    | TokenKind::Clobber
+                    | TokenKind::HereString
+            ) || matches!(
+                kind,
+                TokenKind::HereDoc { delimiter, .. } | TokenKind::HereDocDash { delimiter, .. }
+                    if delimiter.is_empty()
+            );
+
+            let is_any_redir = is_redir_needs_target
+                || matches!(
+                    kind,
+                    TokenKind::HereDoc { .. } | TokenKind::HereDocDash { .. }
+                );
+
+            let is_control_continuation = matches!(
+                kind,
+                TokenKind::Pipe | TokenKind::PipeAnd | TokenKind::Or | TokenKind::And
+            );
+            let is_control_terminator = matches!(kind, TokenKind::Semicolon | TokenKind::Background);
+            let is_case_terminator = matches!(
+                kind,
+                TokenKind::DoubleSemicolon | TokenKind::SemiAnd | TokenKind::DoubleSemiAnd
+            );
+            let is_any_control =
+                is_control_continuation || is_control_terminator || is_case_terminator;
+
+            let is_adjacent = prev_idx.is_some_and(|p| {
+                p + 1 == i && !self.tokens[p].token.value.ends_with(char::is_whitespace)
+            });
+
+            // Case terminators (`;;`, `;&`, `;;&`) are only valid inside `case ... esac`.
+            if is_case_terminator && case_depth == 0 {
+                invalid[i] = true;
+                if is_adjacent
+                    && matches!(
+                        prev_state,
+                        PrevState::RedirNeedsTarget
+                            | PrevState::ControlContinuation
+                            | PrevState::ControlTerminator
+                            | PrevState::CaseTerminator
+                    )
+                    && let Some(p) = prev_idx
+                {
+                    invalid[p] = true;
+                }
+            }
+
+            match prev_state {
+                PrevState::RedirNeedsTarget => {
+                    // A redirection operator must be followed by a filename/fd word
+                    // (or process/command substitution), never another redirection,
+                    // control operator, or bare parenthesis (e.g. `>>(`).
+                    if is_any_redir
+                        || is_any_control
+                        || matches!(
+                            kind,
+                            TokenKind::LParen | TokenKind::RParen | TokenKind::DoubleRParen
+                        )
+                    {
+                        invalid[i] = true;
+                        if is_adjacent && let Some(p) = prev_idx {
+                            invalid[p] = true;
+                        }
+                    }
+                }
+                PrevState::ControlContinuation | PrevState::CaseTerminator => {
+                    if is_any_control {
+                        invalid[i] = true;
+                        if is_adjacent && let Some(p) = prev_idx {
+                            invalid[p] = true;
+                        }
+                    }
+                }
+                PrevState::ControlTerminator => {
+                    // Inside `case`, `; ;;` and `& ;;` (e.g. `sleep 1 & ;;`) are valid.
+                    let allowed_case_end = is_case_terminator && case_depth > 0;
+                    if is_any_control && !allowed_case_end {
+                        invalid[i] = true;
+                        if is_adjacent && let Some(p) = prev_idx {
+                            invalid[p] = true;
+                        }
+                    }
+                }
+                PrevState::CommandStart => {
+                    // Control operators cannot start a command (e.g. `| cat`, `& echo`,
+                    // `; echo`, `&& echo`).
+                    if is_any_control {
+                        invalid[i] = true;
+                    }
+                }
+                PrevState::Normal => {}
+            }
+
+            let is_command_opener = matches!(
+                kind,
+                TokenKind::LParen
+                    | TokenKind::CmdSubst
+                    | TokenKind::ProcessSubstIn
+                    | TokenKind::ProcessSubstOut
+                    | TokenKind::Backtick
+                    | TokenKind::If
+                    | TokenKind::Then
+                    | TokenKind::Elif
+                    | TokenKind::Else
+                    | TokenKind::Do
+                    | TokenKind::While
+                    | TokenKind::Until
+            ) || (matches!(kind, TokenKind::LBrace)
+                && ann.command_word.is_some());
+
+            prev_state = if is_redir_needs_target {
+                PrevState::RedirNeedsTarget
+            } else if is_control_continuation {
+                PrevState::ControlContinuation
+            } else if is_control_terminator {
+                PrevState::ControlTerminator
+            } else if is_case_terminator {
+                PrevState::CaseTerminator
+            } else if is_command_opener {
+                PrevState::CommandStart
+            } else {
+                PrevState::Normal
+            };
+            prev_idx = Some(i);
+            i += 1;
+        }
+
+        for (tok, is_inv) in self.tokens.iter_mut().zip(invalid) {
+            if is_inv {
+                tok.annotations.is_invalid = true;
+            }
+        }
     }
 
     fn annotate_globs(&mut self) {
@@ -2976,5 +3262,99 @@ mod test_keyword_bracket_color {
             cmd_tokens[0].annotations.command_word,
             Some("echo".to_string())
         );
+    }
+
+    #[test]
+    fn test_valid_redirection_and_control_operators_not_invalid() {
+        let valid_inputs = [
+            "echo a |& cat",
+            "echo a &> /dev/null",
+            "echo a &>> /dev/null",
+            "echo a 2>&1 | cat",
+            "echo a >&2",
+            "echo a >&-",
+            "echo a <&-",
+            "echo a >| /dev/null",
+            "echo a <> /dev/null",
+            "cat <<< hello",
+            "echo a |> /dev/null",
+            "echo a | > /dev/null",
+            "echo a & > /dev/null",
+            "echo a > >(cat)",
+            "cat < <(echo hi)",
+            "case x in a) echo 1 ;& b) echo 2 ;;& c) echo 3; ;; d) sleep 1 & ;; esac",
+            "case x in a) ;; esac",
+            "cat <<EOF | sort\na &| b\nEOF",
+            "echo 'a &| b' \"c >>& d\"",
+            "echo ok # &| >>>",
+            "(( a >> 1 ))",
+            "echo $(( 1 << 2 ))",
+            "[[ a < b && c > d ]]",
+            "ls @(foo|bar)",
+        ];
+
+        for input in valid_inputs {
+            let tokens = DParser::parse_and_annotate(input);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            assert!(
+                invalid_vals.is_empty(),
+                "expected no invalid tokens in {input:?}, got {invalid_vals:?}"
+            );
+        }
+
+        // `&>` and `&>>` must not turn the target filename into a command word.
+        for input in ["echo a &> out", "echo a &>> out"] {
+            let tokens = DParser::parse_and_annotate(input);
+            let cmd_words: Vec<&str> = tokens
+                .iter()
+                .filter_map(|t| t.annotations.command_word.as_deref())
+                .collect();
+            assert_eq!(cmd_words, vec!["echo"], "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_redirection_and_control_operators_flagged() {
+        let invalid_cases: &[(&str, &[&str])] = &[
+            ("echo a &| cat", &["&", "|"]),
+            ("echo a >>& out", &[">>", "&"]),
+            ("echo a >>> out", &[">>", ">"]),
+            ("echo a <<<< hi", &["<<<", "<"]),
+            ("echo a <| cat", &["<", "|"]),
+            ("echo a <&> out", &["<&", ">"]),
+            ("echo a >&< out", &[">&", "<"]),
+            ("echo a >|& out", &[">|", "&"]),
+            ("echo a >>| out", &[">>", "|"]),
+            ("echo a &&& echo b", &["&&", "&"]),
+            ("echo a ||| echo b", &["||", "|"]),
+            ("echo a & | cat", &["|"]),
+            ("echo a | | cat", &["|"]),
+            ("echo a > | cat", &["|"]),
+            ("echo a >>(cat)", &[">>", "("]),
+            ("echo a ;& echo b", &[";&"]),
+            ("echo a ;;& echo b", &[";;&"]),
+            ("echo a ;; echo b", &[";;"]),
+            ("| cat", &["|"]),
+            ("& echo a", &["&"]),
+            ("; echo a", &[";"]),
+            ("cat << | sort", &["|"]),
+        ];
+
+        for (input, expected_invalid) in invalid_cases {
+            let tokens = DParser::parse_and_annotate(input);
+            let invalid_vals: Vec<&str> = tokens
+                .iter()
+                .filter(|t| t.annotations.is_invalid)
+                .map(|t| t.token.value.as_str())
+                .collect();
+            assert_eq!(
+                invalid_vals, *expected_invalid,
+                "mismatch for input {input:?}"
+            );
+        }
     }
 }

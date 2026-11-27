@@ -1430,13 +1430,18 @@ pub fn get_last_word(command: &str) -> Option<String> {
                 | TokenKind::Newline
                 | TokenKind::Semicolon
                 | TokenKind::DoubleSemicolon
+                | TokenKind::SemiAnd
+                | TokenKind::DoubleSemiAnd
                 | TokenKind::And
                 | TokenKind::Background
                 | TokenKind::Or
                 | TokenKind::Pipe
+                | TokenKind::PipeAnd
                 | TokenKind::Less
                 | TokenKind::Great
                 | TokenKind::DGreat
+                | TokenKind::AndGreat
+                | TokenKind::AndDGreat
                 | TokenKind::InputDup
                 | TokenKind::OutputDup
                 | TokenKind::ReadWrite
