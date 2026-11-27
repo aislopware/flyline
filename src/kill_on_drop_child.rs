@@ -72,6 +72,25 @@ impl Drop for KillOnDropChild {
     }
 }
 
+/// Whether `pid` is a live process. A killed child that nobody has reaped yet
+/// is a zombie, which `kill(pid, 0)` still finds; that happens when the
+/// test runs as PID 1's descendant in a container, where orphans are not
+/// reaped until the shell exits. Count a zombie as dead.
+#[cfg(test)]
+pub(crate) fn test_process_is_running(pid: nix::unistd::Pid) -> bool {
+    let exists = nix::sys::signal::kill(pid, None).is_ok();
+    #[cfg(target_os = "linux")]
+    if exists
+        && let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        && let Some(state) = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+    {
+        return state != 'Z';
+    }
+    exists
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -107,10 +126,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            if matches!(
-                nix::sys::signal::kill(grandchild_pid, None),
-                Err(nix::errno::Errno::ESRCH)
-            ) {
+            if !test_process_is_running(grandchild_pid) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));

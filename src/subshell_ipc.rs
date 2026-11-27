@@ -376,17 +376,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn wait_for_process_exit(pid: Pid, timeout: Duration) -> bool {
+        let running = crate::kill_on_drop_child::test_process_is_running;
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            match nix::sys::signal::kill(pid, None) {
-                Err(nix::errno::Errno::ESRCH) => return true,
-                _ => std::thread::sleep(Duration::from_millis(10)),
+            if !running(pid) {
+                return true;
             }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        matches!(
-            nix::sys::signal::kill(pid, None),
-            Err(nix::errno::Errno::ESRCH)
-        )
+        !running(pid)
     }
 
     #[test]
